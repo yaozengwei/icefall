@@ -55,6 +55,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 from transformer import Noam
 
+from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.dist import cleanup_dist, setup_dist
@@ -184,6 +185,13 @@ def get_parser():
         type=int,
         default=42,
         help="The seed for random generators intended for reproducibility",
+    )
+
+    parser.add_argument(
+        "--print-diagnostics",
+        type=str2bool,
+        default=False,
+        help="Accumulate stats on activations, print them and exit.",
     )
 
     return parser
@@ -589,6 +597,9 @@ def train_one_epoch(
         maybe_log_gradients("train/grad_norms")
         maybe_log_param_relative_changes()
 
+        if params.print_diagnostics and batch_idx == 5:
+            return
+
         optimizer.zero_grad()
 
         if batch_idx % params.log_interval == 0:
@@ -702,6 +713,12 @@ def run(rank, world_size, args):
 
     librispeech = LibriSpeechAsrDataModule(args)
 
+    if params.print_diagnostics:
+        opts = diagnostics.TensorDiagnosticOptions(
+            2 ** 22
+        )  # allow 4 megabytes per sub-module
+        diagnostic = diagnostics.attach_diagnostics(model, opts)
+
     train_cuts = librispeech.train_clean_100_cuts()
     if params.full_libri:
         train_cuts += librispeech.train_clean_360_cuts()
@@ -729,13 +746,14 @@ def run(rank, world_size, args):
     valid_cuts += librispeech.dev_other_cuts()
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    scan_pessimistic_batches_for_oom(
-        model=model,
-        train_dl=train_dl,
-        optimizer=optimizer,
-        sp=sp,
-        params=params,
-    )
+    if not params.print_diagnostics:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+        )
 
     for epoch in range(params.start_epoch, params.num_epochs):
         fix_random_seed(params.seed + epoch)
@@ -763,6 +781,10 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
         )
+
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
 
         save_checkpoint(
             params=params,
