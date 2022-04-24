@@ -464,6 +464,7 @@ class EmformerLayer(nn.Module):
         dropout: float = 0.0,
         cnn_module_kernel: int = 3,
         left_context_length: int = 0,
+        right_context_length: int = 0,
         max_memory_size: int = 0,
         tanh_on_mem: bool = False,
         negative_inf: float = -1e8,
@@ -496,6 +497,8 @@ class EmformerLayer(nn.Module):
         )
 
         self.conv_module = ConvolutionModule(
+            chunk_length,
+            right_context_length,
             d_model,
             cnn_module_kernel,
             causal=causal,
@@ -610,14 +613,15 @@ class EmformerLayer(nn.Module):
         right_context_end_idx: int,
     ) -> torch.Tensor:
         """Apply convolution module on utterance in non-infer mode."""
+        residual = right_context_utterance
+        right_context_utterance = self.norm_conv(right_context_utterance)
         utterance = right_context_utterance[right_context_end_idx:]
         right_context = right_context_utterance[:right_context_end_idx]
 
-        residual = utterance
-        utterance = self.norm_conv(utterance)
-        utterance, _ = self.conv_module(utterance)
-        utterance = residual + self.dropout(utterance)
-        right_context_utterance = torch.cat([right_context, utterance])
+        utterance, right_context, _ = self.conv_module(utterance, right_context)
+        right_context_utterance = residual + self.dropout(
+            torch.cat([right_context, utterance])
+        )
         return right_context_utterance
 
     def _apply_conv_module_infer(
@@ -627,14 +631,17 @@ class EmformerLayer(nn.Module):
         conv_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply convolution module on utterance in infer mode."""
+        residual = right_context_utterance
+        right_context_utterance = self.norm_conv(right_context_utterance)
         utterance = right_context_utterance[right_context_end_idx:]
         right_context = right_context_utterance[:right_context_end_idx]
 
-        residual = utterance
-        utterance = self.norm_conv(utterance)
-        utterance, conv_cache = self.conv_module(utterance, conv_cache)
-        utterance = residual + self.dropout(utterance)
-        right_context_utterance = torch.cat([right_context, utterance])
+        utterance, right_context, conv_cache = self.conv_module(
+            utterance, right_context, conv_cache
+        )
+        right_context_utterance = residual + self.dropout(
+            torch.cat([right_context, utterance])
+        )
         return right_context_utterance, conv_cache
 
     def _apply_attention_module_forward(
@@ -972,6 +979,7 @@ class EmformerEncoder(nn.Module):
                     dropout=dropout,
                     cnn_module_kernel=cnn_module_kernel,
                     left_context_length=left_context_length,
+                    right_context_length=right_context_length,
                     max_memory_size=max_memory_size,
                     tanh_on_mem=tanh_on_mem,
                     negative_inf=negative_inf,
@@ -1430,15 +1438,22 @@ class ConvolutionModule(nn.Module):
 
     def __init__(
         self,
+        chunk_length: int,
+        right_context_length: int,
         channels: int,
         kernel_size: int,
         bias: bool = True,
-        causal: bool = False,
+        causal: bool = True,
     ) -> None:
         """Construct an ConvolutionModule object."""
         super(ConvolutionModule, self).__init__()
         # kernerl_size should be a odd number for 'SAME' padding
         assert (kernel_size - 1) % 2 == 0
+        assert causal is True  # Hard code causal to `True`
+
+        self.chunk_length = chunk_length
+        self.right_context_length = right_context_length
+        self.channels = channels
 
         self.pointwise_conv1 = nn.Conv1d(
             channels,
@@ -1450,18 +1465,13 @@ class ConvolutionModule(nn.Module):
         )
 
         # from https://github.com/wenet-e2e/wenet/blob/main/wenet/transformer/convolution.py  # noqa
-        if causal:
-            self.left_padding = kernel_size - 1
-            padding = 0
-        else:
-            self.left_padding = 0
-            padding = (kernel_size - 1) // 2
+        self.cache_size = kernel_size - 1
         self.depthwise_conv = nn.Conv1d(
             channels,
             channels,
             kernel_size,
             stride=1,
-            padding=padding,
+            padding=0,
             groups=channels,
             bias=bias,
         )
@@ -1476,61 +1486,195 @@ class ConvolutionModule(nn.Module):
         )
         self.activation = Swish()
 
+    def _split_right_context(
+        self,
+        utterance: torch.Tensor,
+        right_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+          utterance:
+            Its shape is (U + cache_size, B, D).
+          right_context:
+            Its shape is (R, B, D).
+
+        Returns:
+          Right context segments padding with corresponding context.
+          Its shape is (num_segs * B, D, cache_size + right_context_length).
+        """
+        R, B, D = right_context.size()
+        assert self.right_context_length != 0
+        assert R % self.right_context_length == 0
+        num_segs = R // self.right_context_length
+        right_context = right_context.reshape(
+            num_segs, self.right_context_length, B, D
+        )
+        right_context = right_context.permute(0, 2, 1, 3).reshape(
+            num_segs * B, self.right_context_length, D
+        )
+        pad_utterance = []
+        for idx in range(num_segs):
+            start_idx = (idx + 1) * self.chunk_length
+            end_idx = start_idx + self.cache_size
+            pad_utterance.append(utterance[start_idx:end_idx])
+        pad_utterance = torch.cat(pad_utterance, dim=1).permute(1, 0, 2)
+        # (num_segs * B, cache_size, D)
+        right_context = torch.cat([pad_utterance, right_context], dim=1)
+        # (num_segs * B, cache_size + right_context_length, D)
+        return right_context.permute(0, 2, 1)
+
+    def _merge_right_context(
+        self, right_context: torch.Tensor, B: int
+    ) -> torch.Tensor:
+        """
+        Args:
+          right_context:
+            Right context segments.
+            It shape is (num_segs * B, D, right_context_length).
+          B:
+            Batch size.
+
+        Returns:
+          A tensor of shape (B, D, R), where
+          R = num_segs * right_context_length.
+        """
+        right_context = right_context.reshape(
+            -1, B, self.channels, self.right_context_length
+        )
+        right_context = right_context.permute(1, 2, 0, 3)
+        right_context = right_context.reshape(B, self.channels, -1)
+        return right_context
+
     def forward(
         self,
-        x: torch.Tensor,
+        utterance: torch.Tensor,
+        right_context: torch.Tensor,
         cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute convolution module.
+        """Causal convolution module applied on both utterance and right_context.
 
         Args:
-          x (torch.Tensor):
-            Input tensor (#time, batch, channels).
+          utterance (torch.Tensor):
+            Utterance tensor of shape (U, B, D).
+          right_context (torch.Tensor):
+            Right context tensor of shape (R, B, D).
           cache (torch.Tensor, optional):
-            Cached tensor for left padding (#batch, channels, cache_time).
+            Cached tensor for left padding of shape (B, D, cache_size).
+
         Returns:
-          A tuple of 2 tensors:
-            - output tensor (#time, batch, channels).
-            - updated cache tensor (#batch, channels, cache_time).
+          A tuple of 3 tensors:
+            - output utterance of shape (U, B, D).
+            - output right_context of shape (R, B, D).
+            - updated cache tensor of shape (B, D, cache_size).
         """
-        # exchange the temporal dimension and the feature dimension
-        x = x.permute(1, 2, 0)  # (#batch, channels, time).
+        U, B, D = utterance.size()
+        R, _, _ = right_context.size()
 
-        # 1D Depthwise Conv
-        if self.left_padding > 0:
-            # manualy padding self.lorder zeros to the left
-            # make depthwise_conv causal
-            if cache is None:
-                x = nn.functional.pad(
-                    x, (self.left_padding, 0), "constant", 0.0
-                )
-            else:
-                assert cache.size(0) == x.size(0)  # equal batch
-                assert cache.size(1) == x.size(1)  # equal channel
-                assert cache.size(2) == self.left_padding
-                x = torch.cat([cache, x], dim=2)
-            new_cache = x[:, :, x.size(2) - self.left_padding :]  # noqa
-        else:
-            # It's better we just return None if no cache is requried,
-            # However, for JIT export, here we just fake one tensor instead of
-            # None.
-            new_cache = None
+        # point-wise conv
+        x = torch.cat([right_context, utterance], dim=0)  # (R + U, B, D)
+        x = x.permute(1, 2, 0)  # (B, D, R + U)
+        x = self.pointwise_conv1(x)  # (B, 2 * D, R + U)
+        x = nn.functional.glu(x, dim=1)  # (B, D, R + U)
 
-        # GLU mechanism
-        x = self.pointwise_conv1(x)  # (batch, 2*channels, time)
-        x = nn.functional.glu(x, dim=1)  # (batch, channels, time)
+        utterance = x[:, :, R:]  # (B, D, U)
+        right_context = x[:, :, :R]  # (B, D, R)
 
-        x = self.depthwise_conv(x)
-        # x is (batch, channels, time)
+        if cache is None:
+            cache = torch.zeros(
+                B, D, self.cache_size, device=x.device, dtype=x.dtype
+            )
+        utterance = torch.cat([cache, utterance], dim=2)  # (B, D, cache + U)
+        # update cache
+        new_cache = utterance[:, :, -self.cache_size :]
+
+        if self.right_context_length > 0:
+            # depth-wise conv on right_context
+            right_context = self._split_right_context(
+                utterance.permute(2, 0, 1), right_context.permute(2, 0, 1)
+            )  # (num_segs * B, D, cache_size + right_context_length)
+            right_context = self.depthwise_conv(
+                right_context
+            )  # (num_segs * B, D, right_context_length)
+            right_context = self._merge_right_context(
+                right_context, B
+            )  # (B, D, R)
+
+        # depth-wise conv on utterance
+        utterance = self.depthwise_conv(utterance)  # (B, D, U)
+
+        x = torch.cat([right_context, utterance], dim=2)  # (B, D, R + U)
         x = x.permute(0, 2, 1)
         x = self.norm(x)
         x = x.permute(0, 2, 1)
-
         x = self.activation(x)
 
-        x = self.pointwise_conv2(x)  # (batch, channel, time)
+        # point-wise conv
+        x = self.pointwise_conv2(x)  # (B, D, R + U)
 
-        return x.permute(2, 0, 1), new_cache
+        right_context = x[:, :, :R]  # (B, D, R)
+        utterance = x[:, :, R:]  # (B, D, U)
+        return (
+            utterance.permute(2, 0, 1),
+            right_context.permute(2, 0, 1),
+            new_cache,
+        )
+
+    def infer(
+        self,
+        utterance: torch.Tensor,
+        right_context: torch.Tensor,
+        cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Causal convolution module applied on both utterance and right_context.
+
+        Args:
+          utterance (torch.Tensor):
+            Utterance tensor of shape (U, B, D).
+          right_context (torch.Tensor):
+            Right context tensor of shape (R, B, D).
+          cache (torch.Tensor, optional):
+            Cached tensor for left padding of shape (B, D, cache_size).
+
+        Returns:
+          A tuple of 3 tensors:
+            - output utterance of shape (U, B, D).
+            - output right_context of shape (R, B, D).
+            - updated cache tensor of shape (B, D, cache_size).
+        """
+        U, B, D = utterance.size()
+        R, _, _ = utterance.size()
+
+        # point-wise conv
+        x = torch.cat([utterance, right_context], dim=0)  # (U + R, B, D)
+        x = x.permute(1, 2, 0)  # (B, D, U + R)
+        x = self.pointwise_conv1(x)  # (B, 2 * D, U + R)
+        x = nn.functional.glu(x, dim=1)  # (B, D, U + R)
+
+        if cache is None:
+            cache = torch.zeros(
+                B, D, self.cache_size, device=x.device, dtype=x.dtype
+            )
+        x = torch.cat([cache, x], dim=2)  # (B, D, cache_size + U + R)
+        # update cache
+        new_cache = x[:, :, -(self.cache_size + R) : -R]
+
+        # depth-wise conv
+        x = self.depthwise_conv(x)  # (B, D, U + R)
+        x = x.permute(0, 2, 1)
+        x = self.norm(x)
+        x = x.permute(0, 2, 1)
+        x = self.activation(x)
+
+        # point-wise conv
+        x = self.pointwise_conv2(x)  # (B, D, U + R)
+
+        utterance = x[:, :, :U]  # (B, D, U)
+        right_context = x[:, :, U:]  # (B, D, R)
+        return (
+            utterance.permute(2, 0, 1),
+            right_context.permute(2, 0, 1),
+            new_cache,
+        )
 
 
 class Swish(torch.nn.Module):
