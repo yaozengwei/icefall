@@ -287,7 +287,7 @@ def decode_one_batch(
 
         for i in range(batch_size):
             # fmt: off
-            encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
+            encoder_out_i = encoder_out[i:i + 1, :encoder_out_lens[i]]
             # fmt: on
             if params.decoding_method == "greedy_search":
                 hyp = greedy_search(
@@ -478,8 +478,9 @@ def main():
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
 
-    # <blk> is defined in local/train_bpe_model.py
+    # <blk> and <unk> are defined in local/train_bpe_model.py
     params.blank_id = sp.piece_to_id("<blk>")
+    params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
