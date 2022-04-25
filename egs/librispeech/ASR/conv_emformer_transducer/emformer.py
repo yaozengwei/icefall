@@ -636,7 +636,7 @@ class EmformerLayer(nn.Module):
         utterance = right_context_utterance[right_context_end_idx:]
         right_context = right_context_utterance[:right_context_end_idx]
 
-        utterance, right_context, conv_cache = self.conv_module(
+        utterance, right_context, conv_cache = self.conv_module.infer(
             utterance, right_context, conv_cache
         )
         right_context_utterance = residual + self.dropout(
@@ -1423,6 +1423,7 @@ class Emformer(EncoderInterface):
 
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model.
+
     Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/conformer/convolution.py  # noqa
 
     Args:
@@ -1585,7 +1586,8 @@ class ConvolutionModule(nn.Module):
             )
         utterance = torch.cat([cache, utterance], dim=2)  # (B, D, cache + U)
         # update cache
-        new_cache = utterance[:, :, -self.cache_size :]
+        start_idx = utterance.size(2) - self.cache_size
+        new_cache = utterance[:, :, start_idx:]
 
         if self.right_context_length > 0:
             # depth-wise conv on right_context
@@ -1642,7 +1644,7 @@ class ConvolutionModule(nn.Module):
             - updated cache tensor of shape (B, D, cache_size).
         """
         U, B, D = utterance.size()
-        R, _, _ = utterance.size()
+        R, _, _ = right_context.size()
 
         # point-wise conv
         x = torch.cat([utterance, right_context], dim=0)  # (U + R, B, D)
@@ -1656,7 +1658,9 @@ class ConvolutionModule(nn.Module):
             )
         x = torch.cat([cache, x], dim=2)  # (B, D, cache_size + U + R)
         # update cache
-        new_cache = x[:, :, -(self.cache_size + R) : -R]
+        start_idx = x.size(2) - (self.cache_size + R)
+        end_idx = x.size(2) - R
+        new_cache = x[:, :, start_idx:end_idx]
 
         # depth-wise conv
         x = self.depthwise_conv(x)  # (B, D, U + R)
