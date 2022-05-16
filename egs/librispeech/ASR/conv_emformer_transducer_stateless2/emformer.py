@@ -444,6 +444,7 @@ class EmformerAttention(nn.Module):
 
     Relative positional encoding is applied in this module, which is difference
     from https://github.com/pytorch/audio/blob/main/torchaudio/models/emformer.py  # noqa
+    In addition, memory vectors are the averaged values of chunks for simplification.
 
     Args:
       embed_dim (int):
@@ -779,7 +780,7 @@ class EmformerAttention(nn.Module):
         Returns:
           Output of right context and utterance, with shape (R + U, B, D).
         """
-        (output_right_context_utterance, _, _,) = self._forward_impl(
+        output_right_context_utterance, _, _ = self._forward_impl(
             utterance,
             lengths,
             right_context,
@@ -1204,7 +1205,7 @@ class EmformerEncoderLayer(nn.Module):
             For training mode, P = 2*U-1.
 
         Returns:
-          A tuple containing 3 tensors:
+          A tuple containing 2 tensors:
             - output utterance, with shape (U, B, D).
             - output right context, with shape (R, B, D).
         """
