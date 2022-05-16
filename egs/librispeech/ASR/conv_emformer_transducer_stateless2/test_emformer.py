@@ -162,10 +162,9 @@ def test_emformer_encoder_layer_forward():
 
     for use_memory in [True, False]:
         if use_memory:
-            S = num_chunks
-            M = S - 1
+            M = num_chunks - 1
         else:
-            S, M = 0, 0
+            M = 0
 
         layer = EmformerEncoderLayer(
             d_model=D,
@@ -178,27 +177,24 @@ def test_emformer_encoder_layer_forward():
             max_memory_size=M,
         )
 
-        Q, KV = R + U + S, M + R + U
+        Q, KV = R + U, M + R + U
         utterance = torch.randn(U, B, D)
         lengths = torch.randint(1, U + 1, (B,))
         lengths[0] = U
         right_context = torch.randn(R, B, D)
-        memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
         PE = 2 * U - 1
         pos_emb = torch.randn(PE, D)
 
-        output_utterance, output_right_context, output_memory = layer(
+        output_utterance, output_right_context = layer(
             utterance,
             lengths,
             right_context,
-            memory,
             attention_mask,
             pos_emb,
         )
         assert output_utterance.shape == (U, B, D)
         assert output_right_context.shape == (R, B, D)
-        assert output_memory.shape == (M, B, D)
 
 
 def test_emformer_encoder_layer_infer():
@@ -234,7 +230,6 @@ def test_emformer_encoder_layer_infer():
         lengths = torch.randint(1, U + 1, (B,))
         lengths[0] = U
         right_context = torch.randn(R, B, D)
-        memory = torch.randn(M, B, D)
         state = None
         PE = left_context_length + 2 * U - 1
         pos_emb = torch.randn(PE, D)
@@ -242,24 +237,18 @@ def test_emformer_encoder_layer_infer():
         (
             output_utterance,
             output_right_context,
-            output_memory,
             output_state,
             conv_cache,
         ) = layer.infer(
             utterance,
             lengths,
             right_context,
-            memory,
             pos_emb,
             state,
             conv_cache,
         )
         assert output_utterance.shape == (U, B, D)
         assert output_right_context.shape == (R, B, D)
-        if use_memory:
-            assert output_memory.shape == (1, B, D)
-        else:
-            assert output_memory.shape == (0, B, D)
         assert len(output_state) == 4
         assert output_state[0].shape == (M, B, D)
         assert output_state[1].shape == (left_context_length, B, D)
@@ -528,8 +517,8 @@ if __name__ == "__main__":
     test_emformer_attention_infer()
     # test_convolution_module_forward()
     # test_convolution_module_infer()
-    # test_emformer_encoder_layer_forward()
-    # test_emformer_encoder_layer_infer()
+    test_emformer_encoder_layer_forward()
+    test_emformer_encoder_layer_infer()
     # test_emformer_encoder_forward()
     # test_emformer_encoder_infer()
     # test_emformer_encoder_forward_infer_consistency()

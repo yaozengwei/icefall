@@ -940,7 +940,7 @@ class EmformerEncoderLayer(nn.Module):
             tanh_on_mem=tanh_on_mem,
             negative_inf=negative_inf,
         )
-        self.summary_op = nn.AvgPool1d(
+        self.memory_op = nn.AvgPool1d(
             kernel_size=chunk_length, stride=chunk_length, ceil_mode=True
         )
 
@@ -1082,7 +1082,6 @@ class EmformerEncoderLayer(nn.Module):
         right_context_utterance: torch.Tensor,
         R: int,
         lengths: torch.Tensor,
-        memory: torch.Tensor,
         pos_emb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1095,42 +1094,39 @@ class EmformerEncoderLayer(nn.Module):
         right_context = right_context_utterance[:R]
 
         if self.use_memory:
-            summary = self.summary_op(utterance.permute(1, 2, 0)).permute(
-                2, 0, 1
-            )
+            memory = self.memory_op(utterance.permute(1, 2, 0)).permute(2, 0, 1)
+            memory = memory[:-1]
         else:
-            summary = torch.empty(0).to(
+            memory = torch.empty(0).to(
                 dtype=utterance.dtype, device=utterance.device
             )
-        output_right_context_utterance, output_memory = self.attention(
+        output_right_context_utterance = self.attention(
             utterance=utterance,
             lengths=lengths,
             right_context=right_context,
-            summary=summary,
             memory=memory,
             attention_mask=attention_mask,
             pos_emb=pos_emb,
         )
 
-        return output_right_context_utterance, output_memory
+        return output_right_context_utterance
 
     def _apply_attention_module_infer(
         self,
         right_context_utterance: torch.Tensor,
         R: int,
         lengths: torch.Tensor,
-        memory: torch.Tensor,
         pos_emb: torch.Tensor,
         state: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """Apply attention module in inference mode.
         1) Unpack cached states including:
-           - memory from previous chunks in the lower layer;
+           - memory from previous chunks in this layer;
            - attention key and value of left context from proceeding
              chunk's compuation;
         2) Apply attention computation;
         3) Pack updated states including:
-           - output memory of current chunk in the lower layer;
+           - memory of current chunk in this layer;
            - attention key and value in current chunk's computation, which would
              be resued in next chunk's computation.
            - length of current chunk.
@@ -1144,12 +1140,10 @@ class EmformerEncoderLayer(nn.Module):
             state
         )
         if self.use_memory:
-            summary = self.summary_op(utterance.permute(1, 2, 0)).permute(
-                2, 0, 1
-            )
-            summary = summary[:1]
+            memory = self.memory_op(utterance.permute(1, 2, 0)).permute(2, 0, 1)
+            memory = memory[:1]
         else:
-            summary = torch.empty(0).to(
+            memory = torch.empty(0).to(
                 dtype=utterance.dtype, device=utterance.device
             )
         # pos_emb is of shape [PE, D], where PE = L + 2 * U - 1,
@@ -1164,14 +1158,12 @@ class EmformerEncoderLayer(nn.Module):
         pos_emb = pos_emb[tot_PE - PE :]
         (
             output_right_context_utterance,
-            output_memory,
             next_key,
             next_val,
         ) = self.attention.infer(
             utterance=utterance,
             lengths=lengths,
             right_context=right_context,
-            summary=summary,
             memory=pre_memory,
             left_context_key=left_context_key,
             left_context_val=left_context_val,
@@ -1180,14 +1172,13 @@ class EmformerEncoderLayer(nn.Module):
         state = self._pack_state(
             next_key, next_val, utterance.size(0), memory, state
         )
-        return output_right_context_utterance, output_memory, state
+        return output_right_context_utterance, state
 
     def forward(
         self,
         utterance: torch.Tensor,
         lengths: torch.Tensor,
         right_context: torch.Tensor,
-        memory: torch.Tensor,
         attention_mask: torch.Tensor,
         pos_emb: torch.Tensor,
         warmup: float = 1.0,
@@ -1208,9 +1199,6 @@ class EmformerEncoderLayer(nn.Module):
             number of valid frames for i-th batch element in utterance.
           right_context (torch.Tensor):
             Right context frames, with shape (R, B, D).
-          memory (torch.Tensor):
-            Memory elements, with shape (M, B, D).
-            It is an empty tensor without using memory.
           attention_mask (torch.Tensor):
             Attention mask for underlying attention module,
             with shape (Q, KV), where Q = R + U + S, KV = M + R + U.
@@ -1222,7 +1210,6 @@ class EmformerEncoderLayer(nn.Module):
           A tuple containing 3 tensors:
             - output utterance, with shape (U, B, D).
             - output right context, with shape (R, B, D).
-            - output memory, with shape (M, B, D).
         """
         R = right_context.size(0)
         src = torch.cat([right_context, utterance])
@@ -1244,8 +1231,8 @@ class EmformerEncoderLayer(nn.Module):
         src = src + self.dropout(self.feed_forward_macaron(src))
 
         # emformer attention module
-        src_att, output_memory = self._apply_attention_module_forward(
-            src, R, lengths, memory, pos_emb, attention_mask
+        src_att = self._apply_attention_module_forward(
+            src, R, lengths, pos_emb, attention_mask
         )
         src = src + self.dropout(src_att)
 
@@ -1263,14 +1250,13 @@ class EmformerEncoderLayer(nn.Module):
 
         output_utterance = src[R:]
         output_right_context = src[:R]
-        return output_utterance, output_right_context, output_memory
+        return output_utterance, output_right_context
 
     def infer(
         self,
         utterance: torch.Tensor,
         lengths: torch.Tensor,
         right_context: torch.Tensor,
-        memory: torch.Tensor,
         pos_emb: torch.Tensor,
         state: Optional[List[torch.Tensor]] = None,
         conv_cache: Optional[torch.Tensor] = None,
@@ -1291,8 +1277,6 @@ class EmformerEncoderLayer(nn.Module):
              number of valid frames for i-th batch element in utterance.
            right_context (torch.Tensor):
              Right context frames, with shape (R, B, D).
-           memory (torch.Tensor):
-             Memory elements, with shape (M, B, D).
            state (List[torch.Tensor], optional):
              List of tensors representing layer internal state generated in
              preceding computation. (default=None)
@@ -1317,12 +1301,8 @@ class EmformerEncoderLayer(nn.Module):
         src = src + self.dropout(self.feed_forward_macaron(src))
 
         # emformer attention module
-        (
-            src_att,
-            output_memory,
-            output_state,
-        ) = self._apply_attention_module_infer(
-            src, R, lengths, memory, pos_emb, state
+        src_att, output_state = self._apply_attention_module_infer(
+            src, R, lengths, pos_emb, state
         )
         src = src + self.dropout(src_att)
 
@@ -1340,7 +1320,6 @@ class EmformerEncoderLayer(nn.Module):
         return (
             output_utterance,
             output_right_context,
-            output_memory,
             output_state,
             conv_cache,
         )
