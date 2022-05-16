@@ -271,10 +271,9 @@ def test_emformer_encoder_forward():
 
     for use_memory in [True, False]:
         if use_memory:
-            S = num_chunks
-            M = S - 1
+            M = num_chunks - 1
         else:
-            S, M = 0, 0
+            M = 0
 
         encoder = EmformerEncoder(
             chunk_length=chunk_length,
@@ -519,8 +518,8 @@ if __name__ == "__main__":
     # test_convolution_module_infer()
     test_emformer_encoder_layer_forward()
     test_emformer_encoder_layer_infer()
-    # test_emformer_encoder_forward()
-    # test_emformer_encoder_infer()
+    test_emformer_encoder_forward()
+    test_emformer_encoder_infer()
     # test_emformer_encoder_forward_infer_consistency()
     # test_emformer_forward()
     # test_emformer_infer()

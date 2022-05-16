@@ -1398,11 +1398,6 @@ class EmformerEncoder(nn.Module):
         super().__init__()
 
         self.use_memory = max_memory_size > 0
-        self.init_memory_op = nn.AvgPool1d(
-            kernel_size=chunk_length,
-            stride=chunk_length,
-            ceil_mode=True,
-        )
 
         self.emformer_layers = nn.ModuleList(
             [
@@ -1492,16 +1487,15 @@ class EmformerEncoder(nn.Module):
 
         R: length of hard-copied right contexts;
         U: length of full utterance;
-        S: length of summary vectors;
         M: length of memory vectors;
         Q: length of attention query;
         KV: length of attention key and value.
 
         The shape of attention mask is (Q, KV).
         If self.use_memory is `True`:
-          query = [right_context, utterance, summary];
+          query = [right_context, utterance];
           key, value = [memory, right_context, utterance];
-          Q = R + U + S, KV = M + R + U.
+          Q = R + U, KV = M + R + U.
         Otherwise:
           query = [right_context, utterance]
           key, value = [right_context, utterance]
@@ -1512,17 +1506,14 @@ class EmformerEncoder(nn.Module):
           r_i: right context that c_i can use;
           l_i: left context that c_i can use;
           m_i: past memory vectors from previous layer that c_i can use;
-          s_i: summary vector of c_i.
         The target chunk-wise attention is:
           c_i, r_i (in query) -> l_i, c_i, r_i, m_i (in key);
-          s_i (in query) -> l_i, c_i, r_i (in key).
         """
         U = utterance.size(0)
         num_chunks = math.ceil(U / self.chunk_length)
 
         right_context_mask = []
         utterance_mask = []
-        summary_mask = []
 
         if self.use_memory:
             num_cols = 9
@@ -1531,9 +1522,6 @@ class EmformerEncoder(nn.Module):
             right_context_utterance_cols_mask = [
                 idx in [1, 4, 7] for idx in range(num_cols)
             ]
-            # summary attends to right context, utterance
-            summary_cols_mask = [idx in [4, 7] for idx in range(num_cols)]
-            masks_to_concat = [right_context_mask, utterance_mask, summary_mask]
         else:
             num_cols = 6
             # right context and utterance both attend to right context and
@@ -1541,8 +1529,7 @@ class EmformerEncoder(nn.Module):
             right_context_utterance_cols_mask = [
                 idx in [1, 4] for idx in range(num_cols)
             ]
-            summary_cols_mask = None
-            masks_to_concat = [right_context_mask, utterance_mask]
+        masks_to_concat = [right_context_mask, utterance_mask]
 
         for chunk_idx in range(num_chunks):
             col_widths = self._gen_attention_mask_col_widths(chunk_idx, U)
@@ -1565,12 +1552,6 @@ class EmformerEncoder(nn.Module):
                 utterance.device,
             )
             utterance_mask.append(utterance_mask_block)
-
-            if summary_cols_mask is not None:
-                summary_mask_block = _gen_attention_mask_block(
-                    col_widths, summary_cols_mask, 1, utterance.device
-                )
-                summary_mask.append(summary_mask_block)
 
         attention_mask = (
             1 - torch.cat([torch.cat(mask) for mask in masks_to_concat])
@@ -1608,21 +1589,13 @@ class EmformerEncoder(nn.Module):
         utterance = x[:U]
         output_lengths = torch.clamp(lengths - self.right_context_length, min=0)
         attention_mask = self._gen_attention_mask(utterance)
-        memory = (
-            self.init_memory_op(utterance.permute(1, 2, 0)).permute(2, 0, 1)[
-                :-1
-            ]
-            if self.use_memory
-            else torch.empty(0).to(dtype=x.dtype, device=x.device)
-        )
 
         output = utterance
         for layer in self.emformer_layers:
-            output, right_context, memory = layer(
+            output, right_context = layer(
                 output,
                 output_lengths,
                 right_context,
-                memory,
                 attention_mask,
                 pos_emb,
                 warmup=warmup,
@@ -1683,11 +1656,7 @@ class EmformerEncoder(nn.Module):
         right_context = x[right_context_start_idx:]
         utterance = x[:right_context_start_idx]
         output_lengths = torch.clamp(lengths - self.right_context_length, min=0)
-        memory = (
-            self.init_memory_op(utterance.permute(1, 2, 0)).permute(2, 0, 1)
-            if self.use_memory
-            else torch.empty(0).to(dtype=x.dtype, device=x.device)
-        )
+
         output = utterance
         output_states: List[List[torch.Tensor]] = []
         output_conv_caches: List[torch.Tensor] = []
@@ -1695,14 +1664,12 @@ class EmformerEncoder(nn.Module):
             (
                 output,
                 right_context,
-                memory,
                 output_state,
                 output_conv_cache,
             ) = layer.infer(
                 output,
                 output_lengths,
                 right_context,
-                memory,
                 pos_emb,
                 None if states is None else states[layer_idx],
                 None if conv_caches is None else conv_caches[layer_idx],
