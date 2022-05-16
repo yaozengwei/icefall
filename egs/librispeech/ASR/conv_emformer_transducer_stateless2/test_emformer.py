@@ -511,15 +511,15 @@ def test_emformer_infer():
 
 
 if __name__ == "__main__":
-    # test_rel_positional_encoding()
+    test_rel_positional_encoding()
     test_emformer_attention_forward()
     test_emformer_attention_infer()
-    # test_convolution_module_forward()
-    # test_convolution_module_infer()
+    test_convolution_module_forward()
+    test_convolution_module_infer()
     test_emformer_encoder_layer_forward()
     test_emformer_encoder_layer_infer()
     test_emformer_encoder_forward()
     test_emformer_encoder_infer()
     test_emformer_encoder_forward_infer_consistency()
-    # test_emformer_forward()
-    # test_emformer_infer()
+    test_emformer_forward()
+    test_emformer_infer()

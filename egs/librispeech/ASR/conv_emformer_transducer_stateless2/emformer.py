@@ -810,7 +810,7 @@ class EmformerAttention(nn.Module):
 
         It concatenates the right context and utterance (i.e., current chunk),
         to compute the query tensor:
-        query = [right_context, utterance, summary],
+        query = [right_context, utterance],
         with length Q = R + U + S.
         It concatenates the memory vectors, right context, left context, and
         current chunk, to compute the key and value tensors:
@@ -820,7 +820,6 @@ class EmformerAttention(nn.Module):
         The chunk-wise attention is:
         chunk, right context (in query) ->
           left context, chunk, right context, memory vectors (in key);
-        summary (in query) -> left context, chunk, right context (in key).
 
         Relative positional encoding is applied on the part of attention between
         chunk (in query) and chunk itself as well as its left context (in key):
