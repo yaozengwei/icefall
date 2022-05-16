@@ -26,33 +26,29 @@ def test_emformer_attention_forward():
 
     for use_memory in [True, False]:
         if use_memory:
-            S = num_chunks
-            M = S - 1
+            M = num_chunks - 1
         else:
-            S, M = 0, 0
+            M = 0
 
-        Q, KV = R + U + S, M + R + U
+        Q, KV = R + U, M + R + U
         utterance = torch.randn(U, B, D)
         lengths = torch.randint(1, U + 1, (B,))
         lengths[0] = U
         right_context = torch.randn(R, B, D)
-        summary = torch.randn(S, B, D)
         memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
         PE = 2 * U - 1
         pos_emb = torch.randn(PE, D)
 
-        output_right_context_utterance, output_memory = attention(
+        output_right_context_utterance = attention(
             utterance,
             lengths,
             right_context,
-            summary,
             memory,
             attention_mask,
             pos_emb,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
-        assert output_memory.shape == (M, B, D)
 
 
 def test_emformer_attention_infer():
@@ -66,38 +62,30 @@ def test_emformer_attention_infer():
 
     for use_memory in [True, False]:
         if use_memory:
-            S, M = 1, 3
+            M = 3
         else:
-            S, M = 0, 0
+            M = 0
 
         utterance = torch.randn(U, B, D)
         lengths = torch.randint(1, U + 1, (B,))
         lengths[0] = U
         right_context = torch.randn(R, B, D)
-        summary = torch.randn(S, B, D)
         memory = torch.randn(M, B, D)
         left_context_key = torch.randn(L, B, D)
         left_context_val = torch.randn(L, B, D)
         PE = L + 2 * U - 1
         pos_emb = torch.randn(PE, D)
 
-        (
-            output_right_context_utterance,
-            output_memory,
-            next_key,
-            next_val,
-        ) = attention.infer(
+        output_right_context_utterance, next_key, next_val = attention.infer(
             utterance,
             lengths,
             right_context,
-            summary,
             memory,
             left_context_key,
             left_context_val,
             pos_emb,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
-        assert output_memory.shape == (S, B, D)
         assert next_key.shape == (L + U, B, D)
         assert next_val.shape == (L + U, B, D)
 
@@ -535,15 +523,15 @@ def test_emformer_infer():
 
 
 if __name__ == "__main__":
-    test_rel_positional_encoding()
+    # test_rel_positional_encoding()
     test_emformer_attention_forward()
     test_emformer_attention_infer()
-    test_convolution_module_forward()
-    test_convolution_module_infer()
-    test_emformer_encoder_layer_forward()
-    test_emformer_encoder_layer_infer()
-    test_emformer_encoder_forward()
-    test_emformer_encoder_infer()
-    test_emformer_encoder_forward_infer_consistency()
-    test_emformer_forward()
-    test_emformer_infer()
+    # test_convolution_module_forward()
+    # test_convolution_module_infer()
+    # test_emformer_encoder_layer_forward()
+    # test_emformer_encoder_layer_infer()
+    # test_emformer_encoder_forward()
+    # test_emformer_encoder_infer()
+    # test_emformer_encoder_forward_infer_consistency()
+    # test_emformer_forward()
+    # test_emformer_infer()

@@ -597,7 +597,6 @@ class EmformerAttention(nn.Module):
         utterance: torch.Tensor,
         lengths: torch.Tensor,
         right_context: torch.Tensor,
-        summary: torch.Tensor,
         memory: torch.Tensor,
         attention_mask: torch.Tensor,
         pos_emb: torch.Tensor,
@@ -610,10 +609,8 @@ class EmformerAttention(nn.Module):
         M = memory.size(0)
         scaling = float(self.head_dim) ** -0.5
 
-        # compute query with [right_context, utterance, summary].
-        query = self.emb_to_query(
-            torch.cat([right_context, utterance, summary])
-        )
+        # compute query with [right_context, utterance].
+        query = self.emb_to_query(torch.cat([right_context, utterance]))
         # compute key and value with [memory, right_context, utterance].
         key, value = self.emb_to_key_value(
             torch.cat([memory, right_context, utterance])
@@ -657,7 +654,7 @@ class EmformerAttention(nn.Module):
         # between chunk (in query) and itself as well as its left context
         # (in key)
         utterance_with_bais_v = (
-            reshaped_query[R : R + U] + self._pos_bias_v()
+            reshaped_query[R:] + self._pos_bias_v()
         ).permute(1, 2, 0, 3)
         # (B, nhead, U, head_dim)
         PE = pos_emb.size(0)
@@ -685,7 +682,7 @@ class EmformerAttention(nn.Module):
             B * self.nhead, U, -1
         )
         matrix_bd = torch.zeros_like(matrix_ac)
-        matrix_bd[:, R : R + U, M + R :] = matrix_bd_utterance
+        matrix_bd[:, R:, M + R :] = matrix_bd_utterance
 
         attention_weights = matrix_ac + matrix_bd
 
@@ -708,23 +705,15 @@ class EmformerAttention(nn.Module):
         )
 
         # apply output projection
-        outputs = self.out_proj(attention)
+        output_right_context_utterance = self.out_proj(attention)
 
-        output_right_context_utterance = outputs[: R + U]
-        output_memory = outputs[R + U :]
-        if self.tanh_on_mem:
-            output_memory = torch.tanh(output_memory)
-        else:
-            output_memory = torch.clamp(output_memory, min=-10, max=10)
-
-        return output_right_context_utterance, output_memory, key, value
+        return output_right_context_utterance, key, value
 
     def forward(
         self,
         utterance: torch.Tensor,
         lengths: torch.Tensor,
         right_context: torch.Tensor,
-        summary: torch.Tensor,
         memory: torch.Tensor,
         attention_mask: torch.Tensor,
         pos_emb: torch.Tensor,
@@ -736,17 +725,16 @@ class EmformerAttention(nn.Module):
         D: embedding dimension;
         R: length of the hard-copied right contexts;
         U: length of full utterance;
-        S: length of summary vectors;
         M: length of memory vectors.
 
         It computes a `big` attention matrix on full utterance and
         then utilizes a pre-computed mask to simulate chunk-wise attention.
 
         It concatenates three blocks: hard-copied right contexts,
-        full utterance, and summary vectors, as a `big` block,
+        and full utterance, as a `big` block,
         to compute the query tensor:
-        query = [right_context, utterance, summary],
-        with length Q = R + U + S.
+        query = [right_context, utterance],
+        with length Q = R + U.
         It concatenates the three blocks: memory vectors,
         hard-copied right contexts, and full utterance as another `big` block,
         to compute the key and value tensors:
@@ -760,10 +748,8 @@ class EmformerAttention(nn.Module):
         r_i: right context that c_i can use;
         l_i: left context that c_i can use;
         m_i: past memory vectors from previous layer that c_i can use;
-        s_i: summary vector of c_i;
         The target chunk-wise attention is:
         c_i, r_i (in query) -> l_i, c_i, r_i, m_i (in key);
-        s_i (in query) -> l_i, c_i, r_i (in key).
 
         Relative positional encoding is applied on the part of attention between
         utterance (in query) and utterance (in key). Actually, it is applied on
@@ -780,9 +766,6 @@ class EmformerAttention(nn.Module):
           right_context (torch.Tensor):
             Hard-copied right context frames, with shape (R, B, D),
             where R = num_chunks * right_context_length
-          summary (torch.Tensor):
-            Summary elements with shape (S, B, D), where S = num_chunks.
-            It is an empty tensor without using memory.
           memory (torch.Tensor):
             Memory elements, with shape (M, B, D), where M = num_chunks - 1.
             It is an empty tensor without using memory.
@@ -794,32 +777,23 @@ class EmformerAttention(nn.Module):
             where PE = 2 * U - 1.
 
         Returns:
-          A tuple containing 2 tensors:
-            - output of right context and utterance, with shape (R + U, B, D).
-            - memory output, with shape (M, B, D), where M = S - 1 or M = 0.
+          Output of right context and utterance, with shape (R + U, B, D).
         """
-        (
-            output_right_context_utterance,
-            output_memory,
-            _,
-            _,
-        ) = self._forward_impl(
+        (output_right_context_utterance, _, _,) = self._forward_impl(
             utterance,
             lengths,
             right_context,
-            summary,
             memory,
             attention_mask,
             pos_emb,
         )
-        return output_right_context_utterance, output_memory[:-1]
+        return output_right_context_utterance
 
     def infer(
         self,
         utterance: torch.Tensor,
         lengths: torch.Tensor,
         right_context: torch.Tensor,
-        summary: torch.Tensor,
         memory: torch.Tensor,
         left_context_key: torch.Tensor,
         left_context_val: torch.Tensor,
@@ -832,11 +806,10 @@ class EmformerAttention(nn.Module):
         R: length of right context;
         U: length of utterance, i.e., current chunk;
         L: length of cached left context;
-        S: length of summary vectors, S = 1;
         M: length of cached memory vectors.
 
-        It concatenates the right context, utterance (i.e., current chunk)
-        and summary vector of current chunk, to compute the query tensor:
+        It concatenates the right context and utterance (i.e., current chunk),
+        to compute the query tensor:
         query = [right_context, utterance, summary],
         with length Q = R + U + S.
         It concatenates the memory vectors, right context, left context, and
@@ -862,8 +835,6 @@ class EmformerAttention(nn.Module):
           right_context (torch.Tensor):
             Right context frames, with shape (R, B, D),
             where R = right_context_length.
-          summary (torch.Tensor):
-            Summary vector with shape (1, B, D), or empty tensor.
           memory (torch.Tensor):
             Memory vectors, with shape (M, B, D), or empty tensor.
           left_context_key (torch,Tensor):
@@ -879,7 +850,6 @@ class EmformerAttention(nn.Module):
         Returns:
           A tuple containing 4 tensors:
             - output of right context and utterance, with shape (R + U, B, D).
-            - memory output, with shape (1, B, D) or (0, B, D).
             - attention key of left context and utterance, which would be cached
               for next computation, with shape (L + U, B, D).
             - attention value of left context and utterance, which would be
@@ -888,11 +858,10 @@ class EmformerAttention(nn.Module):
         U = utterance.size(0)
         R = right_context.size(0)
         L = left_context_key.size(0)
-        S = summary.size(0)
         M = memory.size(0)
 
-        # query = [right context, utterance, summary]
-        Q = R + U + S
+        # query = [right context, utterance]
+        Q = R + U
         # key, value = [memory, right context, left context, uttrance]
         KV = M + R + L + U
         attention_mask = torch.zeros(Q, KV).to(
@@ -900,16 +869,10 @@ class EmformerAttention(nn.Module):
         )
         # disallow attention bettween the summary vector with the memory bank
         attention_mask[-1, :M] = True
-        (
-            output_right_context_utterance,
-            output_memory,
-            key,
-            value,
-        ) = self._forward_impl(
+        (output_right_context_utterance, key, value,) = self._forward_impl(
             utterance,
             lengths,
             right_context,
-            summary,
             memory,
             attention_mask,
             pos_emb,
@@ -918,7 +881,6 @@ class EmformerAttention(nn.Module):
         )
         return (
             output_right_context_utterance,
-            output_memory,
             key[M + R :],
             value[M + R :],
         )
