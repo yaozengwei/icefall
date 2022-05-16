@@ -867,9 +867,7 @@ class EmformerAttention(nn.Module):
         attention_mask = torch.zeros(Q, KV).to(
             dtype=torch.bool, device=utterance.device
         )
-        # disallow attention bettween the summary vector with the memory bank
-        attention_mask[-1, :M] = True
-        (output_right_context_utterance, key, value,) = self._forward_impl(
+        output_right_context_utterance, key, value = self._forward_impl(
             utterance,
             lengths,
             right_context,

@@ -364,7 +364,7 @@ def test_emformer_encoder_forward_infer_consistency():
     left_context_length, right_context_length = 1, 2
     D = 256
     num_encoder_layers = 3
-    kernel_size = 31
+    kernel_size = 5
     memory_sizes = [0, 3]
 
     for M in memory_sizes:
@@ -520,6 +520,6 @@ if __name__ == "__main__":
     test_emformer_encoder_layer_infer()
     test_emformer_encoder_forward()
     test_emformer_encoder_infer()
-    # test_emformer_encoder_forward_infer_consistency()
+    test_emformer_encoder_forward_infer_consistency()
     # test_emformer_forward()
     # test_emformer_infer()
