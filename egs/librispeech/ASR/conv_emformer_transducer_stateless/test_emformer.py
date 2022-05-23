@@ -44,8 +44,9 @@ def test_emformer_attention_forward():
         summary = torch.randn(S, B, D)
         memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
-        PE = 2 * U + right_context_length - 1
+        PE = 2 * (U + right_context_length) - 1
         pos_emb = torch.randn(PE, D)
+        rel_pos = torch.zeros(R + U, KV).to(dtype=torch.int64)
 
         (
             output_right_context_utterance,
@@ -60,6 +61,7 @@ def test_emformer_attention_forward():
             memory,
             attention_mask,
             pos_emb,
+            rel_pos,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
         assert output_memory.shape == (M, B, D)
@@ -76,7 +78,9 @@ def test_emformer_attention_infer():
     num_chunks = 1
     U = chunk_length * num_chunks
     R = right_context_length * num_chunks
-    L = 3
+    left_context_length = 3
+    L = left_context_length
+
     attention = EmformerAttention(
         embed_dim=D,
         nhead=8,
@@ -86,9 +90,11 @@ def test_emformer_attention_infer():
 
     for use_memory in [True, False]:
         if use_memory:
-            S, M = 1, 3
+            max_memory_size = 3
+            S, M = 1, max_memory_size
         else:
-            S, M = 0, 0
+            max_memory_size = 0
+            S, M = 0, max_memory_size
 
         utterance = torch.randn(U, B, D)
         lengths = torch.randint(1, U + 1, (B,))
@@ -99,12 +105,12 @@ def test_emformer_attention_infer():
         left_context_key = torch.randn(L, B, D)
         left_context_val = torch.randn(L, B, D)
         PE = (
-            2 * U
-            + right_context_length
+            2 * (chunk_length + right_context_length)
             - 1
-            + (M * chunk_length if M > 0 else L)
+            + (max_memory_size * chunk_length if M > 0 else left_context_length)
         )
         pos_emb = torch.randn(PE, D)
+        rel_pos = torch.zeros(U + R, M + R + L + U).to(dtype=torch.int64)
 
         (
             output_right_context_utterance,
@@ -120,6 +126,7 @@ def test_emformer_attention_infer():
             left_context_key,
             left_context_val,
             pos_emb,
+            rel_pos,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
         assert output_memory.shape == (S, B, D)
@@ -222,8 +229,9 @@ def test_emformer_encoder_layer_forward():
         right_context = torch.randn(R, B, D)
         memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
-        PE = 2 * U + right_context_length - 1
+        PE = 2 * (U + right_context_length) - 1
         pos_emb = torch.randn(PE, D)
+        rel_pos = torch.zeros(R + U, KV).to(dtype=torch.int64)
 
         output_utterance, output_right_context, output_memory = layer(
             utterance,
@@ -232,6 +240,7 @@ def test_emformer_encoder_layer_forward():
             memory,
             attention_mask,
             pos_emb,
+            rel_pos,
         )
         assert output_utterance.shape == (U, B, D)
         assert output_right_context.shape == (R, B, D)
@@ -276,14 +285,9 @@ def test_emformer_encoder_layer_infer():
         memory = torch.randn(M, B, D)
         state = None
         PE = (
-            2 * U
-            + right_context_length
+            2 * (chunk_length + right_context_length)
             - 1
-            + (
-                max_memory_size * chunk_length
-                if max_memory_size > 0
-                else left_context_length
-            )
+            + (max_memory_size * chunk_length if M > 0 else left_context_length)
         )
         pos_emb = torch.randn(PE, D)
         conv_cache = None
@@ -453,13 +457,13 @@ def test_emformer_encoder_forward_infer_consistency():
             start_idx = chunk_idx * chunk_length
             end_idx = start_idx + chunk_length
             chunk = x[start_idx : end_idx + right_context_length]  # noqa
-            chunk_length = torch.tensor([chunk_length])
+            length = torch.tensor([chunk_length + right_context_length])
             (
                 infer_output_chunk,
                 infer_output_lengths,
                 states,
                 conv_caches,
-            ) = encoder.infer(chunk, chunk_length, states, conv_caches)
+            ) = encoder.infer(chunk, length, states, conv_caches)
             forward_output_chunk = forward_output[start_idx:end_idx]
             assert torch.allclose(
                 infer_output_chunk,
