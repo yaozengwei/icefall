@@ -154,15 +154,24 @@ class ConvolutionModule(nn.Module):
         right_context = right_context.permute(0, 2, 1, 3).reshape(
             num_chunks * B, self.right_context_length, D
         )
-        padding = []
-        for idx in range(num_chunks):
-            end_idx = min(U_, self.cache_size + (idx + 1) * self.chunk_length)
-            start_idx = end_idx - self.cache_size
-            padding.append(pad_utterance[start_idx:end_idx])
-        padding = torch.cat(padding, dim=1).permute(1, 0, 2)
-        # (num_segs * B, cache_size, D)
+
+        intervals = torch.arange(
+            0, self.chunk_length * (num_chunks - 1), self.chunk_length
+        )
+        first = torch.arange(
+            self.chunk_length, self.chunk_length + self.cache_size
+        )
+        indexes = intervals.unsqueeze(1) + first.unsqueeze(0)
+        indexes = torch.cat(
+            [indexes, torch.arange(U_ - self.cache_size, U_).unsqueeze(0)]
+        )
+        padding = pad_utterance[indexes]  # (num_chunks, cache_size, B, D)
+        padding = padding.permute(0, 2, 1, 3).reshape(
+            num_chunks * B, self.cache_size, D
+        )
+
         pad_right_context = torch.cat([padding, right_context], dim=1)
-        # (num_segs * B, cache_size + right_context_length, D)
+        # (num_chunks * B, cache_size + right_context_length, D)
         return pad_right_context.permute(0, 2, 1)
 
     def _merge_right_context(
@@ -1367,8 +1376,6 @@ class EmformerEncoder(nn.Module):
             ]
         )
 
-        self.encoder_pos = RelPositionalEncoding(d_model, dropout)
-
         self.left_context_length = left_context_length
         self.right_context_length = right_context_length
         self.chunk_length = chunk_length
@@ -1380,13 +1387,23 @@ class EmformerEncoder(nn.Module):
         num_chunks = math.ceil(
             (T - self.right_context_length) / self.chunk_length
         )
-        right_context_blocks = []
-        for seg_idx in range(num_chunks - 1):
-            start = (seg_idx + 1) * self.chunk_length
-            end = start + self.right_context_length
-            right_context_blocks.append(x[start:end])
-        right_context_blocks.append(x[T - self.right_context_length :])
-        return torch.cat(right_context_blocks)
+        # first (num_chunks - 1) right context block
+        intervals = torch.arange(
+            0, self.chunk_length * (num_chunks - 1), self.chunk_length
+        )
+        first = torch.arange(
+            self.chunk_length, self.chunk_length + self.right_context_length
+        )
+        indexes = intervals.unsqueeze(1) + first.unsuqeeze(0)
+        # cat last right context block
+        indexes = torch.cat(
+            [
+                indexes,
+                torch.arange(T - self.right_context_length, T).unsqueeze(0),
+            ]
+        )
+        right_context_blocks = x[indexes.reshape(-1)]
+        return right_context_blocks
 
     def _gen_attention_mask_col_widths(
         self, chunk_idx: int, U: int
