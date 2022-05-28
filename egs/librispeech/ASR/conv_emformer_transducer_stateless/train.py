@@ -22,25 +22,37 @@ Usage:
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-./pruned_transducer_stateless4/train.py \
+./conv_emformer_transducer_stateless/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
-  --exp-dir pruned_transducer_stateless2/exp \
+  --exp-dir conv_emformer_transducer_stateless/exp \
   --full-libri 1 \
-  --max-duration 300
+  --max-duration 300 \
+  --master-port 12321 \
+  --num-encoder-layers 12 \
+  --chunk-length 32 \
+  --cnn-module-kernel 31 \
+  --left-context-length 32 \
+  --right-context-length 8 \
+  --memory-size 32
 
 # For mix precision training:
-
-./pruned_transducer_stateless4/train.py \
+./conv_emformer_transducer_stateless/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
   --use-fp16 1 \
-  --exp-dir pruned_transducer_stateless2/exp \
+  --exp-dir conv_emformer_transducer_stateless/exp \
   --full-libri 1 \
-  --max-duration 550
-
+  --max-duration 300 \
+  --master-port 12321 \
+  --num-encoder-layers 12 \
+  --chunk-length 32 \
+  --cnn-module-kernel 31 \
+  --left-context-length 32 \
+  --right-context-length 8 \
+  --memory-size 32
 """
 
 
@@ -128,21 +140,24 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "--left-context-length",
         type=int,
         default=32,
-        help="Number of frames for the left context in the Emformer",
+        help="""Number of frames before subsampling for left context
+        in the Emformer."""
     )
 
     parser.add_argument(
         "--chunk-length",
         type=int,
         default=32,
-        help="Number of frames for each chuunk in the Emformer",
+        help="""Number of frames before subsampling for each chunk
+        in the Emformer."""
     )
 
     parser.add_argument(
         "--right-context-length",
         type=int,
         default=8,
-        help="Number of frames for right context in the Emformer",
+        help="""Number of frames before subsampling for right context
+        in the Emformer."""
     )
 
     parser.add_argument(
