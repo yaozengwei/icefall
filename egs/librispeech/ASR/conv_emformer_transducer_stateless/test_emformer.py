@@ -1,18 +1,6 @@
 import torch
 
 
-def test_rel_positional_encoding():
-    from emformer import RelPositionalEncoding
-
-    D = 256
-    pos_enc = RelPositionalEncoding(D, dropout=0.1)
-    pos_len = 100
-    neg_len = 100
-    x = torch.randn(2, D)
-    x, pos_emb = pos_enc(x, pos_len, neg_len)
-    assert pos_emb.shape == (pos_len + neg_len - 1, D)
-
-
 def test_emformer_attention_forward():
     from emformer import EmformerAttention
 
@@ -39,8 +27,6 @@ def test_emformer_attention_forward():
         summary = torch.randn(S, B, D)
         memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
-        PE = 2 * U - 1
-        pos_emb = torch.randn(PE, D)
 
         output_right_context_utterance, output_memory = attention(
             utterance,
@@ -49,7 +35,6 @@ def test_emformer_attention_forward():
             summary,
             memory,
             attention_mask,
-            pos_emb,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
         assert output_memory.shape == (M, B, D)
@@ -78,8 +63,6 @@ def test_emformer_attention_infer():
         memory = torch.randn(M, B, D)
         left_context_key = torch.randn(L, B, D)
         left_context_val = torch.randn(L, B, D)
-        PE = L + 2 * U - 1
-        pos_emb = torch.randn(PE, D)
 
         (
             output_right_context_utterance,
@@ -94,7 +77,6 @@ def test_emformer_attention_infer():
             memory,
             left_context_key,
             left_context_val,
-            pos_emb,
         )
         assert output_right_context_utterance.shape == (R + U, B, D)
         assert output_memory.shape == (S, B, D)
@@ -197,8 +179,6 @@ def test_emformer_encoder_layer_forward():
         right_context = torch.randn(R, B, D)
         memory = torch.randn(M, B, D)
         attention_mask = torch.rand(Q, KV) >= 0.5
-        PE = 2 * U - 1
-        pos_emb = torch.randn(PE, D)
 
         output_utterance, output_right_context, output_memory = layer(
             utterance,
@@ -206,7 +186,6 @@ def test_emformer_encoder_layer_forward():
             right_context,
             memory,
             attention_mask,
-            pos_emb,
         )
         assert output_utterance.shape == (U, B, D)
         assert output_right_context.shape == (R, B, D)
@@ -248,8 +227,6 @@ def test_emformer_encoder_layer_infer():
         right_context = torch.randn(R, B, D)
         memory = torch.randn(M, B, D)
         state = None
-        PE = left_context_length + 2 * U - 1
-        pos_emb = torch.randn(PE, D)
         conv_cache = None
         (
             output_utterance,
@@ -262,7 +239,6 @@ def test_emformer_encoder_layer_infer():
             lengths,
             right_context,
             memory,
-            pos_emb,
             state,
             conv_cache,
         )
@@ -417,13 +393,14 @@ def test_emformer_encoder_forward_infer_consistency():
             start_idx = chunk_idx * chunk_length
             end_idx = start_idx + chunk_length
             chunk = x[start_idx : end_idx + right_context_length]  # noqa
-            chunk_length = torch.tensor([chunk_length])
             (
                 infer_output_chunk,
                 infer_output_lengths,
                 states,
                 conv_caches,
-            ) = encoder.infer(chunk, chunk_length, states, conv_caches)
+            ) = encoder.infer(
+                chunk, torch.tensor([chunk_length]), states, conv_caches
+            )
             forward_output_chunk = forward_output[start_idx:end_idx]
             assert torch.allclose(
                 infer_output_chunk,
@@ -535,7 +512,6 @@ def test_emformer_infer():
 
 
 if __name__ == "__main__":
-    test_rel_positional_encoding()
     test_emformer_attention_forward()
     test_emformer_attention_infer()
     test_convolution_module_forward()

@@ -335,9 +335,6 @@ class ConvolutionModule(nn.Module):
 class EmformerAttention(nn.Module):
     r"""Emformer layer attention module.
 
-    Relative positional encoding is applied in this module, which is difference
-    from https://github.com/pytorch/audio/blob/main/torchaudio/models/emformer.py  # noqa
-
     Args:
       embed_dim (int):
         Embedding dimension.
@@ -381,27 +378,6 @@ class EmformerAttention(nn.Module):
         self.out_proj = ScaledLinear(
             embed_dim, embed_dim, bias=True, initial_scale=0.25
         )
-
-        # linear transformation for positional encoding.
-        self.linear_pos = ScaledLinear(embed_dim, embed_dim, bias=False)
-        # these two learnable bias are used in matrix c and matrix d
-        # as described in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context" Section 3.3  # noqa
-        self.pos_bias_u = nn.Parameter(torch.Tensor(nhead, self.head_dim))
-        self.pos_bias_v = nn.Parameter(torch.Tensor(nhead, self.head_dim))
-        self.pos_bias_u_scale = nn.Parameter(torch.zeros(()).detach())
-        self.pos_bias_v_scale = nn.Parameter(torch.zeros(()).detach())
-
-        self._reset_parameters()
-
-    def _pos_bias_u(self):
-        return self.pos_bias_u * self.pos_bias_u_scale.exp()
-
-    def _pos_bias_v(self):
-        return self.pos_bias_v * self.pos_bias_v_scale.exp()
-
-    def _reset_parameters(self) -> None:
-        nn.init.normal_(self.pos_bias_u, std=0.01)
-        nn.init.normal_(self.pos_bias_v, std=0.01)
 
     def _gen_attention_probs(
         self,
@@ -459,32 +435,6 @@ class EmformerAttention(nn.Module):
         )
         return attention_probs
 
-    def _rel_shift(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute relative positional encoding.
-
-        Args:
-          x: Input tensor, of shape (B, nhead, U, PE).
-             U is the length of query vector.
-             For training and validation mode, PE = 2 * U - 1;
-             for inference mode, PE = L + 2 * U - 1.
-
-        Returns:
-          A tensor of shape (B, nhead, U, out_len).
-          For non-infer mode, out_len = U;
-          for infer mode, out_len = L + U.
-        """
-        B, nhead, U, PE = x.size()
-        B_stride = x.stride(0)
-        nhead_stride = x.stride(1)
-        U_stride = x.stride(2)
-        PE_stride = x.stride(3)
-        out_len = PE - (U - 1)
-        return x.as_strided(
-            size=(B, nhead, U, out_len),
-            stride=(B_stride, nhead_stride, U_stride - PE_stride, PE_stride),
-            storage_offset=PE_stride * (U - 1),
-        )
-
     def _forward_impl(
         self,
         utterance: torch.Tensor,
@@ -493,7 +443,6 @@ class EmformerAttention(nn.Module):
         summary: torch.Tensor,
         memory: torch.Tensor,
         attention_mask: torch.Tensor,
-        pos_emb: torch.Tensor,
         left_context_key: Optional[torch.Tensor] = None,
         left_context_val: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -523,64 +472,15 @@ class EmformerAttention(nn.Module):
         Q = query.size(0)
         KV = key.size(0)
 
-        reshaped_key, reshaped_value = [
+        reshaped_query, reshaped_key, reshaped_value = [
             tensor.contiguous()
-            .view(KV, B * self.nhead, self.head_dim)
+            .view(-1, B * self.nhead, self.head_dim)
             .transpose(0, 1)
-            for tensor in [key, value]
-        ]  # both of shape (B * nhead, KV, head_dim)
-        reshaped_query = (
-            query.contiguous().view(Q, B, self.nhead, self.head_dim) * scaling
-        )
-
-        # compute attention score
-        # first, compute attention matrix a and matrix c
-        # as described in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context" Section 3.3  # noqa
-        query_with_bais_u = (
-            (reshaped_query + self._pos_bias_u())
-            .view(Q, B * self.nhead, self.head_dim)
-            .transpose(0, 1)
-        )  # (B * nhead, Q, head_dim)
-        matrix_ac = torch.bmm(
-            query_with_bais_u, reshaped_key.transpose(1, 2)
+            for tensor in [query, key, value]
+        ]  # (B * nhead, Q or KV, head_dim)
+        attention_weights = torch.bmm(
+            reshaped_query * scaling, reshaped_key.transpose(1, 2)
         )  # (B * nhead, Q, KV)
-
-        # second, compute attention matrix b and matrix d
-        # relative positional encoding is applied on the part of attention
-        # between chunk (in query) and itself as well as its left context
-        # (in key)
-        utterance_with_bais_v = (
-            reshaped_query[R : R + U] + self._pos_bias_v()
-        ).permute(1, 2, 0, 3)
-        # (B, nhead, U, head_dim)
-        PE = pos_emb.size(0)
-        if left_context_key is not None and left_context_val is not None:
-            # inference mode
-            L = left_context_key.size(0)
-            assert PE == L + 2 * U - 1
-        else:
-            # training and validation mode
-            assert PE == 2 * U - 1
-        pos_emb = (
-            self.linear_pos(pos_emb)
-            .view(PE, self.nhead, self.head_dim)
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )  # (1, nhead, PE, head_dim)
-        matrix_bd_utterance = torch.matmul(
-            utterance_with_bais_v, pos_emb.transpose(-2, -1)
-        )  # (B, nhead, U, PE)
-        # rel-shift operation
-        matrix_bd_utterance = self._rel_shift(matrix_bd_utterance)
-        # (B, nhead, U, U) for training and validation mode;
-        # (B, nhead, U, L + U) for inference mode.
-        matrix_bd_utterance = matrix_bd_utterance.contiguous().view(
-            B * self.nhead, U, -1
-        )
-        matrix_bd = torch.zeros_like(matrix_ac)
-        matrix_bd[:, R : R + U, M + R :] = matrix_bd_utterance
-
-        attention_weights = matrix_ac + matrix_bd
 
         # compute padding mask
         if B == 1:
@@ -620,7 +520,6 @@ class EmformerAttention(nn.Module):
         summary: torch.Tensor,
         memory: torch.Tensor,
         attention_mask: torch.Tensor,
-        pos_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: Modify docs.
         """Forward pass for training and validation mode.
@@ -658,12 +557,6 @@ class EmformerAttention(nn.Module):
         c_i, r_i (in query) -> l_i, c_i, r_i, m_i (in key);
         s_i (in query) -> l_i, c_i, r_i (in key).
 
-        Relative positional encoding is applied on the part of attention between
-        utterance (in query) and utterance (in key). Actually, it is applied on
-        the part of attention between each chunk (in query) and itself as well
-        as its left context (in key), after applying the mask:
-        c_i -> l_i, c_i.
-
         Args:
           utterance (torch.Tensor):
             Full utterance frames, with shape (U, B, D).
@@ -682,9 +575,6 @@ class EmformerAttention(nn.Module):
           attention_mask (torch.Tensor):
             Pre-computed attention mask to simulate underlying chunk-wise
             attention, with shape (Q, KV).
-          pos_emb (torch.Tensor):
-            Position encoding embedding, with shape (PE, D).
-            where PE = 2 * U - 1.
 
         Returns:
           A tuple containing 2 tensors:
@@ -703,7 +593,6 @@ class EmformerAttention(nn.Module):
             summary,
             memory,
             attention_mask,
-            pos_emb,
         )
         return output_right_context_utterance, output_memory[:-1]
 
@@ -716,7 +605,6 @@ class EmformerAttention(nn.Module):
         memory: torch.Tensor,
         left_context_key: torch.Tensor,
         left_context_val: torch.Tensor,
-        pos_emb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for inference.
 
@@ -742,10 +630,6 @@ class EmformerAttention(nn.Module):
           left context, chunk, right context, memory vectors (in key);
         summary (in query) -> left context, chunk, right context (in key).
 
-        Relative positional encoding is applied on the part of attention between
-        chunk (in query) and chunk itself as well as its left context (in key):
-        chunk (in query) -> left context, chunk (in key).
-
         Args:
           utterance (torch.Tensor):
             Current chunk frames, with shape (U, B, D), where U = chunk_length.
@@ -765,9 +649,6 @@ class EmformerAttention(nn.Module):
           left_context_val (torch.Tensor):
             Cached attention value of left context from preceding computation,
             with shape (L, B, D), where L <= left_context_length.
-          pos_emb (torch.Tensor):
-            Position encoding embedding, with shape (PE, D),
-            where PE = L + 2 * U - 1.
 
         Returns:
           A tuple containing 4 tensors:
@@ -805,7 +686,6 @@ class EmformerAttention(nn.Module):
             summary,
             memory,
             attention_mask,
-            pos_emb,
             left_context_key=left_context_key,
             left_context_val=left_context_val,
         )
@@ -1014,7 +894,6 @@ class EmformerEncoderLayer(nn.Module):
         R: int,
         lengths: torch.Tensor,
         memory: torch.Tensor,
-        pos_emb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply attention module in training and validation mode."""
@@ -1040,7 +919,6 @@ class EmformerEncoderLayer(nn.Module):
             summary=summary,
             memory=memory,
             attention_mask=attention_mask,
-            pos_emb=pos_emb,
         )
 
         return output_right_context_utterance, output_memory
@@ -1051,7 +929,6 @@ class EmformerEncoderLayer(nn.Module):
         R: int,
         lengths: torch.Tensor,
         memory: torch.Tensor,
-        pos_emb: torch.Tensor,
         state: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """Apply attention module in inference mode.
@@ -1083,16 +960,6 @@ class EmformerEncoderLayer(nn.Module):
             summary = torch.empty(0).to(
                 dtype=utterance.dtype, device=utterance.device
             )
-        # pos_emb is of shape [PE, D], where PE = L + 2 * U - 1,
-        # for query of [utterance] (i), key-value [left_context, utterance] (j),
-        # the max relative distance i - j is L + U - 1
-        # the min relative distance i - j is -(U - 1)
-        L = left_context_key.size(0)  # L <= left_context_length
-        U = utterance.size(0)
-        PE = L + 2 * U - 1
-        tot_PE = self.left_context_length + 2 * U - 1
-        assert pos_emb.size(0) == tot_PE
-        pos_emb = pos_emb[tot_PE - PE :]
         (
             output_right_context_utterance,
             output_memory,
@@ -1106,7 +973,6 @@ class EmformerEncoderLayer(nn.Module):
             memory=pre_memory,
             left_context_key=left_context_key,
             left_context_val=left_context_val,
-            pos_emb=pos_emb,
         )
         state = self._pack_state(
             next_key, next_val, utterance.size(0), memory, state
@@ -1120,7 +986,6 @@ class EmformerEncoderLayer(nn.Module):
         right_context: torch.Tensor,
         memory: torch.Tensor,
         attention_mask: torch.Tensor,
-        pos_emb: torch.Tensor,
         warmup: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""Forward pass for training and validation mode.
@@ -1145,9 +1010,6 @@ class EmformerEncoderLayer(nn.Module):
           attention_mask (torch.Tensor):
             Attention mask for underlying attention module,
             with shape (Q, KV), where Q = R + U + S, KV = M + R + U.
-          pos_emb (torch.Tensor):
-            Position encoding embedding, with shape (PE, D).
-            For training mode, P = 2*U-1.
 
         Returns:
           A tuple containing 3 tensors:
@@ -1176,7 +1038,7 @@ class EmformerEncoderLayer(nn.Module):
 
         # emformer attention module
         src_att, output_memory = self._apply_attention_module_forward(
-            src, R, lengths, memory, pos_emb, attention_mask
+            src, R, lengths, memory, attention_mask
         )
         src = src + self.dropout(src_att)
 
@@ -1202,7 +1064,6 @@ class EmformerEncoderLayer(nn.Module):
         lengths: torch.Tensor,
         right_context: torch.Tensor,
         memory: torch.Tensor,
-        pos_emb: torch.Tensor,
         state: Optional[List[torch.Tensor]] = None,
         conv_cache: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]:
@@ -1227,9 +1088,6 @@ class EmformerEncoderLayer(nn.Module):
            state (List[torch.Tensor], optional):
              List of tensors representing layer internal state generated in
              preceding computation. (default=None)
-           pos_emb (torch.Tensor):
-             Position encoding embedding, with shape (PE, D).
-             For infer mode, PE = L+2*U-1.
            conv_cache (torch.Tensor, optional):
              Cache tensor of left context for causal convolution.
 
@@ -1252,9 +1110,7 @@ class EmformerEncoderLayer(nn.Module):
             src_att,
             output_memory,
             output_state,
-        ) = self._apply_attention_module_infer(
-            src, R, lengths, memory, pos_emb, state
-        )
+        ) = self._apply_attention_module_infer(src, R, lengths, memory, state)
         src = src + self.dropout(src_att)
 
         # convolution module
@@ -1394,7 +1250,7 @@ class EmformerEncoder(nn.Module):
         first = torch.arange(
             self.chunk_length, self.chunk_length + self.right_context_length
         )
-        indexes = intervals.unsqueeze(1) + first.unsuqeeze(0)
+        indexes = intervals.unsqueeze(1) + first.unsqueeze(0)
         # cat last right context block
         indexes = torch.cat(
             [
@@ -1562,7 +1418,6 @@ class EmformerEncoder(nn.Module):
               right_context at the end.
         """
         U = x.size(0) - self.right_context_length
-        x, pos_emb = self.encoder_pos(x, pos_len=U, neg_len=U)
 
         right_context = self._gen_right_context(x)
         utterance = x[:U]
@@ -1584,7 +1439,6 @@ class EmformerEncoder(nn.Module):
                 right_context,
                 memory,
                 attention_mask,
-                pos_emb,
                 warmup=warmup,
             )
 
@@ -1635,10 +1489,6 @@ class EmformerEncoder(nn.Module):
             f"for dimension 1 of x, but got {x.size(1)}."
         )
 
-        pos_len = self.chunk_length + self.left_context_length
-        neg_len = self.chunk_length
-        x, pos_emb = self.encoder_pos(x, pos_len=pos_len, neg_len=neg_len)
-
         right_context_start_idx = x.size(0) - self.right_context_length
         right_context = x[right_context_start_idx:]
         utterance = x[:right_context_start_idx]
@@ -1663,7 +1513,6 @@ class EmformerEncoder(nn.Module):
                 output_lengths,
                 right_context,
                 memory,
-                pos_emb,
                 None if states is None else states[layer_idx],
                 None if conv_caches is None else conv_caches[layer_idx],
             )
