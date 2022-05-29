@@ -33,7 +33,43 @@ from scaling import (
 )
 from torch import Tensor, nn
 
-from icefall.utils import make_pad_mask, subsequent_chunk_mask
+from icefall.utils import make_pad_mask
+
+
+# Copied and modified from https://github.com/wenet-e2e/wenet/blob/main/wenet/utils/mask.py
+def subsequent_chunk_mask(
+    size: int,
+    chunk_size: int,
+    num_left_chunks: int = -1,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create mask for subsequent steps (size, size) with chunk size,
+       this is for streaming encoder
+    Args:
+        size (int): size of mask
+        chunk_size (int): size of chunk
+        num_left_chunks (int): number of left chunks
+            <0: use full chunk
+            >=0: use num_left_chunks
+        device (torch.device): "cpu" or "cuda" or torch.Tensor.device
+    Returns:
+        torch.Tensor: mask
+    Examples:
+        >>> subsequent_chunk_mask(4, 2)
+        [[1, 1, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 1],
+         [1, 1, 1, 1]]
+    """
+    ret = torch.zeros(size, size, device=device, dtype=torch.bool)
+    for i in range(size):
+        if num_left_chunks < 0:
+            start = 0
+        else:
+            start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
+        ending = min((i // chunk_size + 1) * chunk_size, size)
+        ret[i, start:ending] = True
+    return ret
 
 
 class Conformer(EncoderInterface):
@@ -171,12 +207,15 @@ class Conformer(EncoderInterface):
                 chunk_size = chunk_size % self.short_chunk_size + 1
 
             mask = ~subsequent_chunk_mask(
-                size=x.size(0), chunk_size=chunk_size,
-                num_left_chunks=self.num_left_chunks, device=x.device
+                size=x.size(0),
+                chunk_size=chunk_size,
+                num_left_chunks=self.num_left_chunks,
+                device=x.device,
             )
 
         x, _ = self.encoder(
-            x, pos_emb,
+            x,
+            pos_emb,
             mask=mask,
             src_key_padding_mask=src_key_padding_mask,
             warmup=warmup,
@@ -185,7 +224,6 @@ class Conformer(EncoderInterface):
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
         return x, lengths
-
 
     def streaming_forward(
         self,
@@ -241,8 +279,12 @@ class Conformer(EncoderInterface):
                 states is not None
             ), "Require cache when sending data in streaming mode"
 
-            assert (
-                states.shape == (2, self.encoder_layers, left_context, x.size(0), self.d_model)
+            assert states.shape == (
+                2,
+                self.encoder_layers,
+                left_context,
+                x.size(0),
+                self.d_model,
             ), f"""The shape of states MUST be equal to
              (2, encoder_layers, left_context, batch, d_model) which is
              {(2, self.encoder_layers, left_context, x.size(0), self.d_model)}
@@ -282,7 +324,7 @@ class Conformer(EncoderInterface):
                 size=x.size(0),
                 chunk_size=chunk_size,
                 num_left_chunks=num_left_chunks,
-                device=x.device
+                device=x.device,
             )
             x, _ = self.encoder(
                 x,
@@ -355,9 +397,7 @@ class ConformerEncoderLayer(nn.Module):
         )
 
         self.conv_module = ConvolutionModule(
-            d_model,
-            cnn_module_kernel,
-            causal=causal
+            d_model, cnn_module_kernel, causal=causal
         )
 
         self.norm_final = BasicNorm(d_model)
@@ -487,6 +527,7 @@ class ConformerEncoder(nn.Module):
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
+        self.double_left_context_layer_idx = num_layers * 0.75
 
     def forward(
         self,
@@ -531,7 +572,22 @@ class ConformerEncoder(nn.Module):
         else:
             assert left_context >= 0
 
+        mask = ~subsequent_chunk_mask(
+            size=src.size(0),
+            chunk_size=chunk_size,
+            num_left_chunks=num_left_chunks,
+            device=src.device,
+        )
+
         for layer_index, mod in enumerate(self.layers):
+            if layer_index == self.double_left_context_layer_idx:
+                num_left_chunks *= 2
+                mask = ~subsequent_chunk_mask(
+                    size=src.size(0),
+                    chunk_size=chunk_size,
+                    num_left_chunks=num_left_chunks,
+                    device=src.size(0),
+                )
             output, cache = mod(
                 output,
                 pos_emb,
@@ -607,10 +663,8 @@ class RelPositionalEncoding(torch.nn.Module):
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
     def forward(
-            self,
-            x: torch.Tensor,
-            context: int = 0
-        ) -> Tuple[Tensor, Tensor]:
+        self, x: torch.Tensor, context: int = 0
+    ) -> Tuple[Tensor, Tensor]:
         """Add positional encoding.
 
         Args:
@@ -766,35 +820,38 @@ class RelPositionMultiheadAttention(nn.Module):
             left_context=left_context,
         )
 
-    def rel_shift(self, x: Tensor, left_context: int = 0) -> Tensor:
+    def rel_shift(self, x: Tensor, left_context_length: int = 0) -> Tensor:
         """Compute relative positional encoding.
 
-        Args:
-            x: Input tensor (batch, head, time1, 2*time1-1).
-                time1 means the length of query vector.
-            left_context (int): left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+          x (tensor):
+            Input tensor of shape (batch, nhead, tgt_len, PE),
+            where src_len is the length of query tensor.
+            For streaming decoding, PE = left_context + 2 * tgt_len - 1;
+            otherwise, PE = 2 * tgt_len - 1
+
+          left_context_length (int):
+            Left context (in frames) used during streaming decoding.
+            It is used only in real streaming decoding;
+            in other circumstances, it MUST be 0.
 
         Returns:
-            Tensor: tensor of shape (batch, head, time1, time2)
-          (note: time2 has the same value as time1, but it is for
-          the key, while time1 is for the query).
+            A tensor of shape (batch, nhead, tgt_len, src_len),
+            where src_len is the length of key tensor.
         """
-        (batch_size, num_heads, time1, n) = x.shape
+        (batch_size, num_heads, tgt_len, PE) = x.shape
 
-        time2 = time1 + left_context
-        assert n == 2 * time2 - 1, f"{n} == 2 * {time2} - 1"
+        src_len = tgt_len + left_context_length
+        assert src_len == PE - (tgt_len - 1)
 
         # Note: TorchScript requires explicit arg for stride()
         batch_stride = x.stride(0)
-        head_stride = x.stride(1)
-        time1_stride = x.stride(2)
-        n_stride = x.stride(3)
+        nhead_stride = x.stride(1)
+        tgt_len_stride = x.stride(2)
+        PE_stride = x.stride(3)
         return x.as_strided(
-            (batch_size, num_heads, time1, time2),
-            (batch_stride, head_stride, time1_stride - n_stride, n_stride),
-            storage_offset=n_stride * (time1 - 1),
+            (batch_size, num_heads, tgt_len, src_len),
+            (batch_stride, nhead_stride, tgt_len_stride - PE_stride, PE_stride),
+            storage_offset=PE_stride * (tgt_len - 1),
         )
 
     def multi_head_attention_forward(
@@ -814,27 +871,33 @@ class RelPositionMultiheadAttention(nn.Module):
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
         attn_mask: Optional[Tensor] = None,
-        left_context: int = 0,
+        left_context_length: int = 0,
+        cache: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""
         Args:
-            query, key, value: map a query and a set of key-value pairs to an output.
-            pos_emb: Positional embedding tensor
-            embed_dim_to_check: total dimension of the model.
-            num_heads: parallel attention heads.
-            in_proj_weight, in_proj_bias: input projection weight and bias.
-            dropout_p: probability of an element to be zeroed.
-            out_proj_weight, out_proj_bias: the output projection weight and bias.
-            training: apply dropout if is ``True``.
-            key_padding_mask: if provided, specified padding elements in the key will
-                be ignored by the attention. This is an binary mask. When the value is True,
-                the corresponding value on the attention layer will be filled with -inf.
-            need_weights: output attn_output_weights.
-            attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
-                the batches while a 3D mask allows to specify a different mask for the entries of each batch.
-            left_context (int): left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+          query, key, value: map a query and a set of key-value pairs to an output.
+          pos_emb: Positional embedding tensor
+          embed_dim_to_check: total dimension of the model.
+          num_heads: parallel attention heads.
+          in_proj_weight, in_proj_bias: input projection weight and bias.
+          dropout_p: probability of an element to be zeroed.
+          out_proj_weight, out_proj_bias: the output projection weight and bias.
+          training: apply dropout if is ``True``.
+          key_padding_mask: if provided, specified padding elements in the key will
+              be ignored by the attention. This is an binary mask. When the value is True,
+              the corresponding value on the attention layer will be filled with -inf.
+          need_weights: output attn_output_weights.
+          attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
+              the batches while a 3D mask allows to specify a different mask for the entries of each batch.
+          left_context_length (int):
+            Length of left context (in frames) used during streaming decoding.
+            It is used only in real streaming decoding;
+            in other circumstances, it MUST be 0.
+          cache (tensor):
+            Cached key and value tensors of left context.
+            Its shape is (2, left_context_length, batch, nhead, head_dim).
+            cache[0, ...] is key and cache[1, ...] is value.
 
         Shape:
             Inputs:
@@ -866,6 +929,7 @@ class RelPositionMultiheadAttention(nn.Module):
         """
 
         tgt_len, bsz, embed_dim = query.size()
+        src_len = key.size(0)
         assert embed_dim == embed_dim_to_check
         assert key.size(0) == value.size(0) and key.size(1) == value.size(1)
 
@@ -980,10 +1044,22 @@ class RelPositionMultiheadAttention(nn.Module):
             key_padding_mask = key_padding_mask.to(torch.bool)
 
         q = (q * scaling).contiguous().view(tgt_len, bsz, num_heads, head_dim)
-        k = k.contiguous().view(-1, bsz, num_heads, head_dim)
-        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
+        k = k.contiguous().view(src_len, bsz, num_heads, head_dim)
+        v = v.contiguous().view(src_len, bsz, num_heads, head_dim)
 
-        src_len = k.size(0)
+        if cache is not None:
+            # pad cached key and value of left context
+            key_cache = cache[0]
+            val_cache = cache[1]
+            k = torch.cat([key_cache, k], dim=0)
+            v = torch.cat([val_cache, v], dim=0)
+            src_len = k.size(0)
+        # update attention cache
+        new_key_cache = k[src_len - left_context_length :]
+        new_val_cache = v[src_len - left_context_length :]
+        new_cache = torch.stack([new_key_cache, new_val_cache], dim=0)
+
+        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
 
         if key_padding_mask is not None:
             assert key_padding_mask.size(0) == bsz, "{} == {}".format(
@@ -1021,7 +1097,7 @@ class RelPositionMultiheadAttention(nn.Module):
         matrix_bd = torch.matmul(
             q_with_bias_v, p
         )  # (batch, head, time1, 2*time1-1)
-        matrix_bd = self.rel_shift(matrix_bd, left_context)
+        matrix_bd = self.rel_shift(matrix_bd, left_context_length)
 
         attn_output_weights = (
             matrix_ac + matrix_bd
@@ -1063,16 +1139,23 @@ class RelPositionMultiheadAttention(nn.Module):
         # the whole column of `attn_output_weights` will be `-inf`
         # (i.e. be `nan` after softmax), so, we fill `0.0` at the masking
         # positions to avoid invalid loss value below.
-        if attn_mask is not None and attn_mask.dtype == torch.bool and \
-                key_padding_mask is not None:
-            combined_mask = attn_mask.unsqueeze(
-                0) | key_padding_mask.unsqueeze(1).unsqueeze(2)
+        if (
+            attn_mask is not None
+            and attn_mask.dtype == torch.bool
+            and key_padding_mask is not None
+        ):
+            combined_mask = attn_mask.unsqueeze(0) | key_padding_mask.unsqueeze(
+                1
+            ).unsqueeze(2)
             attn_output_weights = attn_output_weights.view(
-                bsz, num_heads, tgt_len, src_len)
+                bsz, num_heads, tgt_len, src_len
+            )
             attn_output_weights = attn_output_weights.masked_fill(
-                combined_mask, 0.0)
+                combined_mask, 0.0
+            )
             attn_output_weights = attn_output_weights.view(
-                bsz * num_heads, tgt_len, src_len)
+                bsz * num_heads, tgt_len, src_len
+            )
 
         attn_output_weights = nn.functional.dropout(
             attn_output_weights, p=dropout_p, training=training
@@ -1094,20 +1177,21 @@ class RelPositionMultiheadAttention(nn.Module):
             attn_output_weights = attn_output_weights.view(
                 bsz, num_heads, tgt_len, src_len
             )
-            return attn_output, attn_output_weights.sum(dim=1) / num_heads
+            attn_output_weights = attn_output_weights.sum(dim=1) / num_heads
+            return attn_output, new_cache, attn_output_weights
         else:
-            return attn_output, None
+            return attn_output, new_cache, None
 
 
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model.
-    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/conformer/convolution.py
+    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/conformer/convolution.py  # noqa
 
     Args:
-        channels (int): The number of channels of conv layers.
-        kernel_size (int): Kernerl size of conv layers.
-        bias (bool): Whether to use bias in conv layers (default=True).
-        causal (bool): Whether to use causal convolution.
+      channels (int):
+        The number of channels of conv layers.
+      kernel_size (int):
+        Kernerl size of conv layers.
     """
 
     def __init__(
@@ -1115,13 +1199,11 @@ class ConvolutionModule(nn.Module):
         channels: int,
         kernel_size: int,
         bias: bool = True,
-        causal: bool = False
     ) -> None:
         """Construct an ConvolutionModule object."""
         super(ConvolutionModule, self).__init__()
         # kernerl_size should be a odd number for 'SAME' padding
         assert (kernel_size - 1) % 2 == 0
-        self.causal = causal
 
         self.pointwise_conv1 = ScaledConv1d(
             channels,
@@ -1132,34 +1214,33 @@ class ConvolutionModule(nn.Module):
             bias=bias,
         )
 
-        # after pointwise_conv1 we put x through a gated linear unit (nn.functional.glu).
-        # For most layers the normal rms value of channels of x seems to be in the range 1 to 4,
-        # but sometimes, for some reason, for layer 0 the rms ends up being very large,
-        # between 50 and 100 for different channels.  This will cause very peaky and
-        # sparse derivatives for the sigmoid gating function, which will tend to make
-        # the loss function not learn effectively.  (for most layers the average absolute values
-        # are in the range 0.5..9.0, and the average p(x>0), i.e. positive proportion,
-        # at the output of pointwise_conv1.output is around 0.35 to 0.45 for different
-        # layers, which likely breaks down as 0.5 for the "linear" half and
-        # 0.2 to 0.3 for the part that goes into the sigmoid.  The idea is that if we
-        # constrain the rms values to a reasonable range via a constraint of max_abs=10.0,
-        # it will be in a better position to start learning something, i.e. to latch onto
-        # the correct range.
+        # After pointwise_conv1 we put x through a gated linear unit
+        # (nn.functional.glu).
+        # For most layers the normal rms value of channels of x seems to be in
+        # the range 1 to 4, but sometimes, for some reason, for layer 0 the rms
+        # ends up being very large, between 50 and 100 for different channels.
+        # This will cause very peaky and sparse derivatives for the sigmoid
+        # gating function, which will tend to make the loss function not learn
+        # effectively.  (for most layers the average absolute values are in the
+        # range 0.5..9.0, and the average p(x>0), i.e. positive proportion,
+        # at the output of pointwise_conv1.output is around 0.35 to 0.45 for
+        # different layers, which likely breaks down as 0.5 for the "linear"
+        # half and 0.2 to 0.3 for the part that goes into the sigmoid.
+        # The idea is that if we constrain the rms values to a reasonable range
+        # via a constraint of max_abs=10.0, it will be in a better position to
+        # start learning something, i.e. to latch onto the correct range.
         self.deriv_balancer1 = ActivationBalancer(
             channel_dim=1, max_abs=10.0, min_positive=0.05, max_positive=1.0
         )
 
-        self.lorder = kernel_size - 1
-        padding = (kernel_size - 1) // 2
-        if self.causal:
-            padding = 0
-
+        # make it causal by padding cached (kernel_size - 1) frames on the left
+        self.cache_size = kernel_size - 1
         self.depthwise_conv = ScaledConv1d(
             channels,
             channels,
             kernel_size,
             stride=1,
-            padding=padding,
+            padding=0,
             groups=channels,
             bias=bias,
         )
@@ -1180,38 +1261,48 @@ class ConvolutionModule(nn.Module):
             initial_scale=0.25,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Compute convolution module.
+    def forward(self, x: Tensor, cache: Optional[Tensor] = None) -> Tensor:
+        """Causal convolution module.
 
         Args:
-            x: Input tensor (#time, batch, channels).
+          x (Tensor):
+            Input tensor of shape (time, batch, channel).
+          cache (Tensor):
+            Cached left context for causal convolution.
 
         Returns:
-            Tensor: Output tensor (#time, batch, channels).
-
+          A tensor of shape (time, batch, channels).
         """
+        time, batch, channel = x.size()
         # exchange the temporal dimension and the feature dimension
-        x = x.permute(1, 2, 0)  # (#batch, channels, time).
+        x = x.permute(1, 2, 0)  # (batch, channels, time).
 
-        # GLU mechanism
-        x = self.pointwise_conv1(x)  # (batch, 2*channels, time)
-
+        # point-wise conv and GLU mechanism
+        x = self.pointwise_conv1(x)  # (batch, 2 * channel, time)
         x = self.deriv_balancer1(x)
-        x = nn.functional.glu(x, dim=1)  # (batch, channels, time)
+        x = nn.functional.glu(x, dim=1)  # (batch, channel, time)
+
+        if cache is None:
+            cache = torch.zeros(
+                batch, channel, self.cache_size, device=x.device, dtype=x.dtype
+            )
+        else:
+            assert cache.shape == (batch, channel, self.cache_size)
+        # make depthwise_conv causal by manualy padding cache tensor to the left
+        x = torch.cat([cache, x], dim=2)
+        # update cache
+        new_cache = x[:, :, -self.cache_size :]
 
         # 1D Depthwise Conv
-        if self.causal and self.lorder > 0:
-            # Make depthwise_conv causal by
-            # manualy padding self.lorder zeros to the left
-            x = nn.functional.pad(x, (self.lorder, 0), "constant", 0.0)
         x = self.depthwise_conv(x)
 
         x = self.deriv_balancer2(x)
         x = self.activation(x)
 
+        # point-wise conv
         x = self.pointwise_conv2(x)  # (batch, channel, time)
 
-        return x.permute(2, 0, 1)
+        return x.permute(2, 0, 1), new_cache
 
 
 class Conv2dSubsampling(nn.Module):
