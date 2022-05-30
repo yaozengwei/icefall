@@ -19,7 +19,7 @@ import logging
 import copy
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 import torch
 from encoder_interface import EncoderInterface
@@ -72,6 +72,42 @@ def subsequent_chunk_mask(
     return ret
 
 
+def chunk_mask_with_left_context(
+    chunk_size: int,
+    left_context_size: int,
+    cached_left_context_sizes: Tensor,
+    device: torch.device = torch.device("cpu"),
+) -> Tensor:
+    """Obtain mask for streaming decoding.
+    Args:
+      chunk_size:
+        Length of chunk frames.
+      left_context_size:
+        Target length of left context frames.
+      cached_left_context_sizes:
+        Real lengths of cached left context frames for each sample in the batch.
+        Its size is (batch_size,).
+      device:
+        "cpu" or "cuda" or torch.Tensor.device.
+
+    Returns:
+      A tensor of shape
+      (batch_size, chunk_length, target_left_context_length + chunk_length).
+    """
+    batch_size = len(cached_left_context_sizes)
+    mask = torch.zeros(
+        chunk_size,
+        left_context_size + chunk_size,
+        device=device,
+        dtype=torch.bool,
+    )
+    for i in range(batch_size):
+        cached_left = cached_left_context_sizes[i].item()
+        assert cached_left <= left_context_size
+        mask[i, :, -(cached_left + chunk_size) :] = True
+    return mask
+
+
 class Conformer(EncoderInterface):
     """
     Args:
@@ -118,11 +154,9 @@ class Conformer(EncoderInterface):
         dropout: float = 0.1,
         layer_dropout: float = 0.075,
         cnn_module_kernel: int = 31,
-        dynamic_chunk_training: bool = False,
         short_chunk_threshold: float = 0.75,
         short_chunk_size: int = 25,
         num_left_chunks: int = -1,
-        causal: bool = False,
     ) -> None:
         super(Conformer, self).__init__()
 
@@ -138,13 +172,18 @@ class Conformer(EncoderInterface):
         #   (2) embedding: num_features -> d_model
         self.encoder_embed = Conv2dSubsampling(num_features, d_model)
 
-        self.encoder_layers = num_encoder_layers
+        self.num_encoder_layers = num_encoder_layers
         self.d_model = d_model
         self.dynamic_chunk_training = dynamic_chunk_training
         self.short_chunk_threshold = short_chunk_threshold
         self.short_chunk_size = short_chunk_size
-        self.num_left_chunks = num_left_chunks
-        self.causal = causal
+
+        self.list_expand_left_layer_idx = []
+        self.list_num_left_chunks = []
+        for layer_idx in range(0, num_encoder_layers, expand_period):
+            self.list_expand_left_layer_idx.append(layer_idx)
+            self.list_num_left_chunks.append(num_left_chunks)
+            num_left_chunks *= 2
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
@@ -193,30 +232,29 @@ class Conformer(EncoderInterface):
         assert x.size(0) == lengths.max().item()
 
         src_key_padding_mask = make_pad_mask(lengths)
-        mask = None
 
-        if self.dynamic_chunk_training:
-            assert (
-                self.causal
-            ), "Causal convolution is required for streaming conformer."
-            max_len = x.size(0)
-            chunk_size = torch.randint(1, max_len, (1,)).item()
-            if chunk_size > (max_len * self.short_chunk_threshold):
-                chunk_size = max_len
-            else:
-                chunk_size = chunk_size % self.short_chunk_size + 1
+        max_len = x.size(0)
+        chunk_size = torch.randint(1, max_len, (1,)).item()
+        if chunk_size > (max_len * self.short_chunk_threshold):
+            # full context
+            chunk_size = max_len
+        else:
+            chunk_size = chunk_size % self.short_chunk_size + 1
 
+        attn_masks = []
+        for num_left_chunks in self.list_num_left_chunks:
             mask = ~subsequent_chunk_mask(
                 size=x.size(0),
                 chunk_size=chunk_size,
-                num_left_chunks=self.num_left_chunks,
+                num_left_chunks=num_left_chunks,
                 device=x.device,
             )
+            attn_masks.append(mask)
 
-        x, _ = self.encoder(
+        x, _, _ = self.encoder(
             x,
             pos_emb,
-            mask=mask,
+            attn_masks=attn_masks,
             src_key_padding_mask=src_key_padding_mask,
             warmup=warmup,
         )  # (T, N, C)
@@ -338,20 +376,119 @@ class Conformer(EncoderInterface):
 
         return x, lengths, states
 
+    def streaming_forward(
+        self,
+        x: Tensor,
+        x_lens: Tensor,
+        states: List[Tensor],
+        left_context_size: int,
+    ):
+        """This is for real streaming decoding.
+        Args:
+          x:
+            Input tensor with shape of (batch_size, chunk_size, feature_dim).
+          x_lens:
+            A tensor of shape (batch,) containing the number of frames in
+            `x` before padding.
+          states:
+            Cached states including:
+            - real lengths of cached attention left context of each sample in
+              batch, with shape of (batch_size,).
+            - attention caches, with shape of
+              (num_encoder_layers, 2, left_context_length, batch_size, d_model).
+            - convolution caches, with shape of
+              (num_encoder_layers, batch_size, d_model, cnn_module_kernel - 1).
+          left_context_size:
+            Length of left context frames.
+
+        Returns:
+        """
+        batch_size, chunk_size, _ = x.size()
+
+        assert (
+            states is not None
+        ), "Require states when sending data in streaming mode"
+        assert len(states) == 3, len(states)
+
+        cached_left_context_sizes = states[0]
+        assert cached_left_context_sizes.shape == (
+            batch_size,
+        ), cached_left_context_sizes.shape
+
+        attn_caches = states[1]
+        assert attn_caches.shape == (
+            self.num_encoder_layers,
+            2,
+            left_context_size,
+            batch_size,
+            self.d_model,
+        ), attn_caches.shape
+
+        conv_caches = states[2]
+        assert conv_caches.shape == (
+            self.num_encoder_layers,
+            batch_size,
+            self.d_model,
+            self.cnn_module_kernel - 1,
+        ), conv_caches.shape
+
+        x = self.encoder_embed(x)
+        # query: [chunk] -> key: [left context, chunk]
+        # relative distance of index i in query and index j in key is in range:
+        # [-(chunk_size - 1), left_context_size + chunk_size - 1]
+        x, pos_emb = self.encoder_pos(
+            x, pos_len=chunk_size + left_context_size, neg_len=chunk_size
+        )
+        x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
+        # Caution: We assume the subsampling factor is 4!
+        # lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
+        #
+        # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
+        lengths = (((x_lens - 1) >> 1) - 1) >> 1
+
+        padding_mask = make_pad_mask(lengths + left_context_size)
+        attn_mask = ~chunk_mask_with_left_context(
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            cached_left_context_sizes=cached_left_context_sizes,
+            device=x.device,
+        )
+
+        x, new_attn_caches, new_conv_caches = self.encoder(
+            x,
+            pos_emb,
+            attn_mask=attn_mask,
+            padding_mask=padding_mask,
+            attn_caches=attn_caches,
+            conv_caches=conv_caches,
+            attn_left_context_length=left_context_length,
+        )  # (T, B, F)
+
+        x = x.permute(1, 0, 2)  # (T, N, C) -> (N, T, C)
+
+        # update
+        cached_left_context_sizes += chunk_size
+        cached_left_context_sizes.clamp_(max=left_context_size)
+
+        return x, new_attn_caches, new_conv_caches
+
 
 class ConformerEncoderLayer(nn.Module):
-    """
-    ConformerEncoderLayer is made up of self-attn, feedforward and convolution networks.
+    """ConformerEncoderLayer is made up of self-attn, feedforward and
+    convolution networks.
     See: "Conformer: Convolution-augmented Transformer for Speech Recognition"
 
     Args:
-        d_model: the number of expected features in the input (required).
-        nhead: the number of heads in the multiheadattention models (required).
-        dim_feedforward: the dimension of the feedforward network model (default=2048).
-        dropout: the dropout value (default=0.1).
-        cnn_module_kernel (int): Kernel size of convolution module.
-        causal (bool): Whether to use causal convolution in conformer encoder
-            layer. This MUST be True when using dynamic_chunk_training and streaming decoding.
+      d_model:
+        The number of expected features in the input (required).
+      nhead:
+        The number of heads in the multiheadattention models (required).
+      dim_feedforward:
+        The dimension of the feedforward network model (default=2048).
+      dropout:
+        The dropout value (default=0.1).
+      cnn_module_kernel (int):
+        Kernel size of convolution module.
 
     Examples::
         >>> encoder_layer = ConformerEncoderLayer(d_model=512, nhead=8)
@@ -368,7 +505,6 @@ class ConformerEncoderLayer(nn.Module):
         dropout: float = 0.1,
         layer_dropout: float = 0.075,
         cnn_module_kernel: int = 31,
-        causal: bool = False,
     ) -> None:
         super(ConformerEncoderLayer, self).__init__()
 
@@ -396,13 +532,11 @@ class ConformerEncoderLayer(nn.Module):
             ScaledLinear(dim_feedforward, d_model, initial_scale=0.25),
         )
 
-        self.conv_module = ConvolutionModule(
-            d_model, cnn_module_kernel, causal=causal
-        )
+        self.conv_module = ConvolutionModule(d_model, cnn_module_kernel)
 
         self.norm_final = BasicNorm(d_model)
 
-        # try to ensure the output is close to zero-mean (or at least, zero-median).
+        # try to ensure the output is close to zero-mean (or at least, zero-median) # noqa
         self.balancer = ActivationBalancer(
             channel_dim=-1, min_positive=0.45, max_positive=0.55, max_abs=6.0
         )
@@ -413,36 +547,56 @@ class ConformerEncoderLayer(nn.Module):
         self,
         src: Tensor,
         pos_emb: Tensor,
-        src_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         warmup: float = 1.0,
-        states: Optional[Tensor] = None,
-        left_context: int = 0,
+        attn_cache: Optional[Tensor] = None,
+        conv_cache: Optional[Tensor] = None,
+        left_context_length: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Pass the input through the encoder layer.
 
         Args:
-            src: the sequence to the encoder layer (required).
-            pos_emb: Positional embedding tensor (required).
-            src_mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-            warmup: controls selective bypass of of layers; if < 1.0, we will
-              bypass layers more frequently.
-            states:
-              The decode states for previous frames which contains the cached data.
-              It has a shape of (2, encoder_layers, left_context, batch, attention_dim),
-              states[0,...] is the attn_cache, states[1,...] is the conv_cache.
-            left_context: left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+          src (Tensor):
+            Input sequence to the encoder layer with shape (L, N, E).
+          pos_emb (Tensor):
+            Positional embedding tensor of shape (N, PE, E).
+            In streaming decoding mode, PE = left_context_length + 2 * L - 1;
+            otherwise, PE = 2 * L - 1.
+          attn_mask (Tensor, optional):
+            The attention mask for streaming simulation.
+            Its shape is (L, L).
+          src_key_padding_mask (Tensor, optional):
+            The mask for the src keys per batch.
+            In streaming decoding mode, its shape is (N, left_context_length + L). # noqa
+            otherwise, its shape is (N, L).
+          warmup (float, optional):
+            It controls selective bypass of of layers;
+            if < 1.0, we will bypass layers more frequently.
+          attn_cache (Tensor, optional):
+            Cached attention key and value tensors of left context frames.
+            Its shape is (2, left_context_length, N, E).
+            cache[0, ...] is key and cache[1, ...] is value.
+          conv_cache (Tensor, optional):
+            Cached left context frames for causal convolution.
+            Its shape is (N, E, kernel_size - 1).
+          left_context_length (Tensor, optional):
+            Length of cached left context frames for attention.
+            It is used only in real streaming decoding;
+            in other circumstances, it MUST be 0.
 
-        Shape:
-            src: (S, N, E).
-            pos_emb: (N, 2*S-1, E),for streaming decoding it is (N, 2*(S+left_context)-1, E).
-            src_mask: (S, S).
-            src_key_padding_mask: (N, S).
-            S is the source sequence length, N is the batch size, E is the feature number
+          L: length of input sequence;
+          N: batch size;
+          E: feature number.
+
+        Returns:
+          A tuple of 3 tensors:
+            - output sequence, with shape of (L, N, E)
+            - updated attention cache,
+              with shape of (2, left_context_length, N, E)
+            - updated convolution cache,
+              with shape of (N, E, kernel_size - 1)
         """
         src_orig = src
 
@@ -461,39 +615,21 @@ class ConformerEncoderLayer(nn.Module):
         # macaron style feed forward module
         src = src + self.dropout(self.feed_forward_macaron(src))
 
-        key = src
-        val = src
-        if not self.training and states is not None:
-            # src: [chunk_size, N, F] e.g. [8, 41, 512]
-            key = torch.cat([states[0, ...], src], dim=0)
-            val = key
-            states[0, ...] = key[-left_context:, ...]
-        else:
-            assert left_context == 0
-
         # multi-headed self-attention module
-        src_att = self.self_attn(
+        src_attn, attn_cache, _ = self.self_attn(
             src,
-            key,
-            val,
+            src,
+            src,
             pos_emb=pos_emb,
-            attn_mask=src_mask,
+            attn_mask=attn_mask,
             key_padding_mask=src_key_padding_mask,
-            left_context=left_context,
-        )[0]
-
-        src = src + self.dropout(src_att)
+            left_context_length=left_context_length,
+        )
+        src = src + self.dropout(src_attn)
 
         # convolution module
-        residual = src
-        if not self.training and states is not None:
-            src = torch.cat([states[1, ...], src], dim=0)
-            states[1, ...] = src[-left_context:, ...]
-
-        conv = self.conv_module(src)
-        conv = conv[-residual.size(0) :, :, :]  # noqa: E203
-
-        src = residual + self.dropout(conv)
+        src_conv, conv_cache = self.conv_module(src, conv_cache)
+        src = src + self.dropout(src_conv)
 
         # feed forward module
         src = src + self.dropout(self.feed_forward(src))
@@ -503,15 +639,17 @@ class ConformerEncoderLayer(nn.Module):
         if alpha != 1.0:
             src = alpha * src + (1 - alpha) * src_orig
 
-        return src, states
+        return src, attn_cache, conv_cache
 
 
 class ConformerEncoder(nn.Module):
     r"""ConformerEncoder is a stack of N encoder layers
 
     Args:
-        encoder_layer: an instance of the ConformerEncoderLayer() class (required).
-        num_layers: the number of sub-encoder-layers in the encoder (required).
+      encoder_layer:
+        An instance of the ConformerEncoderLayer() class.
+      num_layers:
+        The number of sub-encoder-layers in the encoder.
 
     Examples::
         >>> encoder_layer = ConformerEncoderLayer(d_model=512, nhead=8)
@@ -521,40 +659,62 @@ class ConformerEncoder(nn.Module):
         >>> out = conformer_encoder(src, pos_emb)
     """
 
-    def __init__(self, encoder_layer: nn.Module, num_layers: int) -> None:
+    def __init__(
+        self,
+        encoder_layer: nn.Module,
+        num_layers: int,
+        expand_layer_indexes: Optional[Set[int]] = None,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
-        self.double_left_context_layer_idx = num_layers * 0.75
+        # e.g., [6, 9], indicates the attention left context length will be
+        # expanded at layer-6 and layer-9
+        self.expand_layer_indexes = expand_layer_indexes
 
     def forward(
         self,
         src: Tensor,
         pos_emb: Tensor,
-        mask: Optional[Tensor] = None,
+        attn_masks: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         warmup: float = 1.0,
-        states: Optional[Tensor] = None,
-        left_context: int = 0,
+        attn_caches: Optional[Tensor] = None,
+        conv_caches: Optional[Tensor] = None,
+        attn_left_context_lengths: Optional[List[int]] = None,
     ) -> Tuple[Tensor, Tensor]:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
-            src: the sequence to the encoder (required).
-            pos_emb: Positional embedding tensor (required).
-            mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-            warmup: controls selective bypass of of layers; if < 1.0, we will
-              bypass layers more frequently.
-            states:
-              The decode states for previous frames which contains the cached data.
-              It has a shape of (2, encoder_layers, left_context, batch, attention_dim),
-              states[0,...] is the attn_cache, states[1,...] is the conv_cache.
-            left_context: left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+          src (Tensor):
+            Input sequence to the encoder layer with shape (L, N, E).
+          pos_emb (Tensor):
+            Positional embedding tensor of shape (N, PE, E).
+            In streaming decoding mode, PE = left_context_length + 2 * L - 1;
+            otherwise, PE = 2 * L - 1.
+          attn_masks (Tensor, optional):
+            List of attention masks for streaming simulation.
+            The shape of each element is (L, L).
+          src_key_padding_mask (Tensor, optional):
+            The mask for the src keys per batch.
+            In streaming decoding mode, its shape is (N, left_context_length + L). # noqa
+            otherwise, its shape is (N, L).
+          warmup (float, optional):
+            It controls selective bypass of of layers;
+            if < 1.0, we will bypass layers more frequently.
+          attn_caches (Tensor, optional):
+            Cached attention key and value tensors of left context frames.
+            Its shape is (num_encoder_layers, 2, left_context_length, N, E).
+            cache[0, ...] is key and cache[1, ...] is value.
+          conv_caches (Tensor, optional):
+            Cached left context frames for causal convolution.
+            Its shape is (num_encoder_layers, N, E, kernel_size - 1).
+          attn_left_context_lengths (Tensor, optional):
+            List of lengths of cached left context frames for attention.
+            It is used only in real streaming decoding;
+            in other circumstances, it MUST be None.
 
         Shape:
             src: (S, N, E).
@@ -564,129 +724,173 @@ class ConformerEncoder(nn.Module):
             S is the source sequence length, T is the target sequence length, N is the batch size, E is the feature number
 
         """
-        output = src
+        streaming_mode = True if attn_masks is None else False
 
-        if self.training:
-            assert left_context == 0
-            assert states is None
-        else:
-            assert left_context >= 0
-
-        mask = ~subsequent_chunk_mask(
-            size=src.size(0),
-            chunk_size=chunk_size,
-            num_left_chunks=num_left_chunks,
-            device=src.device,
-        )
-
-        for layer_index, mod in enumerate(self.layers):
-            if layer_index == self.double_left_context_layer_idx:
-                num_left_chunks *= 2
-                mask = ~subsequent_chunk_mask(
-                    size=src.size(0),
-                    chunk_size=chunk_size,
-                    num_left_chunks=num_left_chunks,
-                    device=src.size(0),
+        expand_idx = -1
+        expand_layer_indexes: List[int] = []
+        if self.expand_layer_indexes is not None:
+            expand_layer_indexes = sorted(list(self.expand_layer_indexes))
+            if not streaming_mode:
+                assert len(attn_masks) - 1 == len(expand_layer_indexes)
+            else:
+                assert len(attn_left_context_lengths) - 1 == len(
+                    expand_layer_indexes
                 )
-            output, cache = mod(
+            expand_idx = expand_layer_indexes.pop(0)
+
+        if not streaming_mode:
+            assert attn_caches is None
+            assert conv_caches is None
+            assert attn_left_context_lengths is None
+            mask = attn_masks[0]
+            attn_left = 0
+        else:
+            mask = None
+            attn_left = attn_left_context_lengths[0]
+
+        new_attn_caches = []
+        new_conv_caches = []
+        output = src
+        for layer_idx, mod in enumerate(self.layers):
+            if layer_idx == expand_idx:
+                if not streaming_mode:
+                    mask = attn_masks[expand_idx]
+                else:
+                    attn_left = attn_left_context_lengths[expand_idx]
+                if len(expand_layer_indexes) > 0:
+                    expand_idx = expand_layer_indexes.pop(0)
+
+            output, attn_cache, conv_cache = mod(
                 output,
                 pos_emb,
-                src_mask=mask,
+                attn_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
                 warmup=warmup,
-                states=None if states is None else states[:, layer_index, ...],
-                left_context=left_context,
+                attn_cache=attn_caches[layer_idx] if streaming_mode else None,
+                conv_caches=conv_caches[layer_idx] if streaming_mode else None,
+                attn_left_context_length=attn_left,
             )
-            if states is not None:
-                states[:, layer_index, ...] = cache
+            new_attn_caches.append(attn_cache)
+            new_conv_caches.append(conv_cache)
 
-        return output, states
+        new_attn_caches = torch.cat(new_attn_caches)
+        new_conv_caches = torch.cat(new_conv_caches)
+        return output, new_attn_caches, new_conv_caches
 
 
 class RelPositionalEncoding(torch.nn.Module):
     """Relative positional encoding module.
 
-    See : Appendix B in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/embedding.py
+    See : Appendix B in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"  # noqa
+    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/embedding.py  # noqa
+
+    Suppose:
+      i -> position of query,
+      j -> position of key(value),
+    we use positive relative position embedding when key(value) is to the
+    left of query(i.e., i > j) and negative embedding otherwise.
 
     Args:
         d_model: Embedding dimension.
-        dropout_rate: Dropout rate.
+        dropout: Dropout rate.
         max_len: Maximum input length.
-
     """
 
     def __init__(
-        self, d_model: int, dropout_rate: float, max_len: int = 5000
+        self, d_model: int, dropout: float, max_len: int = 5000
     ) -> None:
         """Construct an PositionalEncoding object."""
         super(RelPositionalEncoding, self).__init__()
         self.d_model = d_model
-        self.dropout = torch.nn.Dropout(p=dropout_rate)
+        self.dropout = torch.nn.Dropout(p=dropout)
         self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+        self.pos_len = max_len
+        self.neg_len = max_len
+        self.gen_pe_positive()
+        self.gen_pe_negative()
 
-    def extend_pe(self, x: Tensor, context: int = 0) -> None:
-        """Reset the positional encodings."""
-        x_size_1 = x.size(1) + context
-        if self.pe is not None:
-            # self.pe contains both positive and negative parts
-            # the length of self.pe is 2 * input_len - 1
-            if self.pe.size(1) >= x_size_1 * 2 - 1:
-                # Note: TorchScript doesn't implement operator== for torch.Device
-                if self.pe.dtype != x.dtype or str(self.pe.device) != str(
-                    x.device
-                ):
-                    self.pe = self.pe.to(dtype=x.dtype, device=x.device)
-                return
-        # Suppose `i` means to the position of query vecotr and `j` means the
-        # position of key vector. We use position relative positions when keys
-        # are to the left (i>j) and negative relative positions otherwise (i<j).
-        pe_positive = torch.zeros(x_size_1, self.d_model)
-        pe_negative = torch.zeros(x_size_1, self.d_model)
-        position = torch.arange(0, x_size_1, dtype=torch.float32).unsqueeze(1)
+    def gen_pe_positive(self) -> None:
+        """Generate the positive positional encodings."""
+        pe_positive = torch.zeros(self.pos_len, self.d_model)
+        position_positive = torch.arange(
+            0, self.pos_len, dtype=torch.float32
+        ).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, self.d_model, 2, dtype=torch.float32)
             * -(math.log(10000.0) / self.d_model)
         )
-        pe_positive[:, 0::2] = torch.sin(position * div_term)
-        pe_positive[:, 1::2] = torch.cos(position * div_term)
-        pe_negative[:, 0::2] = torch.sin(-1 * position * div_term)
-        pe_negative[:, 1::2] = torch.cos(-1 * position * div_term)
-
+        pe_positive[:, 0::2] = torch.sin(position_positive * div_term)
+        pe_positive[:, 1::2] = torch.cos(position_positive * div_term)
         # Reserve the order of positive indices and concat both positive and
         # negative indices. This is used to support the shifting trick
-        # as in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-        pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
-        pe_negative = pe_negative[1:].unsqueeze(0)
-        pe = torch.cat([pe_positive, pe_negative], dim=1)
-        self.pe = pe.to(device=x.device, dtype=x.dtype)
+        # as in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"  # noqa
+        self.pe_positive = torch.flip(pe_positive, [0])
+
+    def gen_pe_negative(self) -> None:
+        """Generate the negative positional encodings."""
+        # Suppose `i` means to the position of query vecotr and `j` means the
+        # position of key vector. We use positive relative positions when keys
+        # are to the left (i>j) and negative relative positions otherwise (i<j).
+        pe_negative = torch.zeros(self.neg_len, self.d_model)
+        position_negative = torch.arange(
+            0, self.neg_len, dtype=torch.float32
+        ).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32)
+            * -(math.log(10000.0) / self.d_model)
+        )
+        pe_negative[:, 0::2] = torch.sin(-1 * position_negative * div_term)
+        pe_negative[:, 1::2] = torch.cos(-1 * position_negative * div_term)
+        self.pe_negative = pe_negative
+
+    def get_pe(
+        self,
+        pos_len: int,
+        neg_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Get positional encoding given positive length and negative length."""
+        if self.pe_positive.dtype != dtype or str(
+            self.pe_positive.device
+        ) != str(device):
+            self.pe_positive = self.pe_positive.to(dtype=dtype, device=device)
+        if self.pe_negative.dtype != dtype or str(
+            self.pe_negative.device
+        ) != str(device):
+            self.pe_negative = self.pe_negative.to(dtype=dtype, device=device)
+        pe = torch.cat(
+            [
+                self.pe_positive[self.pos_len - pos_len :],
+                self.pe_negative[1:neg_len],
+            ],
+            dim=0,
+        )
+        return pe
 
     def forward(
-        self, x: torch.Tensor, context: int = 0
-    ) -> Tuple[Tensor, Tensor]:
-        """Add positional encoding.
-
+        self,
+        x: torch.Tensor,
+        pos_len: int,
+        neg_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scale input x and get positional encoding.
         Args:
-            x (torch.Tensor): Input tensor (batch, time, `*`).
-            context (int): left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+            x (torch.Tensor): Input tensor (`*`).
 
         Returns:
-            torch.Tensor: Encoded tensor (batch, time, `*`).
-            torch.Tensor: Encoded tensor (batch, 2*time-1, `*`).
-
+          torch.Tensor:
+            Encoded tensor of shape (`*`).
+          torch.Tensor:
+            Position embedding of shape (pos_len + neg_len - 1, `*`).
         """
-        self.extend_pe(x, context)
-        x_size_1 = x.size(1) + context
-        pos_emb = self.pe[
-            :,
-            self.pe.size(1) // 2
-            - x_size_1
-            + 1 : self.pe.size(1) // 2  # noqa E203
-            + x_size_1,
-        ]
+        if pos_len > self.pos_len:
+            self.pos_len = pos_len
+            self.gen_pe_positive()
+        if neg_len > self.neg_len:
+            self.neg_len = neg_len
+            self.gen_pe_negative()
+        pos_emb = self.get_pe(pos_len, neg_len, x.device, x.dtype)
         return self.dropout(x), self.dropout(pos_emb)
 
 
@@ -823,16 +1027,17 @@ class RelPositionMultiheadAttention(nn.Module):
     def rel_shift(self, x: Tensor, left_context_length: int = 0) -> Tensor:
         """Compute relative positional encoding.
 
-          x (tensor):
+        Args:
+          x:
             Input tensor of shape (batch, nhead, tgt_len, PE),
             where src_len is the length of query tensor.
             For streaming decoding, PE = left_context + 2 * tgt_len - 1;
             otherwise, PE = 2 * tgt_len - 1
-
-          left_context_length (int):
-            Left context (in frames) used during streaming decoding.
+          left_context_length:
+            Length of cached left context frames for attention.
             It is used only in real streaming decoding;
             in other circumstances, it MUST be 0.
+
 
         Returns:
             A tensor of shape (batch, nhead, tgt_len, src_len),
@@ -895,7 +1100,7 @@ class RelPositionMultiheadAttention(nn.Module):
             It is used only in real streaming decoding;
             in other circumstances, it MUST be 0.
           cache (tensor):
-            Cached key and value tensors of left context.
+            Cached key and value tensors of left context frames.
             Its shape is (2, left_context_length, batch, nhead, head_dim).
             cache[0, ...] is key and cache[1, ...] is value.
 
@@ -1269,6 +1474,7 @@ class ConvolutionModule(nn.Module):
             Input tensor of shape (time, batch, channel).
           cache (Tensor):
             Cached left context for causal convolution.
+            Its shape is (batch, channel, cache_size).
 
         Returns:
           A tensor of shape (time, batch, channels).
