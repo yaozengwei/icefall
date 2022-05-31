@@ -281,13 +281,64 @@ def test_conformer_streaming_forward():
     )
 
 
+def test_streaming_consistancy():
+    from conformer import Conformer
+
+    d_model, num_heads, cnn_module_kernel, num_layers = 256, 4, 31, 2
+    num_features = 40
+    batch_size, chunk_size, num_chunks = 2, 2, 3
+    left_context_size = 4
+    model = Conformer(
+        num_features=num_features,
+        d_model=d_model,
+        nhead=num_heads,
+        num_encoder_layers=num_layers,
+        cnn_module_kernel=cnn_module_kernel,
+    )
+    model.eval()
+
+    # simulate streaming forward
+    input_len = num_chunks * chunk_size
+    x = torch.randn(batch_size, input_len, d_model)
+    x_lens = torch.ones(batch_size, dtype=torch.int) * input_len
+    out_simulate, out_x_lens = model.simulate_streaming_forward(
+        x, x_lens, chunk_size=chunk_size, left_context_size=left_context_size
+    )
+
+    # real streaming forward
+    attn_caches = torch.zeros(
+        num_layers, 2, left_context_size, batch_size, d_model
+    )
+    conv_caches = torch.zeros(
+        num_layers,
+        batch_size,
+        d_model,
+        cnn_module_kernel - 1,
+    )
+    cached_left_context_sizes = torch.zeros(batch_size, dtype=torch.int)
+    states = [cached_left_context_sizes, attn_caches, conv_caches]
+    for i in range(num_chunks):
+        start = chunk_size * i
+        end = start + chunk_size
+        out_chunk, _, states = model.streaming_forward(
+            x[:, start:end, :],
+            torch.ones(batch_size, dtype=torch.int) * chunk_size,
+            states=states,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+        )
+
+        print(out_chunk - out_simulate[:, start:end, :])
+
+
 if __name__ == "__main__":
-    test_attention_forward()
-    test_attention_infer()
-    test_conformer_encoder_layer_forward()
-    test_conformer_encoder_layer_infer()
-    test_conformer_encoder_forward()
-    test_conformer_encoder_infer()
-    test_conformer_forward()
-    test_conformer_simulate_streaming_forward()
-    test_conformer_streaming_forward()
+    # test_attention_forward()
+    # test_attention_infer()
+    # test_conformer_encoder_layer_forward()
+    # test_conformer_encoder_layer_infer()
+    # test_conformer_encoder_forward()
+    # test_conformer_encoder_infer()
+    # test_conformer_forward()
+    # test_conformer_simulate_streaming_forward()
+    # test_conformer_streaming_forward()
+    test_streaming_consistancy()

@@ -292,7 +292,7 @@ class Conformer(EncoderInterface):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-        x = self.encoder_embed(x)
+        # x = self.encoder_embed(x)
         output_seq_len = x.size(1)
         # query: [utterance] -> key: [utterance]
         # relative distance of index i in query and index j in key is in range:
@@ -305,8 +305,9 @@ class Conformer(EncoderInterface):
         # Caution: We assume the subsampling factor is 4!
         # lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        lengths = (((x_lens - 1) >> 1) - 1) >> 1
-        assert output_seq_len == lengths.max().item()
+        # lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        lengths = x_lens
+        # assert output_seq_len == lengths.max().item()
         padding_mask = make_pad_mask(lengths)
 
         num_left_chunks = -1
@@ -391,7 +392,7 @@ class Conformer(EncoderInterface):
             self.cnn_module_kernel - 1,
         ), conv_caches.shape
 
-        x = self.encoder_embed(x)
+        # x = self.encoder_embed(x)
         assert x.size(1) == chunk_size, x.size(1)
         # query: [chunk] -> key: [left context, chunk]
         # relative distance of index i in query and index j in key is in range:
@@ -404,7 +405,8 @@ class Conformer(EncoderInterface):
         # lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
         #
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        # lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        lengths = x_lens
 
         src_key_padding_mask = make_pad_mask(lengths + left_context_size)
         attn_mask = ~chunk_mask_with_left_context(
