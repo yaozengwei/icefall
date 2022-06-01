@@ -222,7 +222,6 @@ class Conformer(EncoderInterface):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-
         x = self.encoder_embed(x)
         output_seq_len = x.size(1)
         # query: [utterance] -> key: [utterance]
@@ -292,7 +291,7 @@ class Conformer(EncoderInterface):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-        # x = self.encoder_embed(x)
+        x = self.encoder_embed(x)
         output_seq_len = x.size(1)
         # query: [utterance] -> key: [utterance]
         # relative distance of index i in query and index j in key is in range:
@@ -305,8 +304,7 @@ class Conformer(EncoderInterface):
         # Caution: We assume the subsampling factor is 4!
         # lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        # lengths = (((x_lens - 1) >> 1) - 1) >> 1
-        lengths = x_lens
+        lengths = (((x_lens - 1) >> 1) - 1) >> 1
         # assert output_seq_len == lengths.max().item()
         padding_mask = make_pad_mask(lengths)
 
@@ -392,7 +390,7 @@ class Conformer(EncoderInterface):
             self.cnn_module_kernel - 1,
         ), conv_caches.shape
 
-        # x = self.encoder_embed(x)
+        x = self.encoder_embed(x)
         assert x.size(1) == chunk_size, x.size(1)
         # query: [chunk] -> key: [left context, chunk]
         # relative distance of index i in query and index j in key is in range:
@@ -405,8 +403,7 @@ class Conformer(EncoderInterface):
         # lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
         #
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        # lengths = (((x_lens - 1) >> 1) - 1) >> 1
-        lengths = x_lens
+        lengths = (((x_lens - 1) >> 1) - 1) >> 1
 
         src_key_padding_mask = make_pad_mask(lengths + left_context_size)
         attn_mask = ~chunk_mask_with_left_context(
@@ -1074,6 +1071,7 @@ class RelPositionMultiheadAttention(nn.Module):
             L is the target sequence length, S is the source sequence length.
         """
         if cache is None:
+            # This is for training forward or simulated streaming forward.
             assert left_context_size == 0, left_context_size
         tgt_len, bsz, embed_dim = query.size()
         src_len = key.size(0) + left_context_size
@@ -1195,6 +1193,7 @@ class RelPositionMultiheadAttention(nn.Module):
         # v = v.contiguous().view(src_len, bsz, num_heads, head_dim)
 
         if cache is not None:
+            # In streaming forward, cache must be not None.
             assert cache.shape == (2, left_context_size, bsz, embed_dim)
             # pad cached key and value of left context
             key_cache = cache[0]
@@ -1443,10 +1442,12 @@ class ConvolutionModule(nn.Module):
         x = nn.functional.glu(x, dim=1)  # (batch, channel, time)
 
         if cache is None:
+            # This is for training forward and simulated streaming forward.
             cache = torch.zeros(
                 batch, channel, self.cache_size, device=x.device, dtype=x.dtype
             )
         else:
+            # This is for streaming forward.
             assert cache.shape == (batch, channel, self.cache_size)
         # make depthwise_conv causal by manualy padding cache tensor to the left
         x = torch.cat([cache, x], dim=2)

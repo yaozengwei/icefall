@@ -282,6 +282,9 @@ def test_conformer_streaming_forward():
 
 
 def test_streaming_consistancy():
+    # This is to check the consistancy between simulated streaming forward
+    # and real streaming forward. To exclude the impact of feature subsampling,
+    # we should first comment out the module `encoder_embed` in `Conformer` class. # noqa
     from conformer import Conformer
 
     d_model, num_heads, cnn_module_kernel, num_layers = 256, 4, 31, 2
@@ -332,13 +335,13 @@ def test_streaming_consistancy():
 
 
 if __name__ == "__main__":
-    # test_attention_forward()
-    # test_attention_infer()
-    # test_conformer_encoder_layer_forward()
-    # test_conformer_encoder_layer_infer()
-    # test_conformer_encoder_forward()
-    # test_conformer_encoder_infer()
-    # test_conformer_forward()
-    # test_conformer_simulate_streaming_forward()
-    # test_conformer_streaming_forward()
-    test_streaming_consistancy()
+    test_attention_forward()
+    test_attention_infer()
+    test_conformer_encoder_layer_forward()
+    test_conformer_encoder_layer_infer()
+    test_conformer_encoder_forward()
+    test_conformer_encoder_infer()
+    test_conformer_forward()
+    test_conformer_simulate_streaming_forward()
+    test_conformer_streaming_forward()
+    # test_streaming_consistancy()
