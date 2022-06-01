@@ -281,6 +281,22 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--short-chunk-size",
+        type=int,
+        default=25,
+        help="""Chunk length of dynamic training, the chunk size would be either
+        max sequence length of current batch or uniformly sampled from (1, short_chunk_size).  # noqa
+        """,
+    )
+
+    parser.add_argument(
+        "--num-left-chunks",
+        type=int,
+        default=4,
+        help="How many left context can be seen in chunks when calculating attention.", # noqa
+    )
+
     return parser
 
 
@@ -367,6 +383,8 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         nhead=params.nhead,
         dim_feedforward=params.dim_feedforward,
         num_encoder_layers=params.num_encoder_layers,
+        short_chunk_size=params.short_chunk_size,
+        num_left_chunks=params.num_left_chunks,
     )
     return encoder
 
