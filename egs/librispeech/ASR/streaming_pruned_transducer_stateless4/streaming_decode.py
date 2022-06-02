@@ -364,7 +364,8 @@ def decode_one_chunk(
 
     for stream in decode_streams:
         feat, feat_len = stream.get_feature_frames(
-            (params.chunk_size + 2) * params.subsampling_factor
+            (params.chunk_size + 2 + params.right_context_size)
+            * params.subsampling_factor
         )
         features.append(feat)
         feature_lens.append(feat_len)
@@ -407,7 +408,7 @@ def decode_one_chunk(
         x_lens=feature_lens,
         states=states,
         left_context_size=params.left_context_size,
-        # right_context=params.right_context,
+        right_context_size=params.right_context_size,
         processed_lens=processed_feature_lens,
     )
 

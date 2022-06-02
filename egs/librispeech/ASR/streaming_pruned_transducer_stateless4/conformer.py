@@ -337,6 +337,7 @@ class Conformer(EncoderInterface):
         states: List[Tensor],
         chunk_size: int = 8,
         left_context_size: int = 8,
+        right_context_size: int = 2,
         processed_lens: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, List[Tensor]]:
         """This is for real streaming decoding.
@@ -355,7 +356,9 @@ class Conformer(EncoderInterface):
             - convolution caches, with shape of
               (num_encoder_layers, batch_size, d_model, cnn_module_kernel - 1).
           left_context_size (int):
-            Target length of attention left context.
+            Length of attention left context.
+          right_context_size (int):
+            Length of attention left context.
 
         Returns:
           (Tensor, Tensor, List[Tensor]):
@@ -428,7 +431,11 @@ class Conformer(EncoderInterface):
             attn_caches=attn_caches,
             conv_caches=conv_caches,
             left_context_size=left_context_size,
+            right_context_size=right_context_size,
         )  # (T, B, F)
+        if right_context_size > 0:
+            x = x[:-right_context_size, :, :]
+            lengths -= right_context_size
 
         x = x.permute(1, 0, 2)  # (T, N, C) -> (N, T, C)
 
@@ -524,6 +531,7 @@ class ConformerEncoderLayer(nn.Module):
         attn_cache: Optional[Tensor] = None,
         conv_cache: Optional[Tensor] = None,
         left_context_size: int = 0,
+        right_context_size: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """
         Pass the input through the encoder layer.
@@ -595,12 +603,15 @@ class ConformerEncoderLayer(nn.Module):
             attn_mask=attn_mask,
             key_padding_mask=src_key_padding_mask,
             left_context_size=left_context_size,
+            right_context_size=right_context_size,
             cache=attn_cache,
         )
         src = src + self.dropout(src_attn)
 
         # convolution module
-        src_conv, new_conv_cache = self.conv_module(src, conv_cache)
+        src_conv, new_conv_cache = self.conv_module(
+            src, conv_cache, right_context_size=right_context_size
+        )
         src = src + self.dropout(src_conv)
 
         # feed forward module
@@ -652,6 +663,7 @@ class ConformerEncoder(nn.Module):
         attn_caches: Optional[Tensor] = None,
         conv_caches: Optional[Tensor] = None,
         left_context_size: int = 0,
+        right_context_size: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         r"""Pass the input through the encoder layers in turn.
 
@@ -680,8 +692,12 @@ class ConformerEncoder(nn.Module):
           conv_caches (Tensor, optional):
             Cached left context frames for causal convolution.
             Its shape is (num_encoder_layers, N, E, kernel_size - 1).
-          left_context_lengths (Tensor, optional):
-            List of lengths of cached left context frames for attention.
+          left_context_length (int, optional):
+            Length of cached left context frames for attention.
+            It is used only in real streaming decoding;
+            in other circumstances, it MUST be None.
+          right_context_length (int, optional):
+            Length of right context frames for attention.
             It is used only in real streaming decoding;
             in other circumstances, it MUST be None.
 
@@ -711,6 +727,7 @@ class ConformerEncoder(nn.Module):
                 attn_cache=attn_caches[layer_idx] if streaming_mode else None,
                 conv_cache=conv_caches[layer_idx] if streaming_mode else None,
                 left_context_size=left_context_size,
+                right_context_size=right_context_size,
             )
             if streaming_mode:
                 new_attn_caches.append(attn_cache)
@@ -904,6 +921,7 @@ class RelPositionMultiheadAttention(nn.Module):
         need_weights: bool = True,
         attn_mask: Optional[Tensor] = None,
         left_context_size: int = 0,
+        right_context_size: int = 0,
         cache: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""
@@ -967,6 +985,7 @@ class RelPositionMultiheadAttention(nn.Module):
             need_weights=need_weights,
             attn_mask=attn_mask,
             left_context_size=left_context_size,
+            right_context_size=right_context_size,
             cache=cache,
         )
 
@@ -1022,6 +1041,7 @@ class RelPositionMultiheadAttention(nn.Module):
         need_weights: bool = True,
         attn_mask: Optional[Tensor] = None,
         left_context_size: int = 0,
+        right_context_size: int = 0,
         cache: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""
@@ -1080,6 +1100,7 @@ class RelPositionMultiheadAttention(nn.Module):
         if cache is None:
             # This is for training forward or simulated streaming forward.
             assert left_context_size == 0, left_context_size
+            assert right_context_size == 0, right_context_size
         tgt_len, bsz, embed_dim = query.size()
         src_len = key.size(0) + left_context_size
         assert embed_dim == embed_dim_to_check
@@ -1208,8 +1229,22 @@ class RelPositionMultiheadAttention(nn.Module):
             k = torch.cat([key_cache, k], dim=0)
             v = torch.cat([val_cache, v], dim=0)
         # update attention cache
-        new_key_cache = k[src_len - left_context_size :]
-        new_val_cache = v[src_len - left_context_size :]
+        if right_context_size > 0:
+            new_key_cache = k[
+                src_len
+                - left_context_size
+                - right_context_size : src_len
+                - right_context_size
+            ]
+            new_val_cache = v[
+                src_len
+                - left_context_size
+                - right_context_size : src_len
+                - right_context_size
+            ]
+        else:
+            new_key_cache = k[src_len - left_context_size :]
+            new_val_cache = v[src_len - left_context_size :]
         new_cache = torch.stack([new_key_cache, new_val_cache], dim=0)
 
         k = k.contiguous().view(src_len, bsz, num_heads, head_dim)
@@ -1426,7 +1461,12 @@ class ConvolutionModule(nn.Module):
             initial_scale=0.25,
         )
 
-    def forward(self, x: Tensor, cache: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cache: Optional[Tensor] = None,
+        right_context_size: int = 0,
+    ) -> Tensor:
         """Causal convolution module.
 
         Args:
@@ -1459,7 +1499,14 @@ class ConvolutionModule(nn.Module):
         # make depthwise_conv causal by manualy padding cache tensor to the left
         x = torch.cat([cache, x], dim=2)
         # update cache
-        new_cache = x[:, :, -self.cache_size :]
+        if right_context_size > 0:
+            new_cache = x[
+                :,
+                :,
+                -self.cache_size - right_context_size : -right_context_size,
+            ]
+        else:
+            new_cache = x[:, :, -self.cache_size :]
 
         # 1D Depthwise Conv
         x = self.depthwise_conv(x)

@@ -212,6 +212,36 @@ def get_parser():
         Used only when --decoding_method is greedy_search""",
     )
 
+    parser.add_argument(
+        "--short-chunk-size",
+        type=int,
+        default=25,
+        help="""Chunk length of dynamic training, the chunk size would be either
+        max sequence length of current batch or uniformly sampled from (1, short_chunk_size).  # noqa
+        """,
+    )
+
+    parser.add_argument(
+        "--num-left-chunks",
+        type=int,
+        default=4,
+        help="How many left context can be seen in chunks when calculating attention.",  # noqa
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=16,
+        help="The chunk size for decoding (in frames after subsampling)",
+    )
+
+    parser.add_argument(
+        "--left-context-size",
+        type=int,
+        default=64,
+        help="left context can be seen during decoding (in frames after subsampling)",
+    )
+
     return parser
 
 
@@ -260,8 +290,11 @@ def decode_one_batch(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
 
-    encoder_out, encoder_out_lens = model.encoder(
-        x=feature, x_lens=feature_lens
+    encoder_out, encoder_out_lens = model.encoder.simulate_streaming_forward(
+        x=feature,
+        x_lens=feature_lens,
+        chunk_size=params.chunk_size,
+        left_context_size=params.left_context_size,
     )
     hyps = []
 
@@ -474,6 +507,9 @@ def main():
         params.suffix = f"iter-{params.iter}-avg-{params.avg}"
     else:
         params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
+
+    params.suffix += f"-streaming-chunk-size-{params.chunk_size}"
+    params.suffix += f"-left-context-size-{params.left_context_size}"
 
     if "fast_beam_search" in params.decoding_method:
         params.suffix += f"-beam-{params.beam}"
