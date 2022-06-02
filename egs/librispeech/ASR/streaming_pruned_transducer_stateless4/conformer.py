@@ -36,7 +36,7 @@ from torch import Tensor, nn
 from icefall.utils import make_pad_mask
 
 
-# Copied and modified from https://github.com/wenet-e2e/wenet/blob/main/wenet/utils/mask.py
+# Copied and modified from https://github.com/wenet-e2e/wenet/blob/main/wenet/utils/mask.py # noqa
 def subsequent_chunk_mask(
     size: int,
     chunk_size: int,
@@ -405,18 +405,21 @@ class Conformer(EncoderInterface):
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
         lengths = (((x_lens - 1) >> 1) - 1) >> 1
 
-        src_key_padding_mask = make_pad_mask(lengths + left_context_size)
-        attn_mask = ~chunk_mask_with_left_context(
-            chunk_size=chunk_size,
-            left_context_size=left_context_size,
-            cached_left_context_sizes=cached_left_context_sizes,
-            device=x.device,
+        src_key_padding_mask = make_pad_mask(lengths)
+
+        processed_mask = torch.arange(
+            left_context_size, device=x.device
+        ).expand(batch_size, left_context_size)
+        processed_mask = (
+            cached_left_context_sizes.unsqueeze(1) <= processed_mask
+        ).flip(1)
+        src_key_padding_mask = torch.cat(
+            [processed_mask, src_key_padding_mask], dim=1
         )
 
         x, new_attn_caches, new_conv_caches = self.encoder(
             x,
             pos_emb,
-            attn_mask=attn_mask,
             src_key_padding_mask=src_key_padding_mask,
             attn_caches=attn_caches,
             conv_caches=conv_caches,
@@ -1162,14 +1165,14 @@ class RelPositionMultiheadAttention(nn.Module):
                         "The size of the 2D attn_mask is not correct."
                     )
             elif attn_mask.dim() == 3:
-                if list(attn_mask.size()) != [bsz, tgt_len, src_len]:
+                if list(attn_mask.size()) != [
+                    bsz * num_heads,
+                    tgt_len,
+                    src_len,
+                ]:
                     raise RuntimeError(
                         "The size of the 3D attn_mask is not correct."
                     )
-                attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1)
-                attn_mask = attn_mask.contiguous().view(
-                    bsz * num_heads, tgt_len, src_len
-                )
             else:
                 raise RuntimeError(
                     "attn_mask's dimension {} is not supported".format(

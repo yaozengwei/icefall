@@ -36,12 +36,6 @@ def test_attention_infer():
     )
     src = torch.randn(tgt_len, batch_size, d_model)
     pos_emb = torch.randn(1, left_context_size + 2 * tgt_len - 1, d_model)
-    attn_mask = torch.zeros(
-        batch_size,
-        tgt_len,
-        left_context_size + tgt_len,
-        dtype=torch.bool,
-    )
     attn_cache = torch.randn(2, left_context_size, batch_size, d_model)
 
     (src_attn, new_attn_cache, _,) = attention(
@@ -49,7 +43,6 @@ def test_attention_infer():
         src,
         src,
         pos_emb=pos_emb,
-        attn_mask=attn_mask,
         left_context_size=left_context_size,
         cache=attn_cache,
     )
@@ -84,18 +77,11 @@ def test_conformer_encoder_layer_infer():
     )
     src = torch.randn(tgt_len, batch_size, d_model)
     pos_emb = torch.randn(1, left_context_size + 2 * tgt_len - 1, d_model)
-    attn_mask = torch.zeros(
-        batch_size,
-        tgt_len,
-        left_context_size + tgt_len,
-        dtype=torch.bool,
-    )
     attn_cache = torch.randn(2, left_context_size, batch_size, d_model)
     conv_cache = torch.randn(batch_size, d_model, cnn_module_kernel - 1)
     src, new_attn_cache, new_conv_cache = layer(
         src,
         pos_emb=pos_emb,
-        attn_mask=attn_mask,
         attn_cache=attn_cache,
         conv_cache=conv_cache,
         left_context_size=left_context_size,
@@ -135,12 +121,7 @@ def test_conformer_encoder_infer():
     encoder = ConformerEncoder(layer, num_layers)
     src = torch.randn(tgt_len, batch_size, d_model)
     pos_emb = torch.randn(1, left_context_size + 2 * tgt_len - 1, d_model)
-    attn_mask = torch.zeros(
-        batch_size,
-        tgt_len,
-        left_context_size + tgt_len,
-        dtype=torch.bool,
-    )
+
     attn_caches = torch.randn(
         num_layers, 2, left_context_size, batch_size, d_model
     )
@@ -153,7 +134,6 @@ def test_conformer_encoder_infer():
     src, new_attn_caches, new_conv_caches = encoder(
         src,
         pos_emb=pos_emb,
-        attn_mask=attn_mask,
         attn_caches=attn_caches,
         conv_caches=conv_caches,
         left_context_size=left_context_size,
