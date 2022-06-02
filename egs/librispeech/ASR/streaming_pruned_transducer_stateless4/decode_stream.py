@@ -76,7 +76,8 @@ class DecodeStream(object):
             torch.zeros(
                 (
                     params.num_encoder_layers,
-                    params.left_context,
+                    2,
+                    params.left_context_size,
                     params.encoder_dim,
                 ),
                 device=device,
@@ -84,8 +85,8 @@ class DecodeStream(object):
             torch.zeros(
                 (
                     params.num_encoder_layers,
-                    params.cnn_module_kernel - 1,
                     params.encoder_dim,
+                    params.cnn_module_kernel - 1,
                 ),
                 device=device,
             ),
@@ -116,7 +117,7 @@ class DecodeStream(object):
         self.num_processed_frames += (
             chunk_size
             - 2 * self.params.subsampling_factor
-            - self.params.right_context * self.params.subsampling_factor
+            - self.params.right_context_size * self.params.subsampling_factor
         )
 
         if self.num_processed_frames >= self.features.size(0):

@@ -337,6 +337,7 @@ class Conformer(EncoderInterface):
         states: List[Tensor],
         chunk_size: int = 8,
         left_context_size: int = 8,
+        processed_lens: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, List[Tensor]]:
         """This is for real streaming decoding.
         Args:
@@ -366,14 +367,15 @@ class Conformer(EncoderInterface):
         assert (
             states is not None
         ), "Require states when sending data in streaming mode"
-        assert len(states) == 3, len(states)
+        assert len(states) == 2, len(states)
+        # print(x.size(1))
 
-        cached_left_context_sizes = states[0]
-        assert cached_left_context_sizes.shape == (
-            batch_size,
-        ), cached_left_context_sizes.shape
+        # cached_left_context_sizes = states[0]
+        # assert cached_left_context_sizes.shape == (
+        #    batch_size,
+        # ), cached_left_context_sizes.shape
 
-        attn_caches = states[1]
+        attn_caches = states[0]
         assert attn_caches.shape == (
             self.num_encoder_layers,
             2,
@@ -382,7 +384,7 @@ class Conformer(EncoderInterface):
             self.d_model,
         ), attn_caches.shape
 
-        conv_caches = states[2]
+        conv_caches = states[1]
         assert conv_caches.shape == (
             self.num_encoder_layers,
             batch_size,
@@ -391,12 +393,13 @@ class Conformer(EncoderInterface):
         ), conv_caches.shape
 
         x = self.encoder_embed(x)
-        assert x.size(1) == chunk_size, x.size(1)
+        x = x[:, 1:-1, :]
+        # assert x.size(1) == chunk_size, x.size(1)
         # query: [chunk] -> key: [left context, chunk]
         # relative distance of index i in query and index j in key is in range:
         # [-(chunk_size - 1), left_context_size + chunk_size - 1]
         x, pos_emb = self.encoder_pos(
-            x, pos_len=chunk_size + left_context_size, neg_len=chunk_size
+            x, pos_len=x.size(1) + left_context_size, neg_len=x.size(1)
         )
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
         # Caution: We assume the subsampling factor is 4!
@@ -404,15 +407,16 @@ class Conformer(EncoderInterface):
         #
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
         lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        # we will cut off 1 frame on each side of encoder_embed output
+        lengths -= 2
 
         src_key_padding_mask = make_pad_mask(lengths)
 
         processed_mask = torch.arange(
             left_context_size, device=x.device
         ).expand(batch_size, left_context_size)
-        processed_mask = (
-            cached_left_context_sizes.unsqueeze(1) <= processed_mask
-        ).flip(1)
+        processed_lens = processed_lens.view(batch_size, 1)
+        processed_mask = (processed_lens <= processed_mask).flip(1)
         src_key_padding_mask = torch.cat(
             [processed_mask, src_key_padding_mask], dim=1
         )
@@ -429,11 +433,11 @@ class Conformer(EncoderInterface):
         x = x.permute(1, 0, 2)  # (T, N, C) -> (N, T, C)
 
         # update cached left context sizes
-        cached_left_context_sizes += chunk_size
-        cached_left_context_sizes.clamp_(max=left_context_size)
+        # cached_left_context_sizes += chunk_size
+        # cached_left_context_sizes.clamp_(max=left_context_size)
 
         new_states = [
-            cached_left_context_sizes,
+            # cached_left_context_sizes,
             new_attn_caches,
             new_conv_caches,
         ]

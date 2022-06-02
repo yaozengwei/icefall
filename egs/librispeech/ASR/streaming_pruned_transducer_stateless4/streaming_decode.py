@@ -45,6 +45,7 @@ from train import get_params, get_transducer_model
 
 from icefall.checkpoint import (
     average_checkpoints,
+    average_checkpoints_with_averaged_model,
     find_checkpoints,
     load_checkpoint,
 )
@@ -69,9 +70,9 @@ def get_parser():
     parser.add_argument(
         "--epoch",
         type=int,
-        default=28,
+        default=30,
         help="""It specifies the checkpoint to use for decoding.
-        Note: Epoch counts from 0.
+        Note: Epoch counts from 1.
         You can specify --avg to use more checkpoints for model averaging.""",
     )
 
@@ -95,9 +96,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-averaged-model",
+        type=str2bool,
+        default=False,
+        help="Whether to load averaged model. Currently it only supports "
+        "using --epoch. If True, it would decode with the averaged model "
+        "over the epoch range from `epoch-avg` (excluded) to `epoch`."
+        "Actually only the models with epoch number of `epoch-avg` and "
+        "`epoch` are loaded for averaging. ",
+    )
+
+    parser.add_argument(
         "--exp-dir",
         type=str,
-        default="pruned_transducer_stateless2/exp",
+        default="pruned_transducer_stateless4/exp",
         help="The experiment dir",
     )
 
@@ -112,8 +124,21 @@ def get_parser():
         "--decoding-method",
         type=str,
         default="greedy_search",
-        help="""Support only greedy_search and fast_beam_search now.
+        help="""Possible values are:
+          - greedy_search
+          - beam_search
+          - modified_beam_search
+          - fast_beam_search
         """,
+    )
+
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=4,
+        help="""An integer indicating how many candidates we will keep for each
+        frame. Used only when --decoding-method is beam_search or
+        modified_beam_search.""",
     )
 
     parser.add_argument(
@@ -137,7 +162,7 @@ def get_parser():
     parser.add_argument(
         "--max-states",
         type=int,
-        default=32,
+        default=8,
         help="""Used only when --decoding-method is
         fast_beam_search""",
     )
@@ -149,16 +174,12 @@ def get_parser():
         help="The context size in the decoder. 1 means bigram; "
         "2 means tri-gram",
     )
-
     parser.add_argument(
-        "--dynamic-chunk-training",
-        type=str2bool,
-        default=False,
-        help="""Whether to use dynamic_chunk_training, if you want a streaming
-        model, this requires to be True.
-        Note: not needed for decoding, adding it here to construct transducer model,
-              as we reuse the code in train.py.
-        """,
+        "--max-sym-per-frame",
+        type=int,
+        default=1,
+        help="""Maximum number of symbols per frame.
+        Used only when --decoding_method is greedy_search""",
     )
 
     parser.add_argument(
@@ -166,9 +187,7 @@ def get_parser():
         type=int,
         default=25,
         help="""Chunk length of dynamic training, the chunk size would be either
-        max sequence length of current batch or uniformly sampled from (1, short_chunk_size).
-        Note: not needed for decoding, adding it here to construct transducer model,
-              as we reuse the code in train.py.
+        max sequence length of current batch or uniformly sampled from (1, short_chunk_size).  # noqa
         """,
     )
 
@@ -176,37 +195,25 @@ def get_parser():
         "--num-left-chunks",
         type=int,
         default=4,
-        help="""How many left context can be seen in chunks when calculating attention.
-        Note: not needed for decoding, adding it here to construct transducer model,
-              as we reuse the code in train.py.
-        """,
+        help="How many left context can be seen in chunks when calculating attention.",  # noqa
     )
 
     parser.add_argument(
-        "--causal-convolution",
-        type=str2bool,
-        default=True,
-        help="""Whether to use causal convolution, this requires to be True when
-        using dynamic_chunk_training.
-        """,
-    )
-
-    parser.add_argument(
-        "--decode-chunk-size",
+        "--chunk-size",
         type=int,
         default=16,
         help="The chunk size for decoding (in frames after subsampling)",
     )
 
     parser.add_argument(
-        "--left-context",
+        "--left-context-size",
         type=int,
         default=64,
         help="left context can be seen during decoding (in frames after subsampling)",
     )
 
     parser.add_argument(
-        "--right-context",
+        "--right-context-size",
         type=int,
         default=4,
         help="right context can be seen during decoding (in frames after subsampling)",
@@ -233,7 +240,7 @@ def greedy_search(
 
     blank_id = model.decoder.blank_id
     context_size = model.decoder.context_size
-    device = model.device
+    device = next(model.parameters()).device
     T = encoder_out.size(1)
 
     decoder_input = torch.tensor(
@@ -346,7 +353,7 @@ def decode_one_chunk(
     Returns:
       Return a List containing which DecodeStreams are finished.
     """
-    device = model.device
+    device = next(model.parameters()).device
 
     features = []
     feature_lens = []
@@ -357,7 +364,7 @@ def decode_one_chunk(
 
     for stream in decode_streams:
         feat, feat_len = stream.get_feature_frames(
-            (params.decode_chunk_size + 2) * params.subsampling_factor
+            (params.chunk_size + 2) * params.subsampling_factor
         )
         features.append(feat)
         feature_lens.append(feat_len)
@@ -371,7 +378,7 @@ def decode_one_chunk(
 
     # if T is less than 7 there will be an error in time reduction layer,
     # because we subsample features with ((x_len - 1) // 2 - 1) // 2
-    tail_length = 15 + params.right_context * params.subsampling_factor
+    tail_length = 15 + params.right_context_size * params.subsampling_factor
     if features.size(1) < tail_length:
         feature_lens += tail_length - features.size(1)
         features = torch.cat(
@@ -389,18 +396,18 @@ def decode_one_chunk(
         )
 
     states = [
-        torch.stack([x[0] for x in states], dim=2),
-        torch.stack([x[1] for x in states], dim=2),
+        torch.stack([x[0] for x in states], dim=3),
+        torch.stack([x[1] for x in states], dim=1),
     ]
     processed_feature_lens = torch.tensor(processed_feature_lens, device=device)
 
     # Note: states will be modified in streaming_forward.
-    encoder_out, encoder_out_lens = model.encoder.streaming_forward(
+    encoder_out, encoder_out_lens, states = model.encoder.streaming_forward(
         x=features,
         x_lens=feature_lens,
         states=states,
-        left_context=params.left_context,
-        right_context=params.right_context,
+        left_context_size=params.left_context_size,
+        # right_context=params.right_context,
         processed_lens=processed_feature_lens,
     )
 
@@ -424,7 +431,7 @@ def decode_one_chunk(
     else:
         assert False
 
-    states = [torch.unbind(states[0], dim=2), torch.unbind(states[1], dim=2)]
+    states = [torch.unbind(states[0], dim=3), torch.unbind(states[1], dim=1)]
 
     finished_streams = []
     for i in range(len(decode_streams)):
@@ -466,7 +473,7 @@ def decode_dataset(
       The first is the reference transcript, and the second is the
       predicted result.
     """
-    device = model.device
+    device = next(model.parameters()).device
 
     opts = FbankOptions()
     opts.device = device
@@ -604,6 +611,12 @@ def main():
     params = get_params()
     params.update(vars(args))
 
+    assert params.decoding_method in (
+        "greedy_search",
+        "beam_search",
+        "fast_beam_search",
+        "modified_beam_search",
+    )
     params.res_dir = params.exp_dir / "streaming" / params.decoding_method
 
     if params.iter > 0:
@@ -612,15 +625,24 @@ def main():
         params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
 
     # for streaming
-    params.suffix += f"-streaming-chunk-size-{params.decode_chunk_size}"
-    params.suffix += f"-left-context-{params.left_context}"
-    params.suffix += f"-right-context-{params.right_context}"
+    params.suffix += f"-streaming-chunk-size-{params.chunk_size}"
+    params.suffix += f"-left-context-size-{params.left_context_size}"
+    params.suffix += f"-right-context-size-{params.right_context_size}"
 
-    # for fast_beam_search
-    if params.decoding_method == "fast_beam_search":
+    if "fast_beam_search" in params.decoding_method:
         params.suffix += f"-beam-{params.beam}"
         params.suffix += f"-max-contexts-{params.max_contexts}"
         params.suffix += f"-max-states-{params.max_states}"
+    elif "beam_search" in params.decoding_method:
+        params.suffix += (
+            f"-{params.decoding_method}-beam-size-{params.beam_size}"
+        )
+    else:
+        params.suffix += f"-context-{params.context_size}"
+        params.suffix += f"-max-sym-per-frame-{params.max_sym_per_frame}"
+
+    if params.use_averaged_model:
+        params.suffix += "-use-averaged-model"
 
     setup_logger(f"{params.res_dir}/log-decode-{params.suffix}")
     logging.info("Decoding started")
@@ -639,47 +661,91 @@ def main():
     params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
 
-    assert (
-        params.causal_convolution
-    ), "Decoding in streaming requires causal convolution"
-
     logging.info(params)
 
     logging.info("About to create model")
     model = get_transducer_model(params)
 
-    if params.iter > 0:
-        filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
-            : params.avg
-        ]
-        if len(filenames) == 0:
-            raise ValueError(
-                f"No checkpoints found for"
-                f" --iter {params.iter}, --avg {params.avg}"
-            )
-        elif len(filenames) < params.avg:
-            raise ValueError(
-                f"Not enough checkpoints ({len(filenames)}) found for"
-                f" --iter {params.iter}, --avg {params.avg}"
-            )
-        logging.info(f"averaging {filenames}")
-        model.to(device)
-        model.load_state_dict(average_checkpoints(filenames, device=device))
-    elif params.avg == 1:
-        load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+    if not params.use_averaged_model:
+        if params.iter > 0:
+            filenames = find_checkpoints(
+                params.exp_dir, iteration=-params.iter
+            )[: params.avg]
+            if len(filenames) == 0:
+                raise ValueError(
+                    f"No checkpoints found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            elif len(filenames) < params.avg:
+                raise ValueError(
+                    f"Not enough checkpoints ({len(filenames)}) found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            logging.info(f"averaging {filenames}")
+            model.to(device)
+            model.load_state_dict(average_checkpoints(filenames, device=device))
+        elif params.avg == 1:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        else:
+            start = params.epoch - params.avg + 1
+            filenames = []
+            for i in range(start, params.epoch + 1):
+                if i >= 1:
+                    filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
+            logging.info(f"averaging {filenames}")
+            model.to(device)
+            model.load_state_dict(average_checkpoints(filenames, device=device))
     else:
-        start = params.epoch - params.avg + 1
-        filenames = []
-        for i in range(start, params.epoch + 1):
-            if start >= 0:
-                filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
-        logging.info(f"averaging {filenames}")
-        model.to(device)
-        model.load_state_dict(average_checkpoints(filenames, device=device))
+        if params.iter > 0:
+            filenames = find_checkpoints(
+                params.exp_dir, iteration=-params.iter
+            )[: params.avg + 1]
+            if len(filenames) == 0:
+                raise ValueError(
+                    f"No checkpoints found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            elif len(filenames) < params.avg + 1:
+                raise ValueError(
+                    f"Not enough checkpoints ({len(filenames)}) found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            filename_start = filenames[-1]
+            filename_end = filenames[0]
+            logging.info(
+                "Calculating the averaged model over iteration checkpoints"
+                f" from {filename_start} (excluded) to {filename_end}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
+                )
+            )
+        else:
+            assert params.avg > 0, params.avg
+            start = params.epoch - params.avg
+            assert start >= 1, start
+            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
+            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+            logging.info(
+                f"Calculating the averaged model over epoch range from "
+                f"{start} (excluded) to {params.epoch}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
+                )
+            )
 
     model.to(device)
     model.eval()
-    model.device = device
+    # model.device = device
 
     decoding_graph = None
     if params.decoding_method == "fast_beam_search":
