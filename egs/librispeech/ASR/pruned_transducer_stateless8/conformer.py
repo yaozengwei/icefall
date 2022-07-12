@@ -28,6 +28,7 @@ from scaling import (
     DoubleSwish,
     ScaledConv1d,
     ScaledConv2d,
+    ScaledConvTranspose1d,
     ScaledLinear,
 )
 from torch import Tensor, nn
@@ -100,6 +101,7 @@ class Conformer(EncoderInterface):
         #   (1) subsampling: T -> T//subsampling_factor
         #   (2) embedding: num_features -> d_model
         self.encoder_embed = Conv2dSubsampling(num_features, d_model)
+        self.encoder_reconstruct = Conv1dUpsampling(d_model, num_features)
 
         self.encoder_layers = num_encoder_layers
         self.d_model = d_model
@@ -126,7 +128,7 @@ class Conformer(EncoderInterface):
 
     def forward(
         self, x: torch.Tensor, x_lens: torch.Tensor, warmup: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
           x:
@@ -144,7 +146,12 @@ class Conformer(EncoderInterface):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
+        T = x.size(1)
         x = self.encoder_embed(x)
+        x_rec = self.encoder_reconstruct(x.detach())
+        # right padding
+        x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
+
         x, pos_emb = self.encoder_pos(x)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
@@ -193,7 +200,7 @@ class Conformer(EncoderInterface):
             )  # (T, N, C)
 
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-        return x, lengths
+        return x, lengths, x_rec
 
     @torch.jit.export
     def get_init_state(
@@ -256,7 +263,7 @@ class Conformer(EncoderInterface):
         chunk_size: int = 16,
         simulate_streaming: bool = False,
         warmup: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]:
         """
         Args:
           x:
@@ -344,7 +351,11 @@ class Conformer(EncoderInterface):
                 [processed_mask, src_key_padding_mask], dim=1
             )
 
+            T = x.size(1)
             embed = self.encoder_embed(x)
+            x_rec = self.encoder_reconstruct(embed.detach())
+            # right padding
+            x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
 
             # cut off 1 frame on each size of embed as they see the padding
             # value which causes a training and decoding mismatch.
@@ -371,7 +382,13 @@ class Conformer(EncoderInterface):
             # this branch simulates streaming decoding using mask as we are
             # using in training time.
             src_key_padding_mask = make_pad_mask(lengths)
+
+            T = x.size(1)
             x = self.encoder_embed(x)
+            x_rec = self.encoder_reconstruct(x.detach())
+            # right padding
+            x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
+
             x, pos_emb = self.encoder_pos(x)
             x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
@@ -398,7 +415,7 @@ class Conformer(EncoderInterface):
 
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
-        return x, lengths, states
+        return x, lengths, states, x_rec
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -1578,6 +1595,58 @@ class Conv2dSubsampling(nn.Module):
         # Now x is of shape (N, ((T-1)//2 - 1))//2, odim)
         x = self.out_norm(x)
         x = self.out_balancer(x)
+        return x
+
+
+class Conv1dUpsampling(nn.Module):
+    """Convolutional 1D upsampling (to 4 * length).
+
+    Convert an input of shape (N, T, idim) to an output
+    with shape (N, T', odim), where
+    T' = (T * 2 + 1) * 2 + 1, which approximates the length before subsampling.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        """
+        Args:
+          in_channels:
+            Number of channels in. The input shape is (N, T, in_channels).
+          out_channels:
+            Output dim. The output shape is (N, (T*2+1)*2+1, out_channels).
+        """
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            ScaledConvTranspose1d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=2,
+            ),
+            ActivationBalancer(channel_dim=1),
+            DoubleSwish(),
+            ScaledConvTranspose1d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=2,
+            ),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample x.
+
+        Args:
+          x:
+            Its shape is (N, T, idim).
+
+        Returns:
+          Return a tensor of shape (N, (T*2+1)*2+1, odim)
+        """
+        # On entry, x is (N, T, idim)
+        x = x.transpose(1, 2)  # (N, idim, T)
+        x = self.conv(x)  # (N, odim, (T*2+1)*2+1)
+        x = x.transpose(1, 2)  # (N, (T*2+1)*2+1, odim)
         return x
 
 

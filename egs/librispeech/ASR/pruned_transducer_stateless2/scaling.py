@@ -376,6 +376,64 @@ class ScaledConv2d(nn.Conv2d):
         return self._conv_forward(input, self.get_weight())
 
 
+class ScaledConvTranspose1d(nn.ConvTranspose1d):
+    # See docs for ScaledLinear
+    def __init__(
+        self,
+        *args,
+        initial_scale: float = 1.0,
+        initial_speed: float = 1.0,
+        **kwargs
+    ):
+        super(ScaledConvTranspose1d, self).__init__(*args, **kwargs)
+        initial_scale = torch.tensor(initial_scale).log()
+
+        self.bias_scale: Optional[nn.Parameter]  # for torchscript
+
+        self.weight_scale = nn.Parameter(initial_scale.clone().detach())
+        if self.bias is not None:
+            self.bias_scale = nn.Parameter(initial_scale.clone().detach())
+        else:
+            self.register_parameter("bias_scale", None)
+        self._reset_parameters(
+            initial_speed
+        )  # Overrides the reset_parameters in base class
+
+    def _reset_parameters(self, initial_speed: float):
+        std = 0.1 / initial_speed
+        a = (3 ** 0.5) * std
+        nn.init.uniform_(self.weight, -a, a)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0.0)
+        fan_in = self.weight.shape[1] * self.weight[0][0].numel()
+        scale = fan_in ** -0.5  # 1/sqrt(fan_in)
+        with torch.no_grad():
+            self.weight_scale += torch.tensor(scale / std).log()
+
+    def get_weight(self):
+        return self.weight * self.weight_scale.exp()
+
+    def get_bias(self):
+        bias = self.bias
+        bias_scale = self.bias_scale
+        if bias is None or bias_scale is None:
+            return None
+        else:
+            return bias * bias_scale.exp()
+
+    def forward(self, input: Tensor) -> Tensor:
+        F = torch.nn.functional
+        return F.conv_transpose1d(
+            input,
+            self.get_weight(),
+            self.get_bias(),
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
+            self.dilation,
+        )
+
 class ActivationBalancer(torch.nn.Module):
     """
     Modifies the backpropped derivatives of a function to try to encourage, for
@@ -726,8 +784,17 @@ def _test_double_swish_deriv():
     torch.autograd.gradcheck(m, x)
 
 
+def _test_conv_transpose1d():
+    m = ScaledConvTranspose1d(256, 256, 3, 2)
+    for T in range(1, 10):
+        x = torch.randn(2, 256, T)
+        y = m(x)
+        assert y.shape[-1] == 2 * T + 1
+
+
 if __name__ == "__main__":
     _test_activation_balancer_sign()
     _test_activation_balancer_magnitude()
     _test_basic_norm()
     _test_double_swish_deriv()
+    _test_conv_transpose1d()
