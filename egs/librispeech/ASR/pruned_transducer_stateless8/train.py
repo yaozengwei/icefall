@@ -59,6 +59,7 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
 import argparse
 import copy
 import logging
+import random
 import warnings
 from pathlib import Path
 from shutil import copyfile
@@ -588,7 +589,7 @@ def compute_loss(
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
-) -> Tuple[Tensor, MetricsTracker]:
+) -> Tuple[Tensor, MetricsTracker, Tuple]:
     """
     Compute RNN-T loss given the model and its inputs.
 
@@ -625,7 +626,7 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss, rec_loss = model(
+        simple_loss, pruned_loss, rec_loss, feature_rec = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -664,7 +665,16 @@ def compute_loss(
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     info["rec_loss"] = rec_loss.detach().cpu().item()
 
-    return loss, info
+    # Randomly choose one utterance, and visualize its fbank
+    # as well as its reconstructed fbank
+    utt_id = random.randint(0, feature.size(0) - 1)
+    utt_len = feature_lens[utt_id]
+    fbank_pair = (
+        feature[utt_id, :utt_len].detach().cpu().numpy(),
+        feature_rec[utt_id, :utt_len].detach().cpu().numpy(),
+    )
+
+    return loss, info, fbank_pair
 
 
 def compute_validation_loss(
@@ -680,7 +690,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
+        loss, loss_info, _ = compute_loss(
             params=params,
             model=model,
             sp=sp,
@@ -761,7 +771,7 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         with torch.cuda.amp.autocast(enabled=params.use_fp16):
-            loss, loss_info = compute_loss(
+            loss, loss_info, fbank_pair = compute_loss(
                 params=params,
                 model=model,
                 sp=sp,
@@ -838,6 +848,20 @@ def train_one_epoch(
                 tot_loss.write_summary(
                     tb_writer, "train/tot_", params.batch_idx_train
                 )
+
+                if rank == 0:
+                    import matplotlib.pyplot as plt
+
+                    fig, axes = plt.subplots(2, figsize=(20, 4))
+                    for idx, tag in enumerate(
+                        ["fbank_input", "fbank_restruct"]
+                    ):
+                        axes[idx].set_title(tag)
+                        axes[idx].imshow(fbank_pair[idx].transpose())
+                        axes[idx].invert_yaxis()
+                    tb_writer.add_figure(
+                        "train/fbank_pair", fig, params.batch_idx_train
+                    )
 
         if batch_idx > 0 and batch_idx % params.valid_interval == 0:
             logging.info("Computing validation loss")
@@ -1066,7 +1090,7 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, _ = compute_loss(
+                loss, _, _ = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,
