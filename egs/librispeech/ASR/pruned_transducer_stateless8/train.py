@@ -625,7 +625,7 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        simple_loss, pruned_loss, rec_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -646,6 +646,7 @@ def compute_loss(
         loss = (
             params.simple_loss_scale * simple_loss
             + pruned_loss_scale * pruned_loss
+            + rec_loss
         )
 
     assert loss.requires_grad == is_training
@@ -661,6 +662,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["rec_loss"] = rec_loss.detach().cpu().item()
 
     return loss, info
 

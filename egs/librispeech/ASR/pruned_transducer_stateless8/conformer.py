@@ -1652,12 +1652,15 @@ class Conv1dUpsampling(nn.Module):
 
 if __name__ == "__main__":
     feature_dim = 50
-    c = Conformer(num_features=feature_dim, d_model=128, nhead=4)
+    d_model = 128
+    c = Conformer(num_features=feature_dim, d_model=d_model, nhead=4)
     batch_size = 5
     seq_len = 20
     # Just make sure the forward pass runs.
-    f = c(
+    y, _, x_rec = c(
         torch.randn(batch_size, seq_len, feature_dim),
         torch.full((batch_size,), seq_len, dtype=torch.int64),
         warmup=0.5,
     )
+    assert y.shape == (batch_size, ((seq_len - 1) // 2 - 1) // 2, d_model)
+    assert x_rec.shape == (batch_size, seq_len, feature_dim)
