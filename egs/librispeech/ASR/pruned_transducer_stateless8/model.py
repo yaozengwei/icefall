@@ -124,9 +124,7 @@ class Transducer(nn.Module):
         rec_loss = ((x_rec - x) ** 2).sum(dim=2)  # (N, T)
         padding_mask = make_pad_mask(x_lens)
         rec_loss = rec_loss.masked_fill_(padding_mask, 0)
-        rec_loss = rec_loss.sum() / (
-            (padding_mask.numel() - padding_mask.sum()) * x_rec.size(2)
-        )
+        rec_loss = rec_loss.sum() / (padding_mask.numel() - padding_mask.sum())
 
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
