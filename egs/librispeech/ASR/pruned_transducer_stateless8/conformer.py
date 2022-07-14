@@ -146,11 +146,8 @@ class Conformer(EncoderInterface):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-        T = x.size(1)
         x = self.encoder_embed(x)
         x_rec = self.encoder_reconstruct(x.detach())
-        # right padding
-        x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
 
         x, pos_emb = self.encoder_pos(x)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
@@ -161,6 +158,7 @@ class Conformer(EncoderInterface):
         #
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
         lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        x_lens_rec = (lengths * 2 + 1) * 2 + 1
 
         assert x.size(0) == lengths.max().item()
 
@@ -200,7 +198,7 @@ class Conformer(EncoderInterface):
             )  # (T, N, C)
 
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-        return x, lengths, x_rec
+        return x, lengths, x_rec, x_lens_rec
 
     @torch.jit.export
     def get_init_state(
@@ -316,6 +314,7 @@ class Conformer(EncoderInterface):
         #
         # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
         lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        x_lens_rec = (lengths * 2 + 1) * 2 + 1
 
         if not simulate_streaming:
             assert states is not None
@@ -351,11 +350,8 @@ class Conformer(EncoderInterface):
                 [processed_mask, src_key_padding_mask], dim=1
             )
 
-            T = x.size(1)
             embed = self.encoder_embed(x)
             x_rec = self.encoder_reconstruct(embed.detach())
-            # right padding
-            x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
 
             # cut off 1 frame on each size of embed as they see the padding
             # value which causes a training and decoding mismatch.
@@ -383,11 +379,8 @@ class Conformer(EncoderInterface):
             # using in training time.
             src_key_padding_mask = make_pad_mask(lengths)
 
-            T = x.size(1)
             x = self.encoder_embed(x)
             x_rec = self.encoder_reconstruct(x.detach())
-            # right padding
-            x_rec = nn.functional.pad(x_rec, (0, 0, 0, T - x_rec.size(1)))
 
             x, pos_emb = self.encoder_pos(x)
             x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
@@ -415,7 +408,7 @@ class Conformer(EncoderInterface):
 
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
-        return x, lengths, states, x_rec
+        return x, lengths, states, x_rec, x_lens_rec
 
 
 class ConformerEncoderLayer(nn.Module):
