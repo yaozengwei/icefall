@@ -658,6 +658,7 @@ def compute_loss(
         info["frames"] = (
             (feature_lens // params.subsampling_factor).sum().item()
         )
+    info["input_frames"] = feature_lens.sum().item()
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()

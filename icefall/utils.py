@@ -543,13 +543,16 @@ class MetricsTracker(collections.defaultdict):
           [('ctc_loss', 0.1), ('att_loss', 0.07)]
         """
         num_frames = self["frames"] if "frames" in self else 1
+        num_input_frames = self["input_frames"] if "input_frames" in self else 1
         ans = []
         for k, v in self.items():
-            if k != "frames" and k != "rec_loss":
-                norm_value = float(v) / num_frames
+            if k != "frames" and k != "input_frames":
+                norm_value = (
+                    float(v) / num_frames
+                    if k != "rec_loss"
+                    else float(v) / num_input_frames
+                )
                 ans.append((k, norm_value))
-            elif k == "rec_loss":
-                ans.append((k, v))
         return ans
 
     def reduce(self, device):
