@@ -22,11 +22,11 @@ Usage:
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-./lstm_transducer_stateless/train.py \
+./lstm_transducer_stateless2/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
-  --exp-dir lstm_transducer_stateless/exp \
+  --exp-dir lstm_transducer_stateless2/exp \
   --full-libri 1 \
   --max-duration 300
 
@@ -122,6 +122,27 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         If set to 0, will not use the random combiner (Default).
         You can set a positive integer to use the random combiner, e.g., 3.
         """,
+    )
+
+    parser.add_argument(
+        "--num-future-steps",
+        type=int,
+        default=0,
+        help="Number of future steps to predict.",
+    )
+
+    parser.add_argument(
+        "--lower-layer-id",
+        type=int,
+        default=0,
+        help="The 1-based index of the lower layer. If 0, will use the feature after subsampling.",  # noqa
+    )
+
+    parser.add_argument(
+        "--higher-layer-id",
+        type=int,
+        default=5,
+        help="The 1-based index of the higher layer.",
     )
 
 
@@ -258,6 +279,13 @@ def get_parser():
         "loss(joiner is just addition), this simple loss also uses for"
         "training (as a regularization item). We will scale the simple loss"
         "with this parameter before adding to the final loss.",
+    )
+
+    parser.add_argument(
+        "--future-loss-scale",
+        type=float,
+        default=1,
+        help="The scale of the future loss.",
     )
 
     parser.add_argument(
@@ -438,6 +466,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        num_future_steps=params.num_future_steps,
     )
     return model
 
@@ -504,9 +533,6 @@ def load_checkpoint_if_available(
     if params.start_batch > 0:
         if "cur_epoch" in saved_params:
             params["start_epoch"] = saved_params["cur_epoch"]
-
-        if "cur_batch_idx" in saved_params:
-            params["cur_batch_idx"] = saved_params["cur_batch_idx"]
 
     return saved_params
 
@@ -605,7 +631,7 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        simple_loss, pruned_loss, future_losses = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -614,9 +640,11 @@ def compute_loss(
             lm_scale=params.lm_scale,
             warmup=warmup,
             reduction="none",
+            extra_layer_pair_ids=(
+                params.lower_layer_id,
+                params.higher_layer_id,
+            ),
         )
-        simple_loss[0] = float("inf")
-        pruned_loss[1] = float("nan")
         simple_loss_is_finite = torch.isfinite(simple_loss)
         pruned_loss_is_finite = torch.isfinite(pruned_loss)
         is_finite = simple_loss_is_finite & pruned_loss_is_finite
@@ -656,6 +684,12 @@ def compute_loss(
             + pruned_loss_scale * pruned_loss
         )
 
+        if params.num_future_steps > 0:
+            assert len(future_losses) == params.num_future_steps
+            scale = params.future_loss_scale if warmup >= 2.0 else 0
+            for k in range(params.num_future_steps):
+                loss += scale * future_losses[k]
+
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -682,6 +716,10 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+
+    if params.num_future_steps > 0:
+        for k in range(params.num_future_steps):
+            info[f"future_loss_{k+1}"] = future_losses[k]
 
     return loss, info
 
@@ -769,13 +807,7 @@ def train_one_epoch(
 
     tot_loss = MetricsTracker()
 
-    cur_batch_idx = params.get("cur_batch_idx", 0)
-
     for batch_idx, batch in enumerate(train_dl):
-        if batch_idx < cur_batch_idx:
-            continue
-        cur_batch_idx = batch_idx
-
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
 
@@ -821,7 +853,6 @@ def train_one_epoch(
             params.batch_idx_train > 0
             and params.batch_idx_train % params.save_every_n == 0
         ):
-            params.cur_batch_idx = batch_idx
             save_checkpoint_with_global_batch_idx(
                 out_dir=params.exp_dir,
                 global_batch_idx=params.batch_idx_train,
@@ -834,7 +865,6 @@ def train_one_epoch(
                 scaler=scaler,
                 rank=rank,
             )
-            del params.cur_batch_idx
             remove_checkpoints(
                 out_dir=params.exp_dir,
                 topk=params.keep_last_k,

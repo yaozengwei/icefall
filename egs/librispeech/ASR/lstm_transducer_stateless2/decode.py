@@ -366,7 +366,7 @@ def decode_one_batch(
     )
     feature_lens += num_tail_padded_frames
 
-    encoder_out, encoder_out_lens, _ = model.encoder(
+    encoder_out, encoder_out_lens, _, _ = model.encoder(
         x=feature, x_lens=feature_lens
     )
 

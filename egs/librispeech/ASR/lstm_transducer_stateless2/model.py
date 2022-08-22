@@ -15,15 +15,16 @@
 # limitations under the License.
 
 
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import k2
 import torch
 import torch.nn as nn
 from encoder_interface import EncoderInterface
+from regress_loss_net import RegressLossNet
 from scaling import ScaledLinear
 
-from icefall.utils import add_sos
+from icefall.utils import add_sos, make_pad_mask
 
 
 class Transducer(nn.Module):
@@ -40,6 +41,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        num_future_steps: Optional[int] = 0,
     ):
         """
         Args:
@@ -71,6 +73,15 @@ class Transducer(nn.Module):
         )
         self.simple_lm_proj = ScaledLinear(decoder_dim, vocab_size)
 
+        self.num_future_steps = num_future_steps
+        if num_future_steps > 0:
+            self.regress_loss_nets = nn.ModuleList(
+                [
+                    RegressLossNet(encoder_dim, encoder_dim)
+                    for _ in range(num_future_steps)
+                ]
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -81,7 +92,8 @@ class Transducer(nn.Module):
         lm_scale: float = 0.0,
         warmup: float = 1.0,
         reduction: str = "sum",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        extra_layer_pair_ids: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Args:
           x:
@@ -124,8 +136,33 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
-        encoder_out, x_lens, _ = self.encoder(x, x_lens, warmup=warmup)
+        encoder_out, x_lens, _, extra_layer_pair = self.encoder(
+            x, x_lens, warmup=warmup, extra_layer_pair_ids=extra_layer_pair_ids
+        )
         assert torch.all(x_lens > 0)
+
+        if self.num_future_steps > 0:
+            assert len(extra_layer_pair) == 2, len(extra_layer_pair)
+            lower_layer, higher_layer = extra_layer_pair
+            lower_layer = lower_layer.detach()
+            assert lower_layer.shape == higher_layer.shape, (
+                lower_layer.shape,
+                higher_layer.shape,
+            )
+            future_losses = []
+            mask = make_pad_mask(x_lens)
+            assert self.num_future_steps == len(self.regress_loss_nets)
+            for k in range(1, self.num_future_steps + 1):
+                future_losses.append(
+                    self.regress_loss_nets[k - 1](
+                        x=higher_layer[:, :-k, :],
+                        y=lower_layer[:, k:, :],
+                        mask=mask[:, k:],
+                        reduction="sum",
+                    )
+                )
+        else:
+            future_losses = [torch.empty(0)]
 
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
@@ -199,4 +236,4 @@ class Transducer(nn.Module):
                 reduction=reduction,
             )
 
-        return (simple_loss, pruned_loss)
+        return (simple_loss, pruned_loss, future_losses)

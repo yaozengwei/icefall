@@ -175,7 +175,13 @@ class RNN(EncoderInterface):
         x_lens: torch.Tensor,
         states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         warmup: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        extra_layer_pair_ids: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         """
         Args:
           x:
@@ -214,7 +220,9 @@ class RNN(EncoderInterface):
             assert x.size(0) == lengths.max().item()
 
         if states is None:
-            x = self.encoder(x, warmup=warmup)[0]
+            x, _, extra_layer_pair = self.encoder(
+                x, warmup=warmup, extra_layer_pair_ids=extra_layer_pair_ids
+            )
             # torch.jit.trace requires returned types to be the same as annotated  # noqa
             new_states = (torch.empty(0), torch.empty(0))
         else:
@@ -233,10 +241,10 @@ class RNN(EncoderInterface):
                     x.size(1),
                     self.rnn_hidden_size,
                 )
-            x, new_states = self.encoder(x, states)
+            x, new_states, extra_layer_pair = self.encoder(x, states)
 
         x = x.permute(1, 0, 2)  # (T, N, C) -> (N, T, C)
-        return x, lengths, new_states
+        return x, lengths, new_states, extra_layer_pair
 
     @torch.jit.export
     def get_init_states(
@@ -415,7 +423,12 @@ class RNNEncoder(nn.Module):
         src: torch.Tensor,
         states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         warmup: float = 1.0,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        extra_layer_pair_ids: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.tensor],
+    ]:
         """
         Pass the input through the encoder layer in turn.
 
@@ -458,6 +471,19 @@ class RNNEncoder(nn.Module):
         new_hidden_states = []
         new_cell_states = []
 
+        if extra_layer_pair_ids is not None:
+            assert len(extra_layer_pair_ids) == 2, len(extra_layer_pair_ids)
+            # (lower layer, higher layer)
+            assert extra_layer_pair_ids[0] <= extra_layer_pair_ids[1]
+            pair = ()
+            # the feature after subsampling
+            if extra_layer_pair_ids[0] == 0:
+                pair += (output.transpose(0, 1),)
+            if extra_layer_pair_ids[1] == 0:
+                pair += (output.transpose(0, 1),)
+        else:
+            pair = (torch.empty(0), torch.empty(0))
+
         for i, mod in enumerate(self.layers):
             if states is None:
                 output = mod(output, warmup=warmup)[0]
@@ -473,6 +499,12 @@ class RNNEncoder(nn.Module):
             if self.combiner is not None and i in self.aux_layers:
                 outputs.append(output)
 
+            if extra_layer_pair_ids is not None:
+                if extra_layer_pair_ids[0] == i + 1:
+                    pair += (output.transpose(0, 1),)
+                if extra_layer_pair_ids[1] == i + 1:
+                    pair += (output.transpose(0, 1),)
+
         if self.combiner is not None:
             output = self.combiner(outputs)
 
@@ -484,7 +516,7 @@ class RNNEncoder(nn.Module):
                 torch.cat(new_cell_states, dim=0),
             )
 
-        return output, new_states
+        return output, new_states, pair
 
 
 class Conv2dSubsampling(nn.Module):
