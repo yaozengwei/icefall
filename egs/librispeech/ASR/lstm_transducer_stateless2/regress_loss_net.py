@@ -27,27 +27,39 @@ class RegressLossNet(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.linear = ScaledLinear(input_dim, output_dim)
-        self.kl_loss = nn.KLDivLoss(log_target=True, reduction="none")
 
     def forward(
         self,
         x: torch.Tensor,
         y: torch.tensor,
         mask: Optional[torch.Tensor] = None,
+        loss_fun: str = "kld",
         reduction: str = "sum",
     ) -> torch.Tensor:
+        assert loss_fun in ("kld", "neg_cos", "mse", "l1"), loss_fun
         assert reduction in ("sum", "mean"), reduction
 
         prediction = self.linear(x)
 
-        # mse loss
-        # loss = ((prediction - y) ** 2).mean(dim=2)
+        if loss_fun == "kld":
+            # Kullback-Leibler divergence loss
+            prediction = F.softmax(prediction, dim=2)
+            y = F.softmax(y, dim=2)
+            loss = y * (y.log() - prediction.log())
+            # (N, T)
+            loss = loss.sum(dim=2)
+        elif loss_fun == "neg_cos":
+            # negative cosine similarity
+            # (N, T)
+            loss = 1 - F.cosine_similarity(prediction, y, dim=2)
+        elif loss_fun == "mse":
+            # mse loss
+            # (N, T)
+            loss = ((prediction - y) ** 2).mean(dim=2)
+        else:
+            # l1 loss
+            loss = F.l1_loss(prediction, y, reduction="none").mean(dim=2)
 
-        # Kullback-Leibler divergence loss
-        # (N, T)
-        loss = self.kl_loss(
-            F.log_softmax(prediction, dim=2), F.log_softmax(y, dim=2)
-        ).sum(dim=2)
         if mask is not None:
             assert loss.shape == mask.shape, (loss.shape, mask.shape)
             loss.masked_fill_(mask, 0)

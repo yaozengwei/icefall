@@ -289,6 +289,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--regress-loss-fun",
+        type=str,
+        default="kld",
+        help="The loss function for regression, could be `kld`, `neg_cos`, `mse` or `l1`.",  # noqa
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -644,6 +651,7 @@ def compute_loss(
                 params.lower_layer_id,
                 params.higher_layer_id,
             ),
+            regress_loss_fun=params.regress_loss_fun,
         )
         simple_loss_is_finite = torch.isfinite(simple_loss)
         pruned_loss_is_finite = torch.isfinite(pruned_loss)

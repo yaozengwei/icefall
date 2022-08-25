@@ -93,6 +93,7 @@ class Transducer(nn.Module):
         warmup: float = 1.0,
         reduction: str = "sum",
         extra_layer_pair_ids: Optional[Tuple[int, int]] = None,
+        regress_loss_fun: str = "kld",
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -158,6 +159,7 @@ class Transducer(nn.Module):
                         x=higher_layer[:, :-k, :],
                         y=lower_layer[:, k:, :],
                         mask=mask[:, k:],
+                        loss_fun=regress_loss_fun,
                         reduction="sum",
                     )
                 )
