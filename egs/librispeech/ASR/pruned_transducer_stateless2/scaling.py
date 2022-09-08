@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import torch
 import torch.backends.cudnn.rnn as rnn
 import torch.nn as nn
+from sampling import balanced_sample
 from torch import _VF, Tensor
 
 from icefall.utils import is_jit_tracing
@@ -528,6 +529,161 @@ class ScaledLSTM(nn.LSTM):
         output = result[0]
         hidden = result[1:]
         return output, hidden
+
+
+class SamplingFeedforward(nn.Module):
+    """
+    This is a feed-forward module that does not use all the parameters on each frame;
+    it uses a weighted softmax, which is approximated via sampling a subset of indexes,
+    to only access a subset of groups of the hidden dimensions for each frame.
+
+    The sampling is done in such a way that each class (each one corresponding to
+    a group of hidden channels) is sampled exactly the same number of times, taken
+    over the whole minibatch, so that we can use batched matrix multiply for
+    the computations.
+
+    This class is provided an example; the idea is that you will probably want
+    to copy and modify it to suit your purposes.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        hidden_channels: int,
+        groups: int,
+        K_train: int,
+        K_test: int,
+    ):
+        """
+        Args:
+          num_channels: the number of channels at the input and output of this module;
+                these are forced to be the same (the assumption is you might want to have
+                some kind of residual connection).
+          hidden_channels: the number of hidden channels.  This will typically be much
+               larger than num_channels.
+          groups: the number of groups of hidden channels.  E.g. 64.
+          K_train: the number of elements of `groups` that we sample in training mode.
+                   Must be less than `groups`.  e.g. 4.
+          K_test: the number of elements of `groups` that we sample in training mode.
+                   Must be less than `groups`.  e.g. 4.  TODO: support K_test == groups
+        """
+        super(SamplingFeedforward, self).__init__()
+        self.num_channels = num_channels
+        self.hidden_channels = hidden_channels
+        self.groups = groups
+        self.K_train = K_train
+        self.K_test = K_test
+        assert hidden_channels % groups == 0
+        group_size = hidden_channels // groups
+
+        self.linear_in = nn.Parameter(
+            torch.zeros(groups, group_size, num_channels)
+        )
+        self.bias_in = nn.Parameter(torch.zeros(groups, group_size))
+
+        self.nonlin = nn.ReLU()  # you might want to change this
+        # self.balancer = ActivationBalancer(..., channel_dim=-1)
+
+        self.linear_out = nn.Parameter(
+            torch.zeros(groups, num_channels, group_size)
+        )
+        # it's not really clear that we need a bias per group..
+        self.bias_out = nn.Parameter(torch.zeros(groups, num_channels))
+
+        self.to_softmax = nn.Linear(num_channels, groups)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        group_size = self.hidden_channels // self.groups
+        bound_in = 2.0 * (self.num_channels ** -0.5)
+        bound_out = 2.0 * (group_size ** -0.5)
+
+        nn.init.uniform_(self.linear_in, -bound_in, bound_in)
+        nn.init.uniform_(self.bias_in, -0.01, 0.01)
+        nn.init.uniform_(self.linear_out, -bound_out, bound_out)
+        nn.init.uniform_(self.bias_out, -0.01, 0.01)
+
+    def forward(self, x: Tensor, padding: Optional[Tensor] = None) -> Tensor:
+        """
+        Forward function.
+        Args:
+            x: a Tensor of shape (*, num_channels)
+          padding:  a Tensor of shape (*), i.e. the same as x.shape[:-1], with True
+               for frames/items that are padding.  The user asserts that the
+               output at these frames will not affect the thing that we
+               are eventually going to compute.
+         Returns:
+             a tensor of shape (*, num_channels)
+        """
+        x_shape = x.shape
+        num_channels = self.num_channels
+        x = x.reshape(-1, num_channels)
+        num_frames = x.shape[0]
+        # dimension of logprobs: (num_frames, groups)
+        logprobs = self.to_softmax(x)
+
+        K = self.K_train if self.training else self.K_test
+        # TODO(not urgent): treat the case where self.K_test == self.groups specially.
+        # Right now it will cause an error.
+        # TODO: eventually, pass in the padding information.  It's as
+        #
+        (
+            _num_frames_padded,
+            indexes_in,
+            indexes_out,
+            weights_out,
+        ) = balanced_sample(
+            logprobs, K, padding.reshape(-1) if padding else None
+        )
+
+        (groups, frames_per_group) = indexes_in.shape
+        assert groups == self.groups
+
+        # the next line wraps around indexes for padding frames that were
+        # added by balanced_sample(), to refer to valid frames.  The
+        # outputs at these values won't be used, so we can use any input
+        # value.
+        indexes_in = indexes_in % num_frames
+        indexes_in = indexes_in.reshape(-1)
+
+        x = torch.index_select(x, dim=0, index=indexes_in)
+        x = x.reshape(groups, frames_per_group, num_channels)
+
+        # Input linear projection
+        # (groups, frames_per_group, num_channels) * (groups, num_channels, group_size) ->
+        #    (groups, frames_per_group, group_size)
+        x = torch.matmul(x, self.linear_in.transpose(1, 2))
+        x = x + self.bias_in.unsqueeze(1)
+
+        # if you are using ActivationBalancer, it would be done at this point. You would have
+        # to do:
+        # x = x.transpose(0, 1).reshape(frames_per_group, groups * group_size)
+        # x = self.balancer(x)
+        # x = x.reshape(frames_per_group, groups, group_size).transpose(0, 1)
+        # x is now (groups, frames_per_group, group_size) again.
+
+        # Nonlinearity
+        x = self.nonlin(x)
+        # Output linear projection
+        # (groups, frames_per_group, group_size) * (groups, group_size, num_channels) ->
+        #    (groups, frames_per_group, num_channels)
+        x = torch.matmul(x, self.linear_out.transpose(1, 2))
+        x = x + self.bias_out.unsqueeze(1)
+
+        x = x.reshape(groups * frames_per_group, num_channels)
+        # indexes_out was of shape (num_frames, K).  It contains elements in
+        # 0 .. groups*frames_per_group - 1.
+        indexes_out = indexes_out.reshape(-1)
+        x = torch.index_select(x, dim=0, index=indexes_out)
+        # multiply by the importance-sampling weights.
+        x = x * weights_out.reshape(-1).unsqueeze(-1)
+        # .. now aggregate over the K samples.
+        x = x.reshape(num_frames, K, num_channels).sum(dim=1)
+        # x now of shape (num_frames, channels)
+        # Restore the original structure to x, which we previously viewed as a flat
+        # `num_frames`
+        return x.reshape(x_shape)
 
 
 class ActivationBalancer(torch.nn.Module):

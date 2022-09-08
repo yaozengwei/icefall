@@ -16,6 +16,7 @@ per-file-ignores =
 
     # invalid escape sequence (cause by tex formular), W605
     icefall/utils.py: E501, W605
+    egs/librispeech/ASR/pruned_transducer_stateless7/sampling.py: W605, E203, E501
 
 exclude =
   .git,
