@@ -603,17 +603,23 @@ class ScaledSamplingFeedforward(nn.Module):
         self.linear_out_scale = nn.Parameter(initial_scale.clone().detach())
         self.bias_out_scale = nn.Parameter(initial_scale.clone().detach())
 
-        self.reset_parameters()
+        self.reset_parameters(initial_speed)
 
-    def reset_parameters(self) -> None:
+    def reset_parameters(self, initial_speed: float) -> None:
+        std = 0.1 / initial_speed
+
         group_size = self.hidden_channels // self.groups
         bound_in = 2.0 * (self.num_channels ** -0.5)
         bound_out = 2.0 * (group_size ** -0.5)
 
-        nn.init.uniform_(self.linear_in, -bound_in, bound_in)
-        nn.init.uniform_(self.bias_in, -0.01, 0.01)
-        nn.init.uniform_(self.linear_out, -bound_out, bound_out)
-        nn.init.uniform_(self.bias_out, -0.01, 0.01)
+        nn.init.uniform_(self.linear_in, -std, std)
+        nn.init.constant_(self.bias_in, 0.0)
+        nn.init.uniform_(self.linear_out, -std, std)
+        nn.init.constant_(self.bias_out, 0.0)
+
+        with torch.no_grad():
+            self.linear_in_scale += torch.tensor(bound_in / std).log()
+            self.linear_out_scale += torch.tensor(bound_out / std).log()
 
     def get_linear_in(self):
         return self.linear_in * self.linear_in_scale.exp()
