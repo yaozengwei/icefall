@@ -196,7 +196,7 @@ class ScaledLinear(nn.Linear):
         *args,
         initial_scale: float = 1.0,
         initial_speed: float = 1.0,
-        **kwargs
+        **kwargs,
     ):
         super(ScaledLinear, self).__init__(*args, **kwargs)
         initial_scale = torch.tensor(initial_scale).log()
@@ -243,7 +243,7 @@ class ScaledConv1d(nn.Conv1d):
         *args,
         initial_scale: float = 1.0,
         initial_speed: float = 1.0,
-        **kwargs
+        **kwargs,
     ):
         super(ScaledConv1d, self).__init__(*args, **kwargs)
         initial_scale = torch.tensor(initial_scale).log()
@@ -315,7 +315,7 @@ class ScaledConv2d(nn.Conv2d):
         *args,
         initial_scale: float = 1.0,
         initial_speed: float = 1.0,
-        **kwargs
+        **kwargs,
     ):
         super(ScaledConv2d, self).__init__(*args, **kwargs)
         initial_scale = torch.tensor(initial_scale).log()
@@ -390,7 +390,7 @@ class ScaledLSTM(nn.LSTM):
         *args,
         initial_scale: float = 1.0,
         initial_speed: float = 1.0,
-        **kwargs
+        **kwargs,
     ):
         if "bidirectional" in kwargs:
             assert kwargs["bidirectional"] is False
@@ -531,7 +531,7 @@ class ScaledLSTM(nn.LSTM):
         return output, hidden
 
 
-class SamplingFeedforward(nn.Module):
+class ScaledSamplingFeedforward(nn.Module):
     """
     This is a feed-forward module that does not use all the parameters on each frame;
     it uses a weighted softmax, which is approximated via sampling a subset of indexes,
@@ -553,6 +553,9 @@ class SamplingFeedforward(nn.Module):
         groups: int,
         K_train: int,
         K_test: int,
+        initial_scale: float = 1.0,
+        initial_speed: float = 1.0,
+        dropout: float = 0.1,
     ):
         """
         Args:
@@ -567,7 +570,7 @@ class SamplingFeedforward(nn.Module):
           K_test: the number of elements of `groups` that we sample in training mode.
                    Must be less than `groups`.  e.g. 4.  TODO: support K_test == groups
         """
-        super(SamplingFeedforward, self).__init__()
+        super(ScaledSamplingFeedforward, self).__init__()
         self.num_channels = num_channels
         self.hidden_channels = hidden_channels
         self.groups = groups
@@ -581,8 +584,9 @@ class SamplingFeedforward(nn.Module):
         )
         self.bias_in = nn.Parameter(torch.zeros(groups, group_size))
 
-        self.nonlin = nn.ReLU()  # you might want to change this
-        # self.balancer = ActivationBalancer(..., channel_dim=-1)
+        self.balancer = ActivationBalancer(channel_dim=-1)
+        self.nonlin = DoubleSwish()
+        self.dropout = nn.Dropout(dropout)
 
         self.linear_out = nn.Parameter(
             torch.zeros(groups, num_channels, group_size)
@@ -590,7 +594,14 @@ class SamplingFeedforward(nn.Module):
         # it's not really clear that we need a bias per group..
         self.bias_out = nn.Parameter(torch.zeros(groups, num_channels))
 
-        self.to_softmax = nn.Linear(num_channels, groups)
+        self.to_softmax = ScaledLinear(num_channels, groups)
+
+        # define scaling weights
+        initial_scale = torch.tensor(initial_scale).log()
+        self.linear_in_scale = nn.Parameter(initial_scale.clone().detach())
+        self.bias_in_scale = nn.Parameter(initial_scale.clone().detach())
+        self.linear_out_scale = nn.Parameter(initial_scale.clone().detach())
+        self.bias_out_scale = nn.Parameter(initial_scale.clone().detach())
 
         self.reset_parameters()
 
@@ -603,6 +614,18 @@ class SamplingFeedforward(nn.Module):
         nn.init.uniform_(self.bias_in, -0.01, 0.01)
         nn.init.uniform_(self.linear_out, -bound_out, bound_out)
         nn.init.uniform_(self.bias_out, -0.01, 0.01)
+
+    def get_linear_in(self):
+        return self.linear_in * self.linear_in_scale.exp()
+
+    def get_bias_in(self):
+        return self.bias_in * self.bias_in_scale.exp()
+
+    def get_linear_out(self):
+        return self.linear_out * self.linear_out_scale.exp()
+
+    def get_bias_out(self):
+        return self.bias_out * self.bias_out_scale.exp()
 
     def forward(self, x: Tensor, padding: Optional[Tensor] = None) -> Tensor:
         """
@@ -620,6 +643,7 @@ class SamplingFeedforward(nn.Module):
         num_channels = self.num_channels
         x = x.reshape(-1, num_channels)
         num_frames = x.shape[0]
+        group_size = self.hidden_channels // self.groups
         # dimension of logprobs: (num_frames, groups)
         logprobs = self.to_softmax(x)
 
@@ -653,23 +677,21 @@ class SamplingFeedforward(nn.Module):
         # Input linear projection
         # (groups, frames_per_group, num_channels) * (groups, num_channels, group_size) ->
         #    (groups, frames_per_group, group_size)
-        x = torch.matmul(x, self.linear_in.transpose(1, 2))
-        x = x + self.bias_in.unsqueeze(1)
+        x = torch.matmul(x, self.get_linear_in().transpose(1, 2))
+        x = x + self.get_bias_in().unsqueeze(1)
 
-        # if you are using ActivationBalancer, it would be done at this point. You would have
-        # to do:
-        # x = x.transpose(0, 1).reshape(frames_per_group, groups * group_size)
-        # x = self.balancer(x)
-        # x = x.reshape(frames_per_group, groups, group_size).transpose(0, 1)
-        # x is now (groups, frames_per_group, group_size) again.
+        x = x.transpose(0, 1).reshape(frames_per_group, groups * group_size)
+        x = self.balancer(x)
+        x = x.reshape(frames_per_group, groups, group_size).transpose(0, 1)
 
         # Nonlinearity
         x = self.nonlin(x)
+        x = self.dropout(x)
         # Output linear projection
         # (groups, frames_per_group, group_size) * (groups, group_size, num_channels) ->
         #    (groups, frames_per_group, num_channels)
-        x = torch.matmul(x, self.linear_out.transpose(1, 2))
-        x = x + self.bias_out.unsqueeze(1)
+        x = torch.matmul(x, self.get_linear_out().transpose(1, 2))
+        x = x + self.get_bias_out().unsqueeze(1)
 
         x = x.reshape(groups * frames_per_group, num_channels)
         # indexes_out was of shape (num_frames, K).  It contains elements in
@@ -1047,9 +1069,47 @@ def _test_scaled_lstm():
     assert c.shape == (1, N, dim_hidden)
 
 
+def _test_scaled_sampling_feedforward():
+    num_channels = 128
+    hidden_channels = 1024
+    groups = 32
+    K_train = 4
+    K_test = 8
+
+    device = "cuda"  # change to 'cpu' if you have no GPU
+
+    m = ScaledSamplingFeedforward(
+        num_channels, hidden_channels, groups, K_train, K_test
+    )
+    m = m.to(device)
+
+    train_pairs = [
+        (
+            torch.randn(20, 4, num_channels, device=device),
+            torch.randn(20, 4, num_channels, device=device),
+        )
+        for _ in range(50)
+    ]
+
+    optim = torch.optim.Adam(m.parameters(), lr=2.0e-03)
+
+    for epoch in range(50):
+        tot_loss = 0.0
+        for x, y in train_pairs:
+            y_pred = m(x)
+            loss = ((y - y_pred) ** 2).mean()
+            # print("loss = ", loss)
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+            tot_loss += loss.item()
+        print(f"Epoch {epoch}, avg loss={loss/len(train_pairs)}")
+
+
 if __name__ == "__main__":
-    _test_activation_balancer_sign()
-    _test_activation_balancer_magnitude()
-    _test_basic_norm()
-    _test_double_swish_deriv()
-    _test_scaled_lstm()
+    # _test_activation_balancer_sign()
+    # _test_activation_balancer_magnitude()
+    # _test_basic_norm()
+    # _test_double_swish_deriv()
+    # _test_scaled_lstm()
+    _test_scaled_sampling_feedforward()
