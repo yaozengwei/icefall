@@ -1093,6 +1093,7 @@ def _test_scaled_sampling_feedforward():
 
     optim = torch.optim.Adam(m.parameters(), lr=2.0e-03)
 
+    print("_test_scaled_sampling_feedforward:")
     for epoch in range(50):
         tot_loss = 0.0
         for x, y in train_pairs:
@@ -1107,9 +1108,9 @@ def _test_scaled_sampling_feedforward():
 
 
 if __name__ == "__main__":
-    # _test_activation_balancer_sign()
-    # _test_activation_balancer_magnitude()
-    # _test_basic_norm()
-    # _test_double_swish_deriv()
-    # _test_scaled_lstm()
+    _test_activation_balancer_sign()
+    _test_activation_balancer_magnitude()
+    _test_basic_norm()
+    _test_double_swish_deriv()
+    _test_scaled_lstm()
     _test_scaled_sampling_feedforward()
