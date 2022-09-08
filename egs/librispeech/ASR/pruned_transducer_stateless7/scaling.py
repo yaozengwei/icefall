@@ -553,7 +553,8 @@ class ScaledSamplingFeedforward(nn.Module):
         groups: int,
         K_train: int,
         K_test: int,
-        initial_scale: float = 1.0,
+        initial_scale_in: float = 1.0,
+        initial_scale_out: float = 1.0,
         initial_speed: float = 1.0,
         dropout: float = 0.1,
     ):
@@ -597,11 +598,13 @@ class ScaledSamplingFeedforward(nn.Module):
         self.to_softmax = ScaledLinear(num_channels, groups)
 
         # define scaling weights
-        initial_scale = torch.tensor(initial_scale).log()
-        self.linear_in_scale = nn.Parameter(initial_scale.clone().detach())
-        self.bias_in_scale = nn.Parameter(initial_scale.clone().detach())
-        self.linear_out_scale = nn.Parameter(initial_scale.clone().detach())
-        self.bias_out_scale = nn.Parameter(initial_scale.clone().detach())
+        initial_scale_in = torch.tensor(initial_scale_in).log()
+        self.linear_in_scale = nn.Parameter(initial_scale_in.clone().detach())
+        self.bias_in_scale = nn.Parameter(initial_scale_in.clone().detach())
+
+        initial_scale_out = torch.tensor(initial_scale_out).log()
+        self.linear_out_scale = nn.Parameter(initial_scale_out.clone().detach())
+        self.bias_out_scale = nn.Parameter(initial_scale_out.clone().detach())
 
         self.reset_parameters(initial_speed)
 

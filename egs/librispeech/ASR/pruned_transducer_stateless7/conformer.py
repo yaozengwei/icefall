@@ -15,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import math
 import warnings
 from typing import List, Optional, Tuple
@@ -29,6 +28,7 @@ from scaling import (
     ScaledConv1d,
     ScaledConv2d,
     ScaledLinear,
+    ScaledSamplingFeedforward,
 )
 from torch import Tensor, nn
 
@@ -68,6 +68,12 @@ class Conformer(EncoderInterface):
             This also will be used only when dynamic_chunk_training is True.
         causal (bool): Whether to use causal convolution in conformer encoder
             layer. This MUST be True when using dynamic_chunk_training.
+        groups: the number of groups of hidden channels.  E.g. 64.
+        K_train: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.
+        K_test: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.  TODO: support K_test == groups
+        sampling_layer_idx: the layer index to use sampling-based feedforward module.
     """
 
     def __init__(
@@ -86,6 +92,10 @@ class Conformer(EncoderInterface):
         short_chunk_size: int = 25,
         num_left_chunks: int = -1,
         causal: bool = False,
+        groups: int = 64,
+        K_train: int = 4,
+        K_test: int = 4,
+        sampling_layer_idx: int = 11,
     ) -> None:
         super(Conformer, self).__init__()
 
@@ -112,16 +122,20 @@ class Conformer(EncoderInterface):
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
-        encoder_layer = ConformerEncoderLayer(
-            d_model,
-            nhead,
-            dim_feedforward,
-            dropout,
-            layer_dropout,
-            cnn_module_kernel,
-            causal,
+        self.encoder = ConformerEncoder(
+            num_layers=num_encoder_layers,
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            layer_dropout=layer_dropout,
+            cnn_module_kernel=cnn_module_kernel,
+            causal=causal,
+            sampling_layer_idx=sampling_layer_idx,
+            groups=groups,
+            K_train=K_train,
+            K_test=K_test,
         )
-        self.encoder = ConformerEncoder(encoder_layer, num_encoder_layers)
         self._init_state: List[torch.Tensor] = [torch.empty(0)]
 
     def forward(
@@ -415,6 +429,12 @@ class ConformerEncoderLayer(nn.Module):
         cnn_module_kernel (int): Kernel size of convolution module.
         causal (bool): Whether to use causal convolution in conformer encoder
             layer. This MUST be True when using dynamic_chunk_training and streaming decoding.
+        use_sampling_ff: whether to use sampling-based feedforward module.
+        groups: the number of groups of hidden channels.  E.g. 64.
+        K_train: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.
+        K_test: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.  TODO: support K_test == groups
 
     Examples::
         >>> encoder_layer = ConformerEncoderLayer(d_model=512, nhead=8)
@@ -432,6 +452,10 @@ class ConformerEncoderLayer(nn.Module):
         layer_dropout: float = 0.075,
         cnn_module_kernel: int = 31,
         causal: bool = False,
+        use_sampling_ff: bool = False,
+        groups: int = 64,
+        K_train: int = 4,
+        K_test: int = 4,
     ) -> None:
         super(ConformerEncoderLayer, self).__init__()
 
@@ -443,21 +467,42 @@ class ConformerEncoderLayer(nn.Module):
             d_model, nhead, dropout=0.0
         )
 
-        self.feed_forward = nn.Sequential(
-            ScaledLinear(d_model, dim_feedforward),
-            ActivationBalancer(channel_dim=-1),
-            DoubleSwish(),
-            nn.Dropout(dropout),
-            ScaledLinear(dim_feedforward, d_model, initial_scale=0.25),
-        )
-
-        self.feed_forward_macaron = nn.Sequential(
-            ScaledLinear(d_model, dim_feedforward),
-            ActivationBalancer(channel_dim=-1),
-            DoubleSwish(),
-            nn.Dropout(dropout),
-            ScaledLinear(dim_feedforward, d_model, initial_scale=0.25),
-        )
+        if use_sampling_ff:
+            self.feed_forward = ScaledSamplingFeedforward(
+                num_channels=d_model,
+                hidden_channels=dim_feedforward,
+                groups=groups,
+                K_train=K_train,
+                K_test=K_test,
+                dropout=dropout,
+                initial_scale_in=1.0,
+                initial_scale_out=0.25,
+            )
+            self.feed_forward_macaron = ScaledSamplingFeedforward(
+                num_channels=d_model,
+                hidden_channels=dim_feedforward,
+                groups=groups,
+                K_train=K_train,
+                K_test=K_test,
+                dropout=dropout,
+                initial_scale_in=1.0,
+                initial_scale_out=0.25,
+            )
+        else:
+            self.feed_forward = nn.Sequential(
+                ScaledLinear(d_model, dim_feedforward),
+                ActivationBalancer(channel_dim=-1),
+                DoubleSwish(),
+                nn.Dropout(dropout),
+                ScaledLinear(dim_feedforward, d_model, initial_scale=0.25),
+            )
+            self.feed_forward_macaron = nn.Sequential(
+                ScaledLinear(d_model, dim_feedforward),
+                ActivationBalancer(channel_dim=-1),
+                DoubleSwish(),
+                nn.Dropout(dropout),
+                ScaledLinear(dim_feedforward, d_model, initial_scale=0.25),
+            )
 
         self.conv_module = ConvolutionModule(
             d_model, cnn_module_kernel, causal=causal
@@ -639,8 +684,20 @@ class ConformerEncoder(nn.Module):
     r"""ConformerEncoder is a stack of N encoder layers
 
     Args:
-        encoder_layer: an instance of the ConformerEncoderLayer() class (required).
         num_layers: the number of sub-encoder-layers in the encoder (required).
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        cnn_module_kernel (int): Kernel size of convolution module.
+        causal (bool): Whether to use causal convolution in conformer encoder
+            layer. This MUST be True when using dynamic_chunk_training and streaming decoding.
+        groups: the number of groups of hidden channels.  E.g. 64.
+        K_train: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.
+        K_test: the number of elements of `groups` that we sample in training mode.
+                 Must be less than `groups`.  e.g. 4.  TODO: support K_test == groups
+        sampling_layer_idx: the layer index to use sampling-based feedforward module.
 
     Examples::
         >>> encoder_layer = ConformerEncoderLayer(d_model=512, nhead=8)
@@ -650,11 +707,43 @@ class ConformerEncoder(nn.Module):
         >>> out = conformer_encoder(src, pos_emb)
     """
 
-    def __init__(self, encoder_layer: nn.Module, num_layers: int) -> None:
+    def __init__(
+        self,
+        num_layers: int = 12,
+        d_model: int = 256,
+        nhead: int = 4,
+        dim_feedforward: int = 2048,
+        num_encoder_layers: int = 12,
+        dropout: float = 0.1,
+        layer_dropout: float = 0.075,
+        cnn_module_kernel: int = 31,
+        causal: bool = False,
+        groups: int = 64,
+        K_train: int = 4,
+        K_test: int = 4,
+        sampling_layer_idx: int = 11,
+    ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList(
-            [copy.deepcopy(encoder_layer) for i in range(num_layers)]
-        )
+
+        layers = []
+        for i in range(num_layers):
+            encoder_layer = ConformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                layer_dropout=layer_dropout,
+                cnn_module_kernel=cnn_module_kernel,
+                causal=causal,
+                use_sampling_ff=True
+                if (i == sampling_layer_idx or sampling_layer_idx == -1)
+                else False,
+                groups=groups,
+                K_train=K_train,
+                K_test=K_test,
+            )
+            layers.append(encoder_layer)
+        self.layers = nn.ModuleList(layers)
         self.num_layers = num_layers
 
     def forward(
@@ -1616,7 +1705,10 @@ class Conv2dSubsampling(nn.Module):
 
 if __name__ == "__main__":
     feature_dim = 50
-    c = Conformer(num_features=feature_dim, d_model=128, nhead=4)
+    c = Conformer(
+        num_features=feature_dim, d_model=128, nhead=4, sampling_layer_idx=-1
+    )
+    print(c)
     batch_size = 5
     seq_len = 20
     # Just make sure the forward pass runs.
