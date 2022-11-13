@@ -21,7 +21,7 @@
 """
 Usage:
 (1) take ctc-decoding as an example
-./conformer_ctc3/decode.py \
+./pruned_transducer_stateless8/ctc_decode.py \
     --epoch 30 \
     --avg 15 \
     --exp-dir ./conformer_ctc3/exp \
