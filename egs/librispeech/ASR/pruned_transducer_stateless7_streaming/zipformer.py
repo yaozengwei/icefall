@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c)  2021  University of Chinese Academy of Sciences (author: Han Zhu)
+# Copyright    2022  Xiaomi Corp.        (authors: Daniel Povey)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
