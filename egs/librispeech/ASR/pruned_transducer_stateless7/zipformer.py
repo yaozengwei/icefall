@@ -1289,12 +1289,6 @@ class RelPositionMultiheadAttention(nn.Module):
             bsz * num_heads, seq_len, seq_len
         )
 
-        assert list(attn_output_weights.size()) == [
-            bsz * num_heads,
-            seq_len,
-            seq_len,
-        ]
-
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 attn_output_weights.masked_fill_(attn_mask, float("-inf"))
