@@ -454,7 +454,7 @@ class ZipformerEncoderLayer(nn.Module):
         # pooling module
         if torch.jit.is_scripting():
             src = src + self.pooling(src, key_padding_mask=src_key_padding_mask)
-        elif random.random() > dynamic_dropout:
+        elif random.random() >= dynamic_dropout:
             src = src + self.pooling(src, key_padding_mask=src_key_padding_mask)
 
         if torch.jit.is_scripting():
@@ -478,7 +478,7 @@ class ZipformerEncoderLayer(nn.Module):
                 src, src_key_padding_mask=src_key_padding_mask
             )
         else:
-            use_self_attn = random.random() > dynamic_dropout
+            use_self_attn = random.random() >= dynamic_dropout
             if use_self_attn:
                 src_att, attn_weights = self.self_attn(
                     src,
@@ -488,7 +488,7 @@ class ZipformerEncoderLayer(nn.Module):
                 )
                 src = src + src_att
 
-            if random.random() > dynamic_dropout:
+            if random.random() >= dynamic_dropout:
                 src = src + self.conv_module1(
                     src, src_key_padding_mask=src_key_padding_mask
                 )
@@ -497,7 +497,7 @@ class ZipformerEncoderLayer(nn.Module):
             if use_self_attn:
                 src = src + self.self_attn.forward2(src, attn_weights)
 
-            if random.random() > dynamic_dropout:
+            if random.random() >= dynamic_dropout:
                 src = src + self.conv_module2(
                     src, src_key_padding_mask=src_key_padding_mask
                 )
