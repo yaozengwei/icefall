@@ -44,7 +44,7 @@ from scaling import (
 from torch import Tensor, nn
 
 from icefall.dist import get_rank
-from icefall.utils import make_pad_mask
+from icefall.utils import make_pad_mask, subsequent_chunk_mask
 
 
 class Zipformer(EncoderInterface):
@@ -76,6 +76,9 @@ class Zipformer(EncoderInterface):
         dropout: float = 0.1,
         cnn_module_kernels: Tuple[int] = (31, 31),
         pos_dim: int = 4,
+        num_left_chunks: int = 4,
+        short_chunk_threshold: float = 0.75,
+        short_chunk_size: int = 50,
         warmup_batches: float = 4000.0,
     ) -> None:
         super(Zipformer, self).__init__()
@@ -86,6 +89,10 @@ class Zipformer(EncoderInterface):
         self.encoder_unmasked_dims = encoder_unmasked_dims
         self.zipformer_downsampling_factors = zipformer_downsampling_factors
         self.output_downsampling_factor = output_downsampling_factor
+
+        self.num_left_chunks = num_left_chunks
+        self.short_chunk_threshold = short_chunk_threshold
+        self.short_chunk_size = short_chunk_size
 
         # will be written to, see set_batch_count()
         self.batch_count = 0
@@ -106,8 +113,8 @@ class Zipformer(EncoderInterface):
         # each one will be ZipformerEncoder or DownsampledZipformerEncoder
         encoders = []
 
-        num_encoders = len(encoder_dims)
-        for i in range(num_encoders):
+        self.num_encoders = len(encoder_dims)
+        for i in range(self.num_encoders):
             encoder_layer = ZipformerEncoderLayer(
                 encoder_dims[i],
                 attention_dim[i],
@@ -124,8 +131,8 @@ class Zipformer(EncoderInterface):
                 encoder_layer,
                 num_encoder_layers[i],
                 dropout,
-                warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
-                warmup_end=warmup_batches * (i + 2) / (num_encoders + 1),
+                warmup_begin=warmup_batches * (i + 1) / (self.num_encoders + 1),
+                warmup_end=warmup_batches * (i + 2) / (self.num_encoders + 1),
             )
 
             if zipformer_downsampling_factors[i] != 1:
@@ -261,6 +268,7 @@ class Zipformer(EncoderInterface):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
+        chunk_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -286,6 +294,22 @@ class Zipformer(EncoderInterface):
         outputs = []
         feature_masks = self.get_feature_masks(x)
 
+        if self.training:
+            # Generate dynamic chunk-wise attention mask during training
+            max_len = x.size(0)
+            chunk_size = torch.randint(1, max_len, (1,)).item()
+            if chunk_size > (max_len * self.short_chunk_threshold):
+                chunk_size = max_len
+            else:
+                chunk_size = chunk_size % self.short_chunk_size + 1
+
+        attn_mask = ~subsequent_chunk_mask(
+            size=x.size(0),
+            chunk_size=chunk_size,
+            num_left_chunks=self.num_left_chunks,
+            device=x.device,
+        )
+
         for i, (module, skip_module) in enumerate(
             zip(self.encoders, self.skip_modules)
         ):
@@ -297,10 +321,11 @@ class Zipformer(EncoderInterface):
                     x = skip_module(outputs[k], x)
                 elif (not self.training) or random.random() > layer_skip_dropout_prob:
                     x = skip_module(outputs[k], x)
-            x = module(
+            x, _, _, _, _, _, _ = module(
                 x,
                 feature_mask=feature_masks[i],
-                src_key_padding_mask=None if mask is None else mask[..., ::ds],
+                src_key_padding_mask=mask[..., ::ds],
+                attn_mask=attn_mask[::ds, ::ds],
             )
             outputs.append(x)
 
@@ -312,6 +337,209 @@ class Zipformer(EncoderInterface):
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
         return x, lengths
+
+    def streaming_forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        left_context_len: int,
+        processed_lens: Tensor,
+        cached_avg: List[Tensor],
+        cached_key: List[Tensor],
+        cached_val: List[Tensor],
+        cached_val2: List[Tensor],
+        cached_conv1: List[Tensor],
+        cached_conv2: List[Tensor],
+    ) -> Tuple[
+        Tensor,
+        Tensor,
+        List[Tensor],
+        List[Tensor],
+        List[Tensor],
+        List[Tensor],
+        List[Tensor],
+        List[Tensor],
+    ]:
+        """
+        Args:
+          x:
+            The input tensor. Its shape is (batch_size, seq_len, feature_dim).
+          x_lens:
+            A tensor of shape (batch_size,) containing the number of frames in
+            `x` before padding.
+          left_context_len:
+            Length of left context after feature subsampling.
+          cached_key:
+            Cached attention key tensor of left context.
+          cached_val:
+            Cached attention value tensor of left context.
+          cached_conv1:
+            Cached left context for the first convolution module.
+          cached_conv2:
+            Cached left context for the second convolution module.
+          processed_lens:
+            Number of processed frames after feature subsampling.
+          cached_avg:
+            Cached average of past frames.
+
+        Returns:
+          Return a tuple containing 2 tensors:
+            - embeddings: its shape is (batch_size, output_seq_len, encoder_dims[-1])
+            - lengths, a tensor of shape (batch_size,) containing the number
+              of frames in `embeddings` before padding.
+            - updated cached average of past frames.
+            - updated cached attention key tensor of left context.
+            - updated cached attention value tensor of left context.
+            - updated cached left context for the first convolution module.
+            - updated cached left context for the second convolution module.
+        """
+        assert len(cached_key) == self.num_encoders, (
+            len(cached_key),
+            self.num_encoders,
+        )
+        assert len(cached_val) == self.num_encoders, (
+            len(cached_val),
+            self.num_encoders,
+        )
+        assert len(cached_val2) == self.num_encoders, (
+            len(cached_val2),
+            self.num_encoders,
+        )
+        assert len(cached_conv1) == self.num_encoders, (
+            len(cached_conv1),
+            self.num_encoders,
+        )
+        assert len(cached_conv2) == self.num_encoders, (
+            len(cached_conv2),
+            self.num_encoders,
+        )
+        assert len(cached_avg) == self.num_encoders, (
+            len(cached_avg),
+            self.num_encoders,
+        )
+
+        x = self.encoder_embed(x)
+
+        x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
+
+        lengths = (x_lens - 7) >> 1
+        assert x.size(0) == lengths.max().item(), (x.shape, lengths, lengths.max())
+        mask = make_pad_mask(lengths)
+
+        outputs = []
+
+        # Used to mask out initial zero states
+        left_context_mask = torch.arange(left_context_len, device=x.device).expand(
+            x.size(1), left_context_len
+        )
+        # Now left_context_mask: (N, )
+        left_context_mask = (
+            processed_lens.view(x.size(1), 1) <= left_context_mask
+        ).flip(1)
+
+        for i, (module, skip_module) in enumerate(
+            zip(self.encoders, self.skip_modules)
+        ):
+            ds = self.zipformer_downsampling_factors[i]
+            k = self.skip_layers[i]
+            if isinstance(k, int):
+                x = skip_module(outputs[k], x)
+            x, avg, key, val, val2, conv1, conv2 = module(
+                x,
+                src_key_padding_mask=mask[..., ::ds],
+                left_context_mask=left_context_mask[:, ::ds],
+                left_context_len=left_context_len // ds,
+                cached_key=cached_key[i],
+                cached_val=cached_val[i],
+                cached_val2=cached_val2[i],
+                cached_conv1=cached_conv1[i],
+                cached_conv2=cached_conv2[i],
+                processed_lens=processed_lens // ds,
+                cached_avg=cached_avg[i],
+            )
+            outputs.append(x)
+            # Update caches
+            cached_avg[i] = avg
+            cached_key[i] = key
+            cached_val[i] = val
+            cached_val2[i] = val2
+            cached_conv1[i] = conv1
+            cached_conv2[i] = conv2
+
+        x = self.downsample_output(x)
+        # class Downsample has this rounding behavior..
+        assert self.output_downsampling_factor == 2, self.output_downsampling_factor
+        lengths = (lengths + 1) >> 1
+
+        x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
+
+        return (
+            x,
+            lengths,
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        )
+
+    def get_init_state(self, left_context_len: int, batch_size: int = 1):
+        cached_avg = []
+        cached_key = []
+        cached_val = []
+        cached_val2 = []
+        cached_conv1 = []
+        cached_conv2 = []
+
+        for encoder in self.encoders:
+            num_layers = encoder.num_layers
+            ds = 1
+            if isinstance(encoder, DownsampledZipformerEncoder):
+                ds = encoder.downsample_factor
+
+            avg = torch.zeros(num_layers, batch_size, encoder.d_model)
+            cached_avg.append(avg)
+
+            key = torch.zeros(
+                num_layers, left_context_len // ds, batch_size, encoder.attention_dim
+            )
+            cached_key.append(key)
+
+            val = torch.zeros(
+                num_layers,
+                left_context_len // ds,
+                batch_size,
+                encoder.attention_dim // 2,
+            )
+            cached_val.append(val)
+
+            val2 = torch.zeros(
+                num_layers,
+                left_context_len // ds,
+                batch_size,
+                encoder.attention_dim // 2,
+            )
+            cached_val2.append(val2)
+
+            conv1 = torch.zeros(
+                num_layers, encoder.cnn_module_kernel - 1, batch_size, encoder.d_model
+            )
+            cached_conv1.append(conv1)
+
+            conv2 = torch.zeros(
+                num_layers, encoder.cnn_module_kernel - 1, batch_size, encoder.d_model
+            )
+            cached_conv2.append(conv2)
+
+        return (
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        )
 
 
 class ZipformerEncoderLayer(nn.Module):
@@ -345,6 +573,8 @@ class ZipformerEncoderLayer(nn.Module):
         super(ZipformerEncoderLayer, self).__init__()
 
         self.d_model = d_model
+        self.attention_dim = attention_dim
+        self.cnn_module_kernel = cnn_module_kernel
 
         # will be written to, see set_batch_count()
         self.batch_count = 0
@@ -357,7 +587,7 @@ class ZipformerEncoderLayer(nn.Module):
             dropout=0.0,
         )
 
-        self.pooling = PoolingModule(d_model)
+        self.pooling = CausalPoolingModule(d_model)
 
         self.feed_forward1 = FeedforwardModule(d_model, feedforward_dim, dropout)
 
@@ -423,84 +653,175 @@ class ZipformerEncoderLayer(nn.Module):
         self,
         src: Tensor,
         pos_emb: Tensor,
-        src_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        left_context_mask: Optional[Tensor] = None,
+        left_context_len: int = 0,
+        cached_key: Optional[Tensor] = None,
+        cached_val: Optional[Tensor] = None,
+        cached_val2: Optional[Tensor] = None,
+        cached_conv1: Optional[Tensor] = None,
+        cached_conv2: Optional[Tensor] = None,
+        cached_avg: Optional[Tensor] = None,
+        processed_lens: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Pass the input through the encoder layer.
 
         Args:
             src: the sequence to the encoder layer (required).
             pos_emb: Positional embedding tensor (required).
-            src_mask: the mask for the src sequence (optional).
+            attn_mask: the mask for the src sequence (optional).
             src_key_padding_mask: the mask for the src keys per batch (optional).
-        batch_split: if not None, this layer will only be applied to
+            left_context_mask: the mask for cached left context (optional).
+            left_context: length of cached left context.
+            cached_key: cached key tensor of left context for the first attention module.
+            cached_val: cached value tensor of left context for the first attention module.
+            cached_val2: cached value tensor of left context for the second attention module.
+            cached_conv1: cached left context for the first convolution module.
+            cached_conv2: cached left context for the second convolution module.
+            cached_avg: cached average of past frames
+            processed_lens: processed number of past frames
 
         Shape:
             src: (S, N, E).
             pos_emb: (N, 2*S-1, E)
-            src_mask: (S, S).
+            attn_mask: (S, S).
             src_key_padding_mask: (N, S).
-            S is the source sequence length, N is the batch size, E is the feature number
+              S is the source sequence length, N is the batch size, E is the feature number
+            left_context_mask: (N, left_context_len).
+              N is the batch size.
+            left_context_len: int
+            cached_key: (left_context_len, N, K).
+              N is the batch size, K is the key dimension.
+            cached_val: (left_context_len, N, V).
+              N is the batch size, V is the key dimension.
+            cached_val2: (left_context_len, N, V).
+              N is the batch size, V is the key dimension.
+            cached_conv1: (kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_conv2: (kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_avg: (N, C).
+              N is the batch size, C is the feature dimension.
+            processed_lens: (N,)
+              N is the batch size.
         """
         src_orig = src
 
         # macaron style feed forward module
         src = src + self.feed_forward1(src)
 
-        # dropout rate for submodules that interact with time.
-        dynamic_dropout = self.get_dynamic_dropout_rate()
-
-        # pooling module
         if torch.jit.is_scripting():
-            src = src + self.pooling(src, key_padding_mask=src_key_padding_mask)
-        elif random.random() > dynamic_dropout:
-            src = src + self.pooling(src, key_padding_mask=src_key_padding_mask)
+            src_pool, cached_avg = self.pooling(
+                src,
+                src_key_padding_mask=src_key_padding_mask,
+                cached_len=processed_lens,
+                cached_avg=cached_avg,
+            )
+            src = src + src_pool
 
-        if torch.jit.is_scripting():
-            src_att, attn_weights = self.self_attn(
+            if left_context_mask is not None:
+                # (N, left_context_len + S)
+                attn_key_padding_mask = torch.cat(
+                    [left_context_mask, src_key_padding_mask], dim=1
+                )
+            else:
+                attn_key_padding_mask = src_key_padding_mask
+
+            src_attn, attn_weights, cached_key, cached_val = self.self_attn(
                 src,
                 pos_emb=pos_emb,
-                attn_mask=src_mask,
-                key_padding_mask=src_key_padding_mask,
+                attn_mask=attn_mask,
+                key_padding_mask=attn_key_padding_mask,
+                left_context_len=left_context_len,
+                cached_key=cached_key,
+                cached_val=cached_val,
             )
-            src = src + src_att
+            src = src + src_attn
 
-            src = src + self.conv_module1(
-                src, src_key_padding_mask=src_key_padding_mask
+            src_conv, cached_conv1 = self.conv_module1(
+                src,
+                src_key_padding_mask=src_key_padding_mask,
+                cache=cached_conv1,
             )
+            src = src + src_conv
 
             src = src + self.feed_forward2(src)
 
-            src = src + self.self_attn.forward2(src, attn_weights)
-
-            src = src + self.conv_module2(
-                src, src_key_padding_mask=src_key_padding_mask
+            src_attn, cached_val2 = self.self_attn.forward2(
+                src,
+                attn_weights,
+                left_context_len=left_context_len,
+                cached_val=cached_val2,
             )
+            src = src + src_attn
+
+            src_conv, cached_conv2 = self.conv_module2(
+                src,
+                src_key_padding_mask=src_key_padding_mask,
+                cache=cached_conv2,
+            )
+            src = src + src_conv
         else:
-            use_self_attn = random.random() > dynamic_dropout
+            # dropout rate for submodules that interact with time.
+            dynamic_dropout = self.get_dynamic_dropout_rate()
+
+            if random.random() >= dynamic_dropout:
+                src_pool, cached_avg = self.pooling(
+                    src,
+                    src_key_padding_mask=src_key_padding_mask,
+                    cached_len=processed_lens,
+                    cached_avg=cached_avg,
+                )
+                src = src + src_pool
+
+            use_self_attn = random.random() >= dynamic_dropout
             if use_self_attn:
-                src_att, attn_weights = self.self_attn(
+                if left_context_mask is not None:
+                    # (N, left_context_len + S)
+                    attn_key_padding_mask = torch.cat(
+                        [left_context_mask, src_key_padding_mask], dim=1
+                    )
+                else:
+                    attn_key_padding_mask = src_key_padding_mask
+
+                src_attn, attn_weights, cached_key, cached_val = self.self_attn(
                     src,
                     pos_emb=pos_emb,
-                    attn_mask=src_mask,
-                    key_padding_mask=src_key_padding_mask,
+                    attn_mask=attn_mask,
+                    key_padding_mask=attn_key_padding_mask,
+                    left_context_len=left_context_len,
+                    cached_key=cached_key,
+                    cached_val=cached_val,
                 )
-                src = src + src_att
+                src = src + src_attn
 
-            if random.random() > dynamic_dropout:
-                src = src + self.conv_module1(
-                    src, src_key_padding_mask=src_key_padding_mask
+            if random.random() >= dynamic_dropout:
+                src_conv, cached_conv1 = self.conv_module1(
+                    src,
+                    src_key_padding_mask=src_key_padding_mask,
+                    cache=cached_conv1,
                 )
+                src = src + src_conv
 
             src = src + self.feed_forward2(src)
             if use_self_attn:
-                src = src + self.self_attn.forward2(src, attn_weights)
-
-            if random.random() > dynamic_dropout:
-                src = src + self.conv_module2(
-                    src, src_key_padding_mask=src_key_padding_mask
+                src_attn, cached_val2 = self.self_attn.forward2(
+                    src,
+                    attn_weights,
+                    left_context_len=left_context_len,
+                    cached_val=cached_val2,
                 )
+                src = src + src_attn
+
+            if random.random() >= dynamic_dropout:
+                src_conv, cached_conv2 = self.conv_module2(
+                    src,
+                    src_key_padding_mask=src_key_padding_mask,
+                    cache=cached_conv2,
+                )
+                src = src + src_conv
 
         src = src + self.feed_forward3(src)
 
@@ -510,7 +831,15 @@ class ZipformerEncoderLayer(nn.Module):
 
         src = src_orig + delta * self.get_bypass_scale()
 
-        return self.whiten(src)
+        return (
+            self.whiten(src),
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        )
 
 
 class ZipformerEncoder(nn.Module):
@@ -553,6 +882,10 @@ class ZipformerEncoder(nn.Module):
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
+
+        self.d_model = encoder_layer.d_model
+        self.attention_dim = encoder_layer.attention_dim
+        self.cnn_module_kernel = encoder_layer.cnn_module_kernel
 
         assert 0 <= warmup_begin <= warmup_end, (warmup_begin, warmup_end)
 
@@ -634,9 +967,18 @@ class ZipformerEncoder(nn.Module):
         # Note: The type of feature_mask should be Union[float, Tensor],
         # but to make torch.jit.script() work, we use `float` here
         feature_mask: float = 1.0,
-        mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        left_context_mask: Optional[Tensor] = None,
+        left_context_len: int = 0,
+        cached_key: Optional[Tensor] = None,
+        cached_val: Optional[Tensor] = None,
+        cached_val2: Optional[Tensor] = None,
+        cached_conv1: Optional[Tensor] = None,
+        cached_conv2: Optional[Tensor] = None,
+        cached_avg: Optional[Tensor] = None,
+        processed_lens: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
@@ -645,17 +987,89 @@ class ZipformerEncoder(nn.Module):
                by at every layer.
             mask: the mask for the src sequence (optional).
             src_key_padding_mask: the mask for the src keys per batch (optional).
+            left_context_mask: the mask for the cached left context (optional).
+            left_context: length of cached left context.
+            cached_key: cached attention key tensor of left contexts.
+            cached_val: cached attention value tensor of left contexts.
+            cached_val2: cached attention value tensor of left contexts.
+            cached_conv1: cached left contexts for the first convolution module.
+            cached_conv2: cached left contexts for the second convolution module.
+            cached_avg: cached average of past frames.
+            processed_lens: number of past frames.
 
         Shape:
             src: (S, N, E).
             pos_emb: (N, 2*S-1, E)
-            mask: (S, S).
+            attn_mask: (S, S).
             src_key_padding_mask: (N, S).
-            S is the source sequence length, T is the target sequence length, N is the batch size, E is the feature number
+              S is the source sequence length, T is the target sequence length,
+              N is the batch size, E is the feature number
+            left_context_mask: (N, left_context_len). N is the batch size.
+            left_context: int
+            cached_key: (num_layers, left_context_len, N, K).
+              N is the batch size, K is the key dimension.
+            cached_val: (num_layers, left_context_len, N, V).
+              N is the batch size, V is the key dimension.
+            cached_conv1: (num_layers, kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_conv2: (num_layers, kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_avg: (num_layers, N, C).
+              N is the batch size, C is the feature dimension.
+            processed_lens: (N,)
+              N is the batch size.
 
-        Returns: (x, x_no_combine), both of shape (S, N, E)
+        Returns: A tuple of 4 tensors:
+            - output tensor
+            - updated cached average of past frmaes.
+            - updated cached attention key tensor of left contexts.
+            - updated cached attention val tensor of left contexts.
+            - updated cached left contexts of the first convolution module.
+            - updated cached left contexts of the second convolution module.
         """
-        pos_emb = self.encoder_pos(src)
+        if (
+            cached_key is not None
+            and cached_val is not None
+            and cached_val2 is not None
+            and cached_conv1 is not None
+            and cached_conv2 is not None
+            and cached_avg is not None
+        ):
+            has_cache = True
+            assert cached_key.size(0) == self.num_layers, (
+                cached_key.size(0),
+                self.num_layers,
+            )
+            assert cached_val.size(0) == self.num_layers, (
+                cached_val.size(0),
+                self.num_layers,
+            )
+            assert cached_val2.size(0) == self.num_layers, (
+                cached_val2.size(0),
+                self.num_layers,
+            )
+            assert cached_conv1.size(0) == self.num_layers, (
+                cached_conv1.size(0),
+                self.num_layers,
+            )
+            assert cached_conv2.size(0) == self.num_layers, (
+                cached_conv2.size(0),
+                self.num_layers,
+            )
+            assert cached_avg.size(0) == self.num_layers, (
+                cached_avg.size(0),
+                self.num_layers,
+            )
+        else:
+            has_cache = False
+            cached_key = torch.empty(0)
+            cached_val = torch.empty(0)
+            cached_val2 = torch.empty(0)
+            cached_conv1 = torch.empty(0)
+            cached_conv2 = torch.empty(0)
+            cached_avg = torch.empty(0)
+
+        pos_emb = self.encoder_pos(src, left_context_len)
         output = src
 
         if torch.jit.is_scripting():
@@ -670,16 +1084,41 @@ class ZipformerEncoder(nn.Module):
             if not torch.jit.is_scripting():
                 if i in layers_to_drop:
                     continue
-            output = mod(
+            output, avg, key, val, val2, conv1, conv2 = mod(
                 output,
                 pos_emb,
-                src_mask=mask,
+                attn_mask=attn_mask,
                 src_key_padding_mask=src_key_padding_mask,
+                left_context_mask=left_context_mask,
+                left_context_len=left_context_len,
+                cached_key=cached_key[i] if has_cache else None,
+                cached_val=cached_val[i] if has_cache else None,
+                cached_val2=cached_val2[i] if has_cache else None,
+                cached_conv1=cached_conv1[i] if has_cache else None,
+                cached_conv2=cached_conv2[i] if has_cache else None,
+                cached_avg=cached_avg[i] if has_cache else None,
+                processed_lens=processed_lens,
             )
+            if has_cache:
+                # Update caches
+                cached_avg[i] = avg
+                cached_key[i] = key
+                cached_val[i] = val
+                cached_val2[i] = val2
+                cached_conv1[i] = conv1
+                cached_conv2[i] = conv2
 
             output = output * feature_mask
 
-        return output
+        return (
+            output,
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        )
 
 
 class DownsampledZipformerEncoder(nn.Module):
@@ -696,6 +1135,10 @@ class DownsampledZipformerEncoder(nn.Module):
         self.downsample_factor = downsample
         self.downsample = AttentionDownsample(input_dim, output_dim, downsample)
         self.encoder = encoder
+        self.num_layers = encoder.num_layers
+        self.d_model = encoder.d_model
+        self.attention_dim = encoder.attention_dim
+        self.cnn_module_kernel = encoder.cnn_module_kernel
         self.upsample = SimpleUpsample(output_dim, downsample)
         self.out_combiner = SimpleCombiner(
             input_dim, output_dim, min_weight=(0.0, 0.25)
@@ -707,9 +1150,18 @@ class DownsampledZipformerEncoder(nn.Module):
         # Note: the type of feature_mask should be Unino[float, Tensor],
         # but to make torch.jit.script() happ, we use float here
         feature_mask: float = 1.0,
-        mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        left_context_mask: Optional[Tensor] = None,
+        left_context_len: int = 0,
+        cached_key: Optional[Tensor] = None,
+        cached_val: Optional[Tensor] = None,
+        cached_val2: Optional[Tensor] = None,
+        cached_conv1: Optional[Tensor] = None,
+        cached_conv2: Optional[Tensor] = None,
+        cached_avg: Optional[Tensor] = None,
+        processed_lens: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""Downsample, go through encoder, upsample.
 
         Args:
@@ -717,37 +1169,80 @@ class DownsampledZipformerEncoder(nn.Module):
             feature_mask: something that broadcasts with src, that we'll multiply `src`
                by at every layer.  feature_mask is expected to be already downsampled by
                self.downsample_factor.
-            mask: the mask for the src sequence (optional).  CAUTION: we need to downsample
-                  this, if we are to support it.  Won't work correctly yet.
+            attn_mask: the mask for the src sequence (optional).  Should be downsampled already.
             src_key_padding_mask: the mask for the src keys per batch (optional).  Should
-                  be downsampled already.
+               be downsampled already.
+            left_context_mask: mask for left context. Should be downsampled already.
+            left_context_len: length of left context. Should be downsampled already.
+            cached_key: cached attention key tensor.
+            cached_val: cached attention value tensor.
+            cached_conv1: cached left context for the first convolution module.
+            cached_conv2: cached left context for the second convolution module.
+            cached_avg: cached average value of past frames.
+            processed_lens: length of past frames. Should be downsampled already.
 
         Shape:
             src: (S, N, E).
-            mask: (S, S).
+            attn_mask: (S, S).
             src_key_padding_mask: (N, S).
-            S is the source sequence length, T is the target sequence length, N is the batch size, E is the feature number
-
+              S is the source sequence length, T is the target sequence length,
+              N is the batch size, E is the feature number
+            left_context_mask: (N, left_context_len). N is the batch size.
+            left_context_len: int
+            cached_key: (num_layers, left_context_len, N, K).
+              N is the batch size, K is the key dimension.
+            cached_val: (num_layers, left_context_len, N, V).
+              N is the batch size, V is the key dimension.
+            cached_conv1: (num_layers, kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_conv2: (num_layers, kernel_size-1, N, C).
+              N is the batch size, C is the convolution channels.
+            cached_avg: (num_layers, N, C).
+              N is the batch size, C is the feature dimension.
+            processed_lens: (N,)
+              N is the batch size.
         Returns: output of shape (S, N, F) where F is the number of output features
             (output_dim to constructor)
         """
         src_orig = src
         src = self.downsample(src)
-        ds = self.downsample_factor
-        if mask is not None:
-            mask = mask[::ds, ::ds]
 
-        src = self.encoder(
+        (
+            src,
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        ) = self.encoder(
             src,
             feature_mask=feature_mask,
-            mask=mask,
-            src_key_padding_mask=mask,
+            attn_mask=attn_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            left_context_mask=left_context_mask,
+            left_context_len=left_context_len,
+            cached_key=cached_key,
+            cached_val=cached_val,
+            cached_val2=cached_val2,
+            cached_conv1=cached_conv1,
+            cached_conv2=cached_conv2,
+            cached_avg=cached_avg,
+            processed_lens=processed_lens,
         )
         src = self.upsample(src)
         # remove any extra frames that are not a multiple of downsample_factor
         src = src[: src_orig.shape[0]]
 
-        return self.out_combiner(src_orig, src)
+        return (
+            self.out_combiner(src_orig, src),
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        )
 
 
 class AttentionDownsample(torch.nn.Module):
@@ -909,12 +1404,13 @@ class RelPositionalEncoding(torch.nn.Module):
         self.pe = None
         self.extend_pe(torch.tensor(0.0).expand(1, max_len))
 
-    def extend_pe(self, x: Tensor) -> None:
+    def extend_pe(self, x: Tensor, left_context_len: int = 0) -> None:
         """Reset the positional encodings."""
+        x_size_left = x.size(0) + left_context_len
         if self.pe is not None:
             # self.pe contains both positive and negative parts
             # the length of self.pe is 2 * input_len - 1
-            if self.pe.size(1) >= x.size(0) * 2 - 1:
+            if self.pe.size(1) >= x_size_left * 2 - 1:
                 # Note: TorchScript doesn't implement operator== for torch.Device
                 if self.pe.dtype != x.dtype or str(self.pe.device) != str(x.device):
                     self.pe = self.pe.to(dtype=x.dtype, device=x.device)
@@ -922,9 +1418,9 @@ class RelPositionalEncoding(torch.nn.Module):
         # Suppose `i` means to the position of query vecotr and `j` means the
         # position of key vector. We use position relative positions when keys
         # are to the left (i>j) and negative relative positions otherwise (i<j).
-        pe_positive = torch.zeros(x.size(0), self.d_model)
-        pe_negative = torch.zeros(x.size(0), self.d_model)
-        position = torch.arange(0, x.size(0), dtype=torch.float32).unsqueeze(1)
+        pe_positive = torch.zeros(x_size_left, self.d_model)
+        pe_negative = torch.zeros(x_size_left, self.d_model)
+        position = torch.arange(0, x_size_left, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, self.d_model, 2, dtype=torch.float32)
             * -(math.log(10000.0) / self.d_model)
@@ -942,22 +1438,23 @@ class RelPositionalEncoding(torch.nn.Module):
         pe = torch.cat([pe_positive, pe_negative], dim=1)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor, left_context_len: int = 0) -> Tensor:
         """Add positional encoding.
 
         Args:
             x (torch.Tensor): Input tensor (time, batch, `*`).
+            left_context_len: (int): Length of cached left context.
 
         Returns:
-            torch.Tensor: Encoded tensor (batch, time, `*`).
-            torch.Tensor: Encoded tensor (batch, 2*time-1, `*`).
+            torch.Tensor: Encoded tensor (batch, left_context_len + 2*time-1, `*`).
 
         """
-        self.extend_pe(x)
+        self.extend_pe(x, left_context_len)
+        x_size_left = x.size(0) + left_context_len
         pos_emb = self.pe[
             :,
             self.pe.size(1) // 2
-            - x.size(0)
+            - x_size_left
             + 1 : self.pe.size(1) // 2  # noqa E203
             + x.size(0),
         ]
@@ -1009,10 +1506,10 @@ class RelPositionMultiheadAttention(nn.Module):
         # the initial_scale is supposed to take over the "scaling" factor of
         # head_dim ** -0.5, dividing it between the query and key.
         in_proj_dim = (
-            2 * attention_dim
-            + attention_dim // 2  # query, key
-            + pos_dim * num_heads  # value
-        )  # positional encoding query
+            2 * attention_dim  # query, key
+            + attention_dim // 2  # value
+            + pos_dim * num_heads  # positional encoding query
+        )
 
         self.in_proj = ScaledLinear(
             embed_dim, in_proj_dim, bias=True, initial_scale=self.head_dim**-0.25
@@ -1065,6 +1562,9 @@ class RelPositionMultiheadAttention(nn.Module):
         pos_emb: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
+        left_context_len: int = 0,
+        cached_key: Optional[Tensor] = None,
+        cached_val: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         r"""
         Args:
@@ -1077,6 +1577,9 @@ class RelPositionMultiheadAttention(nn.Module):
                 layer will be ignored
             attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
                 the batches while a 3D mask allows to specify a different mask for the entries of each batch.
+            left_context_len: Length of cached left context.
+            cached_key: Cached attention key tensor of left context.
+            cached_val: Cached attention value tensor of left context.
 
         Shape:
             - Inputs:
@@ -1095,15 +1598,21 @@ class RelPositionMultiheadAttention(nn.Module):
             while the zero positions will be unchanged. If a BoolTensor is provided, positions with ``True``
             is not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
             is provided, it will be added to the attention weight.
+            - left_context_len: int
+            - cached_key: :math:`(left_context_len, N, K)`, where N is the batch size, K is the key dimension.
+            - cached_val: :math:`(left_context_len, N, V)`, where N is the batch size, V is the value dimension.
 
             - Returns: (attn_output, attn_weights)
-
-             - attn_output: :math:`(S, N, E)` where S is the sequence length, N is the batch size,
+              - attn_output: :math:`(S, N, E)` where S is the sequence length, N is the batch size,
                 E is the embedding dimension.
               - attn_weights: :math:`(N * N, S, S)` where N is the batch size, H is the num-heads
-                 and S is the sequence length.
+                and S is the sequence length.
+              - cached_key: :math:`(left_context_len, N, K)`, updated cached attention key tensor of
+                left context
+              - cached_val: :math:`(left_context_len, N, K)`, updated cached attention value tensor of
+                left context.
         """
-        x, weights = self.multi_head_attention_forward(
+        x, weights, cached_key, cached_val = self.multi_head_attention_forward(
             self.in_proj(x),
             self.linear_pos(pos_emb),
             self.attention_dim,
@@ -1114,8 +1623,11 @@ class RelPositionMultiheadAttention(nn.Module):
             training=self.training,
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
+            left_context_len=left_context_len,
+            cached_key=cached_key,
+            cached_val=cached_val,
         )
-        return x, weights
+        return x, weights, cached_key, cached_val
 
     def multi_head_attention_forward(
         self,
@@ -1129,7 +1641,10 @@ class RelPositionMultiheadAttention(nn.Module):
         training: bool = True,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        left_context_len: int = 0,
+        cached_key: Optional[Tensor] = None,
+        cached_val: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Args:
             x_proj: the projected input, to be split into query, key, value.
@@ -1144,6 +1659,9 @@ class RelPositionMultiheadAttention(nn.Module):
                 the corresponding value on the attention layer will be filled with -inf.
             attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
                 the batches while a 3D mask allows to specify a different mask for the entries of each batch.
+            left_context_len: length of cached left context.
+            cached_key: cached attention key tensor of left context.
+            cached_val: cached attention value tensor of left context.
 
         Shape:
             Inputs:
@@ -1162,12 +1680,19 @@ class RelPositionMultiheadAttention(nn.Module):
             while the zero positions will be unchanged. If a BoolTensor is provided, positions with ``True``
             are not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
             is provided, it will be added to the attention weight.
+            - left_context_len: int
+            - cached_key: :math:`(left_context_len, N, K)`, where N is the batch size, K is the key dimension.
+            - cached_val: :math:`(left_context_len, N, V)`, where N is the batch size, V is the value dimension.
 
             Outputs:
             - attn_output: :math:`(L, N, E)` where L is the target sequence length, N is the batch size,
               E is the embedding dimension.
             - attn_weights: :math:`(N * H, S, S)` where N is the batch size,
               H is the num-heads, S is the sequence length.
+            - cached_key: :math:`(left_context_len, N, K)`, updated cached attention key tensor of
+              left context
+            - cached_val: :math:`(left_context_len, N, K)`, updated cached attention value tensor of
+              left context.
         """
 
         seq_len, bsz, _ = x_proj.size()
@@ -1191,6 +1716,30 @@ class RelPositionMultiheadAttention(nn.Module):
         q = self.copy_query(q)  # for diagnostics only, does nothing.
         p = self.copy_pos_query(p)  # for diagnostics only, does nothing.
 
+        if cached_key is not None and cached_val is not None:
+            assert cached_key.shape == (
+                left_context_len,
+                bsz,
+                k.size(-1),
+            ), "{} == {}".format(cached_key.shape, (left_context_len, bsz, k.size(-1)))
+            assert cached_val.shape == (
+                left_context_len,
+                bsz,
+                v.size(-1),
+            ), "{} == {}".format(cached_val.shape, (left_context_len, bsz, v.size(-1)))
+            # Pad cached left contexts
+            k = torch.cat([cached_key, k], dim=0)
+            v = torch.cat([cached_val, v], dim=0)
+            # Update cached left contexts
+            cached_key = k[-left_context_len:, ...]
+            cached_val = v[-left_context_len:, ...]
+        else:
+            cached_key = torch.empty(0)
+            cached_val = torch.empty(0)
+
+        # The length of key and value
+        kv_len = k.shape[0]
+
         if attn_mask is not None:
             assert (
                 attn_mask.dtype == torch.float32
@@ -1209,13 +1758,13 @@ class RelPositionMultiheadAttention(nn.Module):
 
             if attn_mask.dim() == 2:
                 attn_mask = attn_mask.unsqueeze(0)
-                if list(attn_mask.size()) != [1, seq_len, seq_len]:
+                if list(attn_mask.size()) != [1, seq_len, kv_len]:
                     raise RuntimeError("The size of the 2D attn_mask is not correct.")
             elif attn_mask.dim() == 3:
                 if list(attn_mask.size()) != [
                     bsz * num_heads,
                     seq_len,
-                    seq_len,
+                    kv_len,
                 ]:
                     raise RuntimeError("The size of the 3D attn_mask is not correct.")
             else:
@@ -1233,22 +1782,22 @@ class RelPositionMultiheadAttention(nn.Module):
 
         q = q.reshape(seq_len, bsz, num_heads, head_dim)
         p = p.reshape(seq_len, bsz, num_heads, pos_dim)
-        k = k.reshape(seq_len, bsz, num_heads, head_dim)
-        v = v.reshape(seq_len, bsz * num_heads, head_dim // 2).transpose(0, 1)
+        k = k.reshape(kv_len, bsz, num_heads, head_dim)
+        v = v.reshape(kv_len, bsz * num_heads, head_dim // 2).transpose(0, 1)
 
         if key_padding_mask is not None:
             assert key_padding_mask.size(0) == bsz, "{} == {}".format(
                 key_padding_mask.size(0), bsz
             )
-            assert key_padding_mask.size(1) == seq_len, "{} == {}".format(
-                key_padding_mask.size(1), seq_len
+            assert key_padding_mask.size(1) == kv_len, "{} == {}".format(
+                key_padding_mask.size(1), kv_len
             )
 
         q = q.permute(1, 2, 0, 3)  # (batch, head, time1, head_dim)
         p = p.permute(1, 2, 0, 3)  # (batch, head, time1, pos_dim)
         k = k.permute(1, 2, 3, 0)  # (batch, head, d_k, time2)
 
-        seq_len2 = 2 * seq_len - 1
+        seq_len2 = 2 * seq_len - 1 + left_context_len
         pos = pos.reshape(1, seq_len2, num_heads, pos_dim).permute(0, 2, 3, 1)
         # pos shape now: (batch, head, pos_dim, seq_len2)
 
@@ -1259,7 +1808,7 @@ class RelPositionMultiheadAttention(nn.Module):
         # to absolute position.  I don't know whether I might have got the time-offsets backwards or
         # not, but let this code define which way round it is supposed to be.
         pos_weights = pos_weights.as_strided(
-            (bsz, num_heads, seq_len, seq_len),
+            (bsz, num_heads, seq_len, kv_len),
             (
                 pos_weights.stride(0),
                 pos_weights.stride(1),
@@ -1285,15 +1834,7 @@ class RelPositionMultiheadAttention(nn.Module):
                 )
 
         # attn_output_weights: (batch, head, time1, time2)
-        attn_output_weights = attn_output_weights.view(
-            bsz * num_heads, seq_len, seq_len
-        )
-
-        assert list(attn_output_weights.size()) == [
-            bsz * num_heads,
-            seq_len,
-            seq_len,
-        ]
+        attn_output_weights = attn_output_weights.view(bsz * num_heads, seq_len, kv_len)
 
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
@@ -1303,14 +1844,15 @@ class RelPositionMultiheadAttention(nn.Module):
 
         if key_padding_mask is not None:
             attn_output_weights = attn_output_weights.view(
-                bsz, num_heads, seq_len, seq_len
+                bsz, num_heads, seq_len, kv_len
             )
+            # key_padding_mask for query tensor
             attn_output_weights = attn_output_weights.masked_fill(
                 key_padding_mask.unsqueeze(1).unsqueeze(2),
                 float("-inf"),
             )
             attn_output_weights = attn_output_weights.view(
-                bsz * num_heads, seq_len, seq_len
+                bsz * num_heads, seq_len, kv_len
             )
 
         # Using this version of softmax, defined in scaling.py,
@@ -1332,13 +1874,15 @@ class RelPositionMultiheadAttention(nn.Module):
         )
         attn_output = nn.functional.linear(attn_output, out_proj_weight, out_proj_bias)
 
-        return attn_output, attn_output_weights
+        return attn_output, attn_output_weights, cached_key, cached_val
 
     def forward2(
         self,
         x: Tensor,
         attn_weights: Tensor,
-    ) -> Tensor:
+        left_context_len: int = 0,
+        cached_val: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Second forward function, where we re-use the attn_weights returned by the first forward function
         but with different input.
@@ -1354,7 +1898,16 @@ class RelPositionMultiheadAttention(nn.Module):
         # v: (tgt_len, bsz, embed_dim // 2)
         v = self.in_proj2(x)
         v = self.whiten_values2(v)  # does nothing in the forward pass.
-        v = v.reshape(seq_len, bsz * num_heads, head_dim // 2).transpose(0, 1)
+
+        if cached_val is not None:
+            assert cached_val.shape == (left_context_len, bsz, v.shape[-1])
+            v = torch.cat([cached_val, v], dim=0)
+            cached_val = v[-left_context_len:]
+        else:
+            cached_val = torch.empty(0)
+
+        seq_len2 = left_context_len + seq_len
+        v = v.reshape(seq_len2, bsz * num_heads, head_dim // 2).transpose(0, 1)
 
         # now v: (bsz * num_heads, seq_len, head_dim // 2)
         attn_output = torch.bmm(attn_weights, v)
@@ -1370,7 +1923,7 @@ class RelPositionMultiheadAttention(nn.Module):
             .view(seq_len, bsz, self.attention_dim // 2)
         )
         # returned value is of shape (seq_len, bsz, embed_dim), like x.
-        return self.out_proj2(attn_output)
+        return self.out_proj2(attn_output), cached_val
 
     def _print_attn_stats(self, attn_weights: Tensor, attn_output: Tensor):
         # attn_weights: (batch_size * num_heads, seq_len, seq_len)
@@ -1448,6 +2001,72 @@ class PoolingModule(nn.Module):
         return x
 
 
+class CausalPoolingModule(nn.Module):
+    """
+    Averages the input over the time dimension and project with a square matrix.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.proj = ScaledLinear(d_model, d_model, initial_scale=0.1, bias=False)
+
+    def forward(
+        self,
+        x: Tensor,
+        src_key_padding_mask: Optional[Tensor] = None,
+        cached_len: Optional[Tensor] = None,
+        cached_avg: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Args:
+           x: a Tensor of shape (T, N, C)
+           src_key_padding_mask: a Tensor of bool, of shape (N, T), with True in masked
+               positions.
+           cached_len: a Tensor of int, of shape (N,), containing the number of
+               past frames in batch.
+           cached_avg: a Tensor of shape (N, C), the average over all past frames
+               in batch.
+
+        Returns:
+           A tuple of 2 tensors:
+           - output, a Tensor of shape (T, N, C).
+           - updated cached_avg, a Tensor of shape (N, C).
+        """
+        if src_key_padding_mask is not None:
+            # False in padding positions
+            padding_mask = src_key_padding_mask.logical_not().to(x.dtype)  # (N, T)
+            # Cumulated numbers of frames from start
+            cum_mask = padding_mask.cumsum(dim=1)  # (N, T)
+            x = x.cumsum(dim=0)  # (T, N, C)
+            if cached_avg is not None:
+                x = x + (cached_avg * cached_len.unsqueeze(1)).unsqueeze(0)
+                cum_mask = cum_mask + cached_len.unsqueeze(1)
+            pooling_mask = padding_mask / cum_mask
+            pooling_mask = pooling_mask.transpose(0, 1).contiguous().unsqueeze(-1)
+            # now pooling_mask: (T, N, 1)
+            x = x * pooling_mask  # (T, N, C)
+        else:
+            num_frames = x.shape[0]
+            cum_mask = torch.arange(1, num_frames + 1).unsqueeze(1)  # (T, 1)
+            x = x.cumsum(dim=0)  # (T, N, C)
+            if cached_avg is not None:
+                x = x + (cached_avg * cached_len.unsqueeze(1)).unsqueeze(0)
+                cum_mask = cum_mask + cached_len.unsqueeze(0)  # (T, N)
+            pooling_mask = (1.0 / cum_mask).unsqueeze(2)
+            # now pooling_mask: (T, N, 1)
+            x = x * pooling_mask
+
+        if cached_avg is not None:
+            # For the chunk in batch with padding, (i.e., it has reached the end),
+            # its updated cached_avg are useless.
+            cached_avg = x[-1]
+        else:
+            cached_avg = torch.empty(0)
+
+        x = self.proj(x)
+        return x, cached_avg
+
+
 class FeedforwardModule(nn.Module):
     """Feedforward module in Zipformer model."""
 
@@ -1471,7 +2090,7 @@ class FeedforwardModule(nn.Module):
 
 
 class ConvolutionModule(nn.Module):
-    """ConvolutionModule in Zipformer model.
+    """Streaming ConvolutionModule in Zipformer model.
     Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/zipformer/convolution.py
 
     Args:
@@ -1517,12 +2136,14 @@ class ConvolutionModule(nn.Module):
             max_positive=1.0,
         )
 
+        # Will pad cached left context
+        self.lorder = kernel_size - 1
         self.depthwise_conv = nn.Conv1d(
             channels,
             channels,
             kernel_size,
             stride=1,
-            padding=(kernel_size - 1) // 2,
+            padding=0,
             groups=channels,
             bias=bias,
         )
@@ -1551,17 +2172,21 @@ class ConvolutionModule(nn.Module):
         self,
         x: Tensor,
         src_key_padding_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        cache: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
         """Compute convolution module.
 
         Args:
             x: Input tensor (#time, batch, channels).
-           src_key_padding_mask: the mask for the src keys per batch (optional):
+            src_key_padding_mask: the mask for the src keys per batch (optional):
                (batch, #time), contains bool in masked positions.
+            cache (optional): Cached left context for depthwise_conv, with shape of
+               (#kernel_size-1, batch, channels). Only used in real streaming decoding.
 
         Returns:
-            Tensor: Output tensor (#time, batch, channels).
-
+            A tuple of 2 tensors:
+            - Output tensor (#time, batch, channels).
+            - New cached left context, with shape of (#kernel_size-1, batch, channels).
         """
         # exchange the temporal dimension and the feature dimension
         x = x.permute(1, 2, 0)  # (#batch, channels, time).
@@ -1576,6 +2201,18 @@ class ConvolutionModule(nn.Module):
             x.masked_fill_(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
 
         # 1D Depthwise Conv
+        if self.lorder > 0:
+            if cache is None:
+                # Make depthwise_conv causal by
+                # manualy padding self.lorder zeros to the left
+                x = nn.functional.pad(x, (self.lorder, 0), "constant", 0.0)
+                cache = torch.empty(0)
+            else:
+                assert not self.training, "Cache should be None in training time"
+                assert cache.size(0) == self.lorder, (cache.size(0), self.lorder)
+                x = torch.cat([cache.permute(1, 2, 0), x], dim=2)
+                # Update cache
+                cache = x.permute(2, 0, 1)[-self.lorder :, ...]
         x = self.depthwise_conv(x)
 
         x = self.deriv_balancer2(x)
@@ -1583,7 +2220,7 @@ class ConvolutionModule(nn.Module):
 
         x = self.pointwise_conv2(x)  # (batch, channel, time)
 
-        return x.permute(2, 0, 1)
+        return x.permute(2, 0, 1), cache
 
 
 class Conv2dSubsampling(nn.Module):
@@ -1675,146 +2312,6 @@ class Conv2dSubsampling(nn.Module):
         return x
 
 
-class AttentionCombine(nn.Module):
-    """
-    This module combines a list of Tensors, all with the same shape, to
-    produce a single output of that same shape which, in training time,
-    is a random combination of all the inputs; but which in test time
-    will be just the last input.
-
-    All but the last input will have a linear transform before we
-    randomly combine them; these linear transforms will be initialized
-    to the identity transform.
-
-    The idea is that the list of Tensors will be a list of outputs of multiple
-    zipformer layers.  This has a similar effect as iterated loss. (See:
-    DEJA-VU: DOUBLE FEATURE PRESENTATION AND ITERATED LOSS IN DEEP TRANSFORMER
-    NETWORKS).
-    """
-
-    def __init__(
-        self,
-        num_channels: int,
-        num_inputs: int,
-        random_prob: float = 0.25,
-        single_prob: float = 0.333,
-    ) -> None:
-        """
-        Args:
-          num_channels:
-            the number of channels
-          num_inputs:
-            The number of tensor inputs, which equals the number of layers'
-            outputs that are fed into this module.  E.g. in an 18-layer neural
-            net if we output layers 16, 12, 18, num_inputs would be 3.
-          random_prob:
-            the probability with which we apply a nontrivial mask, in training
-            mode.
-         single_prob:
-            the probability with which we mask to allow just a single
-            module's output (in training)
-        """
-        super().__init__()
-
-        self.random_prob = random_prob
-        self.single_prob = single_prob
-        self.weight = torch.nn.Parameter(torch.zeros(num_channels, num_inputs))
-        self.bias = torch.nn.Parameter(torch.zeros(num_inputs))
-
-        assert 0 <= random_prob <= 1, random_prob
-        assert 0 <= single_prob <= 1, single_prob
-
-    def forward(self, inputs: List[Tensor]) -> Tensor:
-        """Forward function.
-        Args:
-          inputs:
-            A list of Tensor, e.g. from various layers of a transformer.
-            All must be the same shape, of (*, num_channels)
-        Returns:
-          A Tensor of shape (*, num_channels).  In test mode
-          this is just the final input.
-        """
-        num_inputs = self.weight.shape[1]
-        assert len(inputs) == num_inputs
-
-        # Shape of weights: (*, num_inputs)
-        num_channels = inputs[0].shape[-1]
-        num_frames = inputs[0].numel() // num_channels
-
-        ndim = inputs[0].ndim
-        # stacked_inputs: (num_frames, num_channels, num_inputs)
-        stacked_inputs = torch.stack(inputs, dim=ndim).reshape(
-            (num_frames, num_channels, num_inputs)
-        )
-
-        scores = (stacked_inputs * self.weight).sum(dim=(1,)) + self.bias
-
-        if random.random() < 0.002:
-            logging.info(f"Average scores are {scores.softmax(dim=1).mean(dim=0)}")
-
-        if self.training:
-            # random masking..
-            mask_start = torch.randint(
-                low=1,
-                high=int(num_inputs / self.random_prob),
-                size=(num_frames,),
-                device=scores.device,
-            ).unsqueeze(1)
-            # mask will have rows like: [ False, False, False, True, True, .. ]
-            arange = (
-                torch.arange(num_inputs, device=scores.device)
-                .unsqueeze(0)
-                .expand(num_frames, num_inputs)
-            )
-            mask = arange >= mask_start
-
-            apply_single_prob = torch.logical_and(
-                torch.rand(size=(num_frames, 1), device=scores.device)
-                < self.single_prob,
-                mask_start < num_inputs,
-            )
-            single_prob_mask = torch.logical_and(
-                apply_single_prob, arange < mask_start - 1
-            )
-
-            mask = torch.logical_or(mask, single_prob_mask)
-
-            scores = scores.masked_fill(mask, float("-inf"))
-
-        if self.training and random.random() < 0.1:
-            scores = penalize_abs_values_gt(scores, limit=10.0, penalty=1.0e-04)
-
-        weights = scores.softmax(dim=1)
-
-        # (num_frames, num_channels, num_inputs) * (num_frames, num_inputs, 1) -> (num_frames, num_channels, 1),
-        ans = torch.matmul(stacked_inputs, weights.unsqueeze(2))
-        # ans: (*, num_channels)
-        ans = ans.reshape(*tuple(inputs[0].shape[:-1]), num_channels)
-
-        if __name__ == "__main__":
-            # for testing only...
-            print("Weights = ", weights.reshape(num_frames, num_inputs))
-        return ans
-
-
-def _test_random_combine():
-    print("_test_random_combine()")
-    num_inputs = 3
-    num_channels = 50
-    m = AttentionCombine(
-        num_channels=num_channels,
-        num_inputs=num_inputs,
-        random_prob=0.5,
-        single_prob=0.0,
-    )
-
-    x = [torch.ones(3, 4, num_channels) for _ in range(num_inputs)]
-
-    y = m(x)
-    assert y.shape == x[0].shape
-    assert torch.allclose(y, x[0])  # .. since actually all ones.
-
-
 def _test_zipformer_main():
     feature_dim = 50
     batch_size = 5
@@ -1856,10 +2353,196 @@ def _test_conv2d_subsampling():
         assert (x.shape[1] - 7) // 2 == y.shape[1], (x.shape[1], y.shape[1])
 
 
+def _test_causal_pooling_module():
+    N, S, C = 2, 12, 32
+    chunk_len = 4
+    m = CausalPoolingModule(d_model=C)
+
+    # test chunk-wise forward without padding_mask
+    x = torch.randn(S, N, C)
+    y, _ = m(x)
+    cached_len = torch.zeros(N, dtype=torch.int32)
+    cached_avg = torch.zeros(N, C)
+    for i in range(S // chunk_len):
+        start = i * chunk_len
+        end = start + chunk_len
+        x_chunk = x[start:end]
+        y_chunk, cached_avg = m(x_chunk, cached_len=cached_len, cached_avg=cached_avg)
+        cached_len += chunk_len
+        assert torch.allclose(y_chunk, y[start:end]), (y_chunk, y[start:end])
+
+    # test chunk-wise forward with padding_mask
+    x = torch.randn(S, N, C)
+    lengths = torch.randint(low=9, high=S, size=(N,))
+    lengths[0] = S
+    padding_mask = make_pad_mask(lengths)
+    y, _ = m(x, src_key_padding_mask=padding_mask)
+    cached_len = torch.zeros(N, dtype=torch.int32)
+    cached_avg = torch.zeros(N, C)
+    for i in range(S // chunk_len):
+        start = i * chunk_len
+        end = start + chunk_len
+        x_chunk = x[start:end]
+        y_chunk, cached_avg = m(
+            x_chunk,
+            src_key_padding_mask=padding_mask[:, start:end],
+            cached_len=cached_len,
+            cached_avg=cached_avg,
+        )
+        cached_len += chunk_len
+        assert torch.allclose(y_chunk, y[start:end]), (y_chunk, y[start:end])
+
+
+def _test_zipformer_encoder_layer():
+    d_model, attention_dim, cnn_module_kernel = 384, 256, 31
+    m = ZipformerEncoderLayer(
+        d_model=d_model,
+        nhead=4,
+        attention_dim=attention_dim,
+        cnn_module_kernel=cnn_module_kernel,
+    )
+    m.eval()
+
+    N, S, chunk_size, left_context_len = 2, 12, 4, 4
+    x = torch.randn(S, N, d_model)
+    lengths = torch.randint(low=9, high=S, size=(N,))
+    lengths[0] = S
+    padding_mask = make_pad_mask(lengths)
+    pos_enc = RelPositionalEncoding(d_model, dropout_rate=0.0)
+    pos_emb = pos_enc(x, left_context_len=left_context_len)
+    attn_mask = ~subsequent_chunk_mask(
+        size=x.size(0),
+        chunk_size=chunk_size,
+        num_left_chunks=1,
+    )
+    y, _, _, _, _, _, _ = m(
+        x,
+        pos_emb=pos_emb[:, left_context_len:],
+        src_key_padding_mask=padding_mask,
+        attn_mask=attn_mask,
+    )
+
+    processed_lens = torch.zeros(N, dtype=torch.int32)
+    cached_avg = torch.zeros(N, d_model)
+    cached_key = torch.zeros(left_context_len, N, attention_dim)
+    cached_val = torch.zeros(left_context_len, N, attention_dim // 2)
+    cached_val2 = torch.zeros(left_context_len, N, attention_dim // 2)
+    cached_conv1 = torch.zeros(cnn_module_kernel - 1, N, d_model)
+    cached_conv2 = torch.zeros(cnn_module_kernel - 1, N, d_model)
+    for i in range(S // chunk_size):
+        start = i * chunk_size
+        end = start + chunk_size
+        x_chunk = x[start:end]
+        pos_emb = pos_enc(x_chunk, left_context_len=left_context_len)
+
+        # Used to mask out initial zero states
+        left_context_mask = torch.arange(left_context_len, device=x.device).expand(
+            N, left_context_len
+        )
+        left_context_mask = (processed_lens.view(N, 1) <= left_context_mask).flip(1)
+
+        (
+            y_chunk,
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        ) = m(
+            x_chunk,
+            pos_emb=pos_emb,
+            src_key_padding_mask=padding_mask[:, start:end],
+            processed_lens=processed_lens,
+            left_context_len=left_context_len,
+            left_context_mask=left_context_mask,
+            cached_avg=cached_avg,
+            cached_key=cached_key,
+            cached_val=cached_val,
+            cached_val2=cached_val2,
+            cached_conv1=cached_conv1,
+            cached_conv2=cached_conv2,
+        )
+        processed_lens += chunk_size
+        assert torch.allclose(y_chunk, y[start:end]), (y_chunk, y[start:end])
+
+
+def _test_zipformer():
+    num_features = 80
+
+    m = Zipformer(
+        num_features=num_features,
+        encoder_dims=(64, 96),
+        encoder_unmasked_dims=(48, 64),
+        nhead=(4, 4),
+        zipformer_downsampling_factors=(4, 8),
+        num_left_chunks=2,
+    )
+    m.eval()
+
+    N, chunk_size, num_chunks, left_context_len = 2, 8, 4, 16
+    S = num_chunks * chunk_size * 2  # 2 is for input feature subsampling
+    subsampling_factor = 4
+    pad_len = 5  # (((9-2)>>1)+1)>>1=1
+    x = torch.randn(N, S + pad_len, num_features)
+    # lengths = torch.randint(low=9, high=S + pad_len, size=(N,))
+    # lengths[0] = S + pad_len
+    lengths = torch.full((N,), S + pad_len, dtype=torch.int32)
+
+    y, _ = m(x, x_lens=lengths, chunk_size=chunk_size)
+    print(y.shape)
+
+    processed_lens = torch.zeros(N, dtype=torch.int32)
+    (
+        cached_avg,
+        cached_key,
+        cached_val,
+        cached_val2,
+        cached_conv1,
+        cached_conv2,
+    ) = m.get_init_state(left_context_len=left_context_len, batch_size=N)
+
+    seg_len = chunk_size * 2
+    for i in range(num_chunks):
+        start = i * seg_len
+        end = start + seg_len + pad_len
+        x_chunk = x[:, start:end]
+        x_lens = torch.full((N,), seg_len + pad_len, dtype=torch.int32)
+        (
+            y_chunk,
+            y_lens,
+            cached_avg,
+            cached_key,
+            cached_val,
+            cached_val2,
+            cached_conv1,
+            cached_conv2,
+        ) = m.streaming_forward(
+            x_chunk,
+            x_lens=x_lens,
+            processed_lens=processed_lens,
+            left_context_len=left_context_len,
+            cached_avg=cached_avg,
+            cached_key=cached_key,
+            cached_val=cached_val,
+            cached_val2=cached_val2,
+            cached_conv1=cached_conv1,
+            cached_conv2=cached_conv2,
+        )
+        processed_lens += chunk_size
+
+        start = i * (chunk_size // 2)
+        end = start + chunk_size // 2
+        assert torch.allclose(y_chunk, y[:, start:end]), y_chunk - y[:, start:end]
+
+
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    _test_random_combine()
-    _test_zipformer_main()
-    _test_conv2d_subsampling()
+    # _test_random_combine()
+    # _test_zipformer_main()
+    # _test_conv2d_subsampling()
+    # _test_causal_pooling_module()
+    # _test_zipformer_encoder_layer()
+    _test_zipformer()
