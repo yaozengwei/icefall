@@ -44,7 +44,7 @@ from scaling import (
 from torch import Tensor, nn
 
 from icefall.dist import get_rank
-from icefall.utils import make_pad_mask
+from icefall.utils import make_pad_mask, subsequent_chunk_mask
 
 
 class Zipformer(EncoderInterface):
@@ -76,6 +76,9 @@ class Zipformer(EncoderInterface):
         dropout: float = 0.1,
         cnn_module_kernels: Tuple[int] = (31, 31),
         pos_dim: int = 4,
+        num_left_chunks: int = 4,
+        short_chunk_threshold: float = 0.75,
+        short_chunk_size: int = 50,
         warmup_batches: float = 4000.0,
     ) -> None:
         super(Zipformer, self).__init__()
@@ -86,6 +89,10 @@ class Zipformer(EncoderInterface):
         self.encoder_unmasked_dims = encoder_unmasked_dims
         self.zipformer_downsampling_factors = zipformer_downsampling_factors
         self.output_downsampling_factor = output_downsampling_factor
+
+        self.num_left_chunks = num_left_chunks
+        self.short_chunk_threshold = short_chunk_threshold
+        self.short_chunk_size = short_chunk_size
 
         # will be written to, see set_batch_count()
         self.batch_count = 0
@@ -261,6 +268,7 @@ class Zipformer(EncoderInterface):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
+        chunk_size: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -286,6 +294,32 @@ class Zipformer(EncoderInterface):
         outputs = []
         feature_masks = self.get_feature_masks(x)
 
+        if chunk_size == 0:
+            # Training mode
+            max_ds = max(self.zipformer_downsampling_factors)
+            # Generate dynamic chunk-wise attention mask during training
+            max_len = x.size(0) // max_ds
+            short_chunk_size = self.short_chunk_size // max_ds
+            chunk_size = torch.randint(1, max_len, (1,)).item()
+            if chunk_size > (max_len * self.short_chunk_threshold):
+                # Full attention
+                chunk_size = x.size(0)
+            else:
+                # Chunk-wise attention
+                chunk_size = chunk_size % short_chunk_size + 1
+                chunk_size *= max_ds
+        else:
+            # Evaluation mode
+            for ds in self.zipformer_downsampling_factors:
+                assert chunk_size % ds == 0, (chunk_size, ds)
+
+        attn_mask = ~subsequent_chunk_mask(
+            size=x.size(0),
+            chunk_size=chunk_size,
+            num_left_chunks=self.num_left_chunks,
+            device=x.device,
+        )
+
         for i, (module, skip_module) in enumerate(
             zip(self.encoders, self.skip_modules)
         ):
@@ -301,6 +335,7 @@ class Zipformer(EncoderInterface):
                 x,
                 feature_mask=feature_masks[i],
                 src_key_padding_mask=None if mask is None else mask[..., ::ds],
+                mask=attn_mask[::ds, ::ds],
             )
             outputs.append(x)
 
@@ -733,15 +768,12 @@ class DownsampledZipformerEncoder(nn.Module):
         """
         src_orig = src
         src = self.downsample(src)
-        ds = self.downsample_factor
-        if mask is not None:
-            mask = mask[::ds, ::ds]
 
         src = self.encoder(
             src,
             feature_mask=feature_mask,
             mask=mask,
-            src_key_padding_mask=mask,
+            src_key_padding_mask=src_key_padding_mask,
         )
         src = self.upsample(src)
         # remove any extra frames that are not a multiple of downsample_factor
@@ -1297,9 +1329,11 @@ class RelPositionMultiheadAttention(nn.Module):
 
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                attn_output_weights.masked_fill_(attn_mask, float("-inf"))
+                attn_output_weights = attn_output_weights.masked_fill(
+                    attn_mask, float("-inf")
+                )
             else:
-                attn_output_weights += attn_mask
+                attn_output_weights = attn_output_weights + attn_mask
 
         if key_padding_mask is not None:
             attn_output_weights = attn_output_weights.view(
@@ -1318,6 +1352,39 @@ class RelPositionMultiheadAttention(nn.Module):
         # we are in automatic mixed precision mode (amp) == autocast,
         # only storing the half-precision output for backprop purposes.
         attn_output_weights = softmax(attn_output_weights, dim=-1)
+
+        # If we are using dynamic_chunk_training and setting a limited
+        # num_left_chunks, the attention may only see the padding values which
+        # will also be masked out by `key_padding_mask`, at this circumstances,
+        # the whole column of `attn_output_weights` will be `-inf`
+        # (i.e. be `nan` after softmax), so, we fill `0.0` at the masking
+        # positions to avoid invalid loss value below.
+        if (
+            attn_mask is not None
+            and attn_mask.dtype == torch.bool
+            and key_padding_mask is not None
+        ):
+            if attn_mask.size(0) != 1:
+                attn_mask = attn_mask.view(bsz, num_heads, seq_len, seq_len)
+                combined_mask = attn_mask | key_padding_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                # attn_mask.shape == (1, tgt_len, src_len)
+                combined_mask = attn_mask.unsqueeze(0) | key_padding_mask.unsqueeze(
+                    1
+                ).unsqueeze(2)
+
+            attn_output_weights = attn_output_weights.view(
+                bsz, num_heads, seq_len, seq_len
+            )
+            attn_output_weights = attn_output_weights.masked_fill(combined_mask, 0.0)
+            attn_output_weights = attn_output_weights.view(
+                bsz * num_heads, seq_len, seq_len
+            )
+
+        # if not torch.isfinite(attn_output_weights.to(torch.float32).sum()):
+        #     raise ValueError(
+        #         f"The sum of attn_output_weights is not finite: {attn_output_weights}"
+        #     )
 
         attn_output_weights = nn.functional.dropout(
             attn_output_weights, p=dropout_p, training=training
@@ -1434,15 +1501,22 @@ class PoolingModule(nn.Module):
            a Tensor of shape (1, N, C)
         """
         if key_padding_mask is not None:
-            pooling_mask = key_padding_mask.logical_not().to(x.dtype)  # (N, T)
-            pooling_mask = pooling_mask / pooling_mask.sum(dim=1, keepdim=True)
+            # False in padding positions
+            padding_mask = key_padding_mask.logical_not().to(x.dtype)  # (N, T)
+            # Cumulated numbers of frames from start
+            cum_mask = padding_mask.cumsum(dim=1)  # (N, T)
+            x = x.cumsum(dim=0)  # (T, N, C)
+            pooling_mask = padding_mask / cum_mask
             pooling_mask = pooling_mask.transpose(0, 1).contiguous().unsqueeze(-1)
             # now pooling_mask: (T, N, 1)
-            x = (x * pooling_mask).sum(dim=0, keepdim=True)
+            x = x * pooling_mask  # (T, N, C)
         else:
             num_frames = x.shape[0]
-            pooling_mask = 1.0 / num_frames
-            x = (x * pooling_mask).sum(dim=0, keepdim=True)
+            cum_mask = torch.arange(1, num_frames + 1).unsqueeze(1)  # (T, 1)
+            x = x.cumsum(dim=0)  # (T, N, C)
+            pooling_mask = (1.0 / cum_mask).unsqueeze(2)
+            # now pooling_mask: (T, N, 1)
+            x = x * pooling_mask
 
         x = self.proj(x)
         return x
@@ -1517,12 +1591,14 @@ class ConvolutionModule(nn.Module):
             max_positive=1.0,
         )
 
+        # Will pad cached left context
+        self.lorder = kernel_size - 1
         self.depthwise_conv = nn.Conv1d(
             channels,
             channels,
             kernel_size,
             stride=1,
-            padding=(kernel_size - 1) // 2,
+            padding=0,
             groups=channels,
             bias=bias,
         )
@@ -1576,6 +1652,8 @@ class ConvolutionModule(nn.Module):
             x.masked_fill_(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
 
         # 1D Depthwise Conv
+        # Make depthwise_conv causal by manualy padding self.lorder zeros to the left
+        x = nn.functional.pad(x, (self.lorder, 0), "constant", 0.0)
         x = self.depthwise_conv(x)
 
         x = self.deriv_balancer2(x)
