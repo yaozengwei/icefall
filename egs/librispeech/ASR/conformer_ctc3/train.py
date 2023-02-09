@@ -81,7 +81,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from icefall import diagnostics
-from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
+from icefall.bpe_graph_compiler import ModifiedBpeCtcTrainingGraphCompiler
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.checkpoint import (
@@ -314,6 +314,15 @@ def get_parser():
         See https://github.com/k2-fsa/icefall/pull/669 for details.""",
     )
 
+    parser.add_argument(
+        "--non-epsilon-first",
+        type=str2bool,
+        default=True,
+        help="""If True, in the generated modified CTC topology,
+        the non-epsilon aux-label is on the first arc as normal.
+        Otherwise, the non-epsilon aux-label is on the last arc.""",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -539,7 +548,9 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
@@ -591,7 +602,7 @@ def compute_loss(
         supervisions, subsampling_factor=params.subsampling_factor
     )
 
-    if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
+    if isinstance(graph_compiler, ModifiedBpeCtcTrainingGraphCompiler):
         # Works with a BPE model
         token_ids = graph_compiler.texts_to_ids(texts)
         decoding_graph = graph_compiler.compile(token_ids)
@@ -655,7 +666,9 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -691,7 +704,9 @@ def train_one_epoch(
     model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -880,11 +895,12 @@ def run(rank, world_size, args):
     logging.info(f"Device: {device}")
 
     if "lang_bpe" in str(params.lang_dir):
-        graph_compiler = BpeCtcTrainingGraphCompiler(
+        graph_compiler = ModifiedBpeCtcTrainingGraphCompiler(
             params.lang_dir,
             device=device,
             sos_token="<sos/eos>",
             eos_token="<sos/eos>",
+            non_epsilon_first=params.non_epsilon_first,
         )
     elif "lang_phone" in str(params.lang_dir):
         graph_compiler = CtcTrainingGraphCompiler(
@@ -1051,7 +1067,9 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     params: AttributeDict,
     warmup: float,
 ):
