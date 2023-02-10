@@ -201,7 +201,12 @@ class ModifiedBpeCtcTrainingGraphCompiler(BpeCtcTrainingGraphCompiler):
         L = k2.add_epsilon_self_loops(L)
         ctc_topo_L = k2.compose(self.ctc_topo, L, treat_epsilons_specially=False)
         ctc_topo_L = k2.remove_epsilon(ctc_topo_L)
+        # Now ctc_topo_L.labels is a RaggedTensor
         ctc_topo_L = k2.connect(ctc_topo_L)
+
+        # Convert ctc_topo_L.labels from RaggedTensor to Tensor
+        ctc_topo_L_invert = k2.invert(ctc_topo_L)
+        ctc_topo_L.aux_labels = ctc_topo_L_invert.labels
 
         # Replace max_token_id + 1 with 0 for blank label
         labels = ctc_topo_L.labels.clone()
