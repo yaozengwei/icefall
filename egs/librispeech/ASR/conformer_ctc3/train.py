@@ -81,7 +81,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from icefall import diagnostics
-from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
+from icefall.bpe_graph_compiler import ModifiedBpeCtcTrainingGraphCompiler
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.checkpoint import (
@@ -96,6 +96,7 @@ from icefall.utils import (
     AttributeDict,
     MetricsTracker,
     encode_supervisions,
+    filter_uneven_sized_batch,
     setup_logger,
     str2bool,
 )
@@ -314,6 +315,15 @@ def get_parser():
         See https://github.com/k2-fsa/icefall/pull/669 for details.""",
     )
 
+    parser.add_argument(
+        "--non-epsilon-first",
+        type=str2bool,
+        default=True,
+        help="""If True, in the generated modified CTC topology,
+        the non-epsilon aux-label is on the first arc as normal.
+        Otherwise, the non-epsilon aux-label is on the last arc.""",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -365,6 +375,8 @@ def get_params() -> AttributeDict:
     """
     params = AttributeDict(
         {
+            "frame_shift_ms": 10.0,
+            "allowed_excess_duration_ratio": 0.1,
             "best_train_loss": float("inf"),
             "best_valid_loss": float("inf"),
             "best_train_epoch": -1,
@@ -539,7 +551,9 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
@@ -566,6 +580,17 @@ def compute_loss(
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
+    # For the uneven-sized batch, the total duration after padding would possibly
+    # cause OOM. Hence, for each batch, which is sorted descendingly by length,
+    # we simply drop the last few shortest samples, so that the retained total frames
+    # (after padding) would not exceed `allowed_max_frames`:
+    # `allowed_max_frames = int(max_frames * (1.0 + allowed_excess_duration_ratio))`,
+    # where `max_frames = max_duration * 1000 // frame_shift_ms`.
+    # We set allowed_excess_duration_ratio=0.1.
+    max_frames = params.max_duration * 1000 // params.frame_shift_ms
+    allowed_max_frames = int(max_frames * (1.0 + params.allowed_excess_duration_ratio))
+    batch = filter_uneven_sized_batch(batch, allowed_max_frames)
+
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
@@ -591,7 +616,7 @@ def compute_loss(
         supervisions, subsampling_factor=params.subsampling_factor
     )
 
-    if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
+    if isinstance(graph_compiler, ModifiedBpeCtcTrainingGraphCompiler):
         # Works with a BPE model
         token_ids = graph_compiler.texts_to_ids(texts)
         decoding_graph = graph_compiler.compile(token_ids)
@@ -656,7 +681,9 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -692,7 +719,9 @@ def train_one_epoch(
     model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -881,11 +910,12 @@ def run(rank, world_size, args):
     logging.info(f"Device: {device}")
 
     if "lang_bpe" in str(params.lang_dir):
-        graph_compiler = BpeCtcTrainingGraphCompiler(
+        graph_compiler = ModifiedBpeCtcTrainingGraphCompiler(
             params.lang_dir,
             device=device,
             sos_token="<sos/eos>",
             eos_token="<sos/eos>",
+            non_epsilon_first=params.non_epsilon_first,
         )
     elif "lang_phone" in str(params.lang_dir):
         graph_compiler = CtcTrainingGraphCompiler(
@@ -1052,7 +1082,9 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    graph_compiler: Union[BpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler],
+    graph_compiler: Union[
+        ModifiedBpeCtcTrainingGraphCompiler, CtcTrainingGraphCompiler
+    ],
     params: AttributeDict,
     warmup: float,
 ):
