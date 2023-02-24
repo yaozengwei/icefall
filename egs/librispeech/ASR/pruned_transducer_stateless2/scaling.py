@@ -20,6 +20,7 @@ import random
 from itertools import repeat
 from typing import Optional, Tuple
 
+import nvtx
 import torch
 import torch.backends.cudnn.rnn as rnn
 import torch.nn as nn
@@ -43,6 +44,7 @@ _pair = _ntuple(2)
 
 class ActivationBalancerFunction(torch.autograd.Function):
     @staticmethod
+    @nvtx.annotate("ActivationBalancer_forward", color="red")
     def forward(
         ctx,
         x: Tensor,
@@ -95,6 +97,7 @@ class ActivationBalancerFunction(torch.autograd.Function):
         return x
 
     @staticmethod
+    @nvtx.annotate("ActivationBalancer_backward", color="red")
     def backward(
         ctx, x_grad: Tensor
     ) -> Tuple[Tensor, None, None, None, None, None, None]:
@@ -650,7 +653,8 @@ class ActivationBalancer(torch.nn.Module):
         self.balance_prob = balance_prob
 
     def forward(self, x: Tensor) -> Tensor:
-        if random.random() >= self.balance_prob:
+        # if random.random() >= self.balance_prob:
+        if False:
             return x
 
         return ActivationBalancerFunction.apply(

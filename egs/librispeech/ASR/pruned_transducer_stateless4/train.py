@@ -65,6 +65,7 @@ from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 
 import k2
+import nvtx
 import optim
 import sentencepiece as spm
 import torch
@@ -285,6 +286,13 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Accumulate stats on activations, print them and exit.",
+    )
+
+    parser.add_argument(
+        "--exit-after-batch",
+        type=int,
+        default=-1,
+        help="If set, exit after this many batches",
     )
 
     parser.add_argument(
@@ -790,26 +798,30 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         with torch.cuda.amp.autocast(enabled=params.use_fp16):
-            loss, loss_info = compute_loss(
-                params=params,
-                model=model,
-                sp=sp,
-                batch=batch,
-                is_training=True,
-                warmup=(params.batch_idx_train / params.model_warm_step),
-            )
+            with nvtx.annotate("compute_loss", color="gray"):
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                    warmup=(params.batch_idx_train / params.model_warm_step),
+                )
         # summary stats
         tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
         # NOTE: We use reduction==sum and loss is computed over utterances
         # in the batch and there is no normalization to it so far.
-        scaler.scale(loss).backward()
+        with nvtx.annotate("backward", color="brown"):
+            scaler.scale(loss).backward()
         scheduler.step_batch(params.batch_idx_train)
-        scaler.step(optimizer)
+        with nvtx.annotate("step", color="white"):
+            scaler.step(optimizer)
         scaler.update()
-        optimizer.zero_grad()
+        with nvtx.annotate("zero_grad", color="purple"):
+            optimizer.zero_grad()
 
-        if params.print_diagnostics and batch_idx == 30:
+        if batch_idx == params.exit_after_batch:
             return
 
         if (
@@ -864,7 +876,7 @@ def train_one_epoch(
                 )
                 tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
 
-        if batch_idx > 0 and batch_idx % params.valid_interval == 0:
+        if batch_idx % params.valid_interval == 0 and params.exit_after_batch < 0:
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
                 params=params,
@@ -1037,7 +1049,10 @@ def run(rank, world_size, args):
     valid_cuts += librispeech.dev_other_cuts()
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    if params.start_batch <= 0 and not params.print_diagnostics:
+    if params.print_diagnostics:
+        params.exit_after_batch = 5
+
+    if params.exit_after_batch < 0:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
@@ -1079,6 +1094,8 @@ def run(rank, world_size, args):
 
         if params.print_diagnostics:
             diagnostic.print_diagnostics()
+            break
+        elif params.exit_after_batch >= 0:
             break
 
         save_checkpoint(

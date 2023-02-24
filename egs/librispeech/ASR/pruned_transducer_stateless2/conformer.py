@@ -20,6 +20,7 @@ import math
 import warnings
 from typing import List, Optional, Tuple
 
+import nvtx
 import torch
 from encoder_interface import EncoderInterface
 from scaling import (
@@ -124,6 +125,7 @@ class Conformer(EncoderInterface):
         self.encoder = ConformerEncoder(encoder_layer, num_encoder_layers)
         self._init_state: List[torch.Tensor] = [torch.empty(0)]
 
+    @nvtx.annotate("Conformer", color="blue")
     def forward(
         self, x: torch.Tensor, x_lens: torch.Tensor, warmup: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -465,6 +467,7 @@ class ConformerEncoderLayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+    @nvtx.annotate("ConformerEncoderLayer", color="blue")
     def forward(
         self,
         src: Tensor,
@@ -505,7 +508,9 @@ class ConformerEncoderLayer(nn.Module):
             alpha = 1.0
 
         # macaron style feed forward module
-        src = src + self.dropout(self.feed_forward_macaron(src))
+        with nvtx.annotate("feed_forward_macaron", color="yellow"):
+            src_ff = self.feed_forward_macaron(src)
+        src = src + self.dropout(src_ff)
 
         # multi-headed self-attention module
         src_att = self.self_attn(
@@ -524,7 +529,9 @@ class ConformerEncoderLayer(nn.Module):
         src = src + self.dropout(conv)
 
         # feed forward module
-        src = src + self.dropout(self.feed_forward(src))
+        with nvtx.annotate("feed_forward", color="yellow"):
+            src_ff2 = self.feed_forward(src)
+        src = src + self.dropout(src_ff2)
 
         src = self.norm_final(self.balancer(src))
 
@@ -650,6 +657,7 @@ class ConformerEncoder(nn.Module):
         )
         self.num_layers = num_layers
 
+    @nvtx.annotate("ConformerEncoder", color="blue")
     def forward(
         self,
         src: Tensor,
@@ -826,6 +834,7 @@ class RelPositionalEncoding(torch.nn.Module):
         pe = torch.cat([pe_positive, pe_negative], dim=1)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
+    @nvtx.annotate("RelPositionalEncoding", color="blue")
     def forward(
         self,
         x: torch.Tensor,
@@ -912,6 +921,7 @@ class RelPositionMultiheadAttention(nn.Module):
         nn.init.normal_(self.pos_bias_u, std=0.01)
         nn.init.normal_(self.pos_bias_v, std=0.01)
 
+    @nvtx.annotate("RelPositionMultiheadAttention", color="yellow")
     def forward(
         self,
         query: Tensor,
@@ -1416,6 +1426,7 @@ class ConvolutionModule(nn.Module):
             initial_scale=0.25,
         )
 
+    @nvtx.annotate("ConvolutionModule", color="red")
     def forward(
         self,
         x: Tensor,
@@ -1556,6 +1567,7 @@ class Conv2dSubsampling(nn.Module):
             channel_dim=-1, min_positive=0.45, max_positive=0.55
         )
 
+    @nvtx.annotate("Conv2dSubsampling", color="red")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Subsample x.
 
