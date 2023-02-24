@@ -19,22 +19,22 @@
 """
 Usage:
 (1) decode in non-streaming mode (take ctc-decoding as an example)
-./conformer_ctc3/decode.py \
+./conformer_ctc_attn/decode.py \
     --epoch 30 \
     --avg 15 \
-    --exp-dir ./conformer_ctc3/exp \
+    --exp-dir ./conformer_ctc_attn/exp \
     --max-duration 600 \
     --decoding-method ctc-decoding
 
 (2) decode in streaming mode (take ctc-decoding as an example)
-./conformer_ctc3/decode.py \
+./conformer_ctc_attn/decode.py \
     --epoch 30 \
     --avg 15 \
     --simulate-streaming 1 \
     --causal-convolution 1 \
     --decode-chunk-size 16 \
     --left-context 64 \
-    --exp-dir ./conformer_ctc3/exp \
+    --exp-dir ./conformer_ctc_attn/exp \
     --max-duration 600 \
     --decoding-method ctc-decoding
 
@@ -43,10 +43,10 @@ To evaluate symbol delay, you should:
 ./add_alignments.sh
 (2) Set the argument "--manifest-dir data/fbank_ali" while decoding.
 For example:
-./conformer_ctc3/decode.py \
+./conformer_ctc_attn/decode.py \
     --epoch 30 \
     --avg 15 \
-    --exp-dir ./conformer_ctc3/exp \
+    --exp-dir ./conformer_ctc_attn/exp \
     --max-duration 600 \
     --decoding-method ctc-decoding \
     --simulate-streaming 1 \
@@ -458,7 +458,7 @@ def decode_one_batch(
     else:
         encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
 
-    nnet_output = model.get_ctc_output(encoder_out)
+    nnet_output = model.ctc_output(encoder_out)
     # nnet_output is (N, T, C)
 
     if params.decoding_method == "ctc-greedy-search":

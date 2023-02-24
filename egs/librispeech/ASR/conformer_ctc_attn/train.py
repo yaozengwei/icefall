@@ -22,31 +22,31 @@ Usage:
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-./conformer_ctc3/train.py \
+./conformer_ctc_attn/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
-  --exp-dir conformer_ctc3/exp \
+  --exp-dir conformer_ctc_attn/exp \
   --full-libri 1 \
   --max-duration 300
 
 # For mix precision training:
 
-./conformer_ctc3/train.py \
+./conformer_ctc_attn/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
   --use-fp16 1 \
-  --exp-dir conformer_ctc3/exp \
+  --exp-dir conformer_ctc_attn/exp \
   --full-libri 1 \
   --max-duration 550
 
 # train a streaming model
-./conformer_ctc3/train.py \
+./conformer_ctc_attn/train.py \
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
-  --exp-dir conformer_ctc3/exp \
+  --exp-dir conformer_ctc_attn/exp \
   --full-libri 1 \
   --dynamic-chunk-training 1 \
   --causal-convolution 1 \
@@ -69,11 +69,12 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
+from attention_decoder import AttentionDecoderModel
 from conformer import Conformer
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
-from model import CTCModel
+from model import CTCAttentionModel
 from optim import Eden, Eve
 from torch import Tensor
 from torch.cuda.amp import GradScaler
@@ -91,6 +92,7 @@ from icefall.checkpoint import (
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
 from icefall.graph_compiler import CtcTrainingGraphCompiler
+from icefall.hooks import register_inf_check_hooks
 from icefall.lexicon import Lexicon
 from icefall.utils import (
     AttributeDict,
@@ -194,7 +196,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="conformer_ctc3/exp",
+        default="conformer_ctc_attn/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -208,6 +210,15 @@ def get_parser():
         help="""The lang dir
         It contains language related input files such as
         "lexicon.txt"
+        """,
+    )
+
+    parser.add_argument(
+        "--att-loss-scale",
+        type=float,
+        default=0.8,
+        help="""The attention loss scale.
+        The total loss is (1 - att_loss_scale) * ctc_loss + att_loss_scale * att_loss.
         """,
     )
 
@@ -247,6 +258,13 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Accumulate stats on activations, print them and exit.",
+    )
+
+    parser.add_argument(
+        "--inf-check",
+        type=str2bool,
+        default=False,
+        help="Add hooks to check for infinite module outputs and gradients.",
     )
 
     parser.add_argument(
@@ -302,16 +320,6 @@ def get_parser():
         It is almost the same as the `delay_penalty` in our `rnnt_loss`, See
         https://github.com/k2-fsa/k2/issues/955 and
         https://arxiv.org/pdf/2211.00490.pdf for more details.""",
-    )
-
-    parser.add_argument(
-        "--nnet-delay-penalty",
-        type=float,
-        default=0.0,
-        help="""A constant to penalize symbol delay, which is applied on
-        the nnet_output after log-softmax.
-        We recommend using --delay-penalty instead.
-        See https://github.com/k2-fsa/icefall/pull/669 for details.""",
     )
 
     add_model_arguments(parser)
@@ -380,9 +388,16 @@ def get_params() -> AttributeDict:
             "nhead": 8,
             "dim_feedforward": 2048,
             "num_encoder_layers": 12,
+            # parameters for attention decoder
+            "decoder_dim": 512,
+            "num_decoder_layers": 6,
+            "decoder_attention_dim": 512,
+            "decoder_nhead": 8,
+            "decoder_feedforward_dim": 2048,
+            "ignore_id": -1,
+            "label_smoothing": 0.1,
             # parameters for loss
             "beam_size": 10,
-            "reduction": "none",
             "use_double_scores": True,
             # parameters for Noam
             "model_warm_step": 3000,  # arg given to model, not for lrate
@@ -394,7 +409,6 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Conformer and Transformer
     encoder = Conformer(
         num_features=params.feature_dim,
         subsampling_factor=params.subsampling_factor,
@@ -410,10 +424,29 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     return encoder
 
 
-def get_ctc_model(params: AttributeDict) -> nn.Module:
+def get_decoder_model(params: AttributeDict) -> nn.Module:
+    decoder = AttentionDecoderModel(
+        vocab_size=params.vocab_size,
+        decoder_dim=params.decoder_dim,
+        num_decoder_layers=params.num_decoder_layers,
+        attention_dim=params.decoder_attention_dim,
+        nhead=params.decoder_nhead,
+        feedforward_dim=params.decoder_feedforward_dim,
+        sos_id=params.sos_id,
+        eos_id=params.eos_id,
+        ignore_id=params.ignore_id,
+        label_smoothing=params.label_smoothing,
+    )
+    return decoder
+
+
+def get_ctc_attention_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
-    model = CTCModel(
+    decoder = get_decoder_model(params)
+
+    model = CTCAttentionModel(
         encoder=encoder,
+        decoder=decoder,
         encoder_dim=params.encoder_dim,
         vocab_size=params.vocab_size,
     )
@@ -574,36 +607,32 @@ def compute_loss(
 
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
+    token_ids = graph_compiler.texts_to_ids(supervisions["text"])
 
     with torch.set_grad_enabled(is_training):
-        nnet_output, encoder_out_lens = model(
+        ctc_output, att_loss = model(
             feature,
             feature_lens,
             warmup=warmup,
-            delay_penalty=params.nnet_delay_penalty if warmup >= 1.0 else 0,
+            token_ids=token_ids,
         )
-        assert torch.all(encoder_out_lens > 0)
+    assert att_loss.requires_grad == is_training
 
     # NOTE: We need `encode_supervisions` to sort sequences with
     # different duration in decreasing order, required by
     # `k2.intersect_dense` called in `k2.ctc_loss`
-    supervision_segments, texts = encode_supervisions(
-        supervisions, subsampling_factor=params.subsampling_factor
+    supervision_segments, token_ids = encode_supervisions(
+        supervisions,
+        subsampling_factor=params.subsampling_factor,
+        token_ids=token_ids,
     )
 
-    if isinstance(graph_compiler, BpeCtcTrainingGraphCompiler):
-        # Works with a BPE model
-        token_ids = graph_compiler.texts_to_ids(texts)
-        decoding_graph = graph_compiler.compile(token_ids)
-    elif isinstance(graph_compiler, CtcTrainingGraphCompiler):
-        # Works with a phone lexicon
-        decoding_graph = graph_compiler.compile(texts)
-    else:
-        raise ValueError(f"Unsupported type of graph compiler: {type(graph_compiler)}")
-
+    # Works with a BPE model
+    # token_ids has been sorted
+    decoding_graph = graph_compiler.compile(token_ids)
     with torch.cuda.amp.autocast(enabled=False):
         dense_fsa_vec = k2.DenseFsaVec(
-            nnet_output.float(),
+            ctc_output.float(),
             supervision_segments,
             allow_truncate=params.subsampling_factor - 1,
         )
@@ -612,23 +641,14 @@ def compute_loss(
             dense_fsa_vec=dense_fsa_vec,
             output_beam=params.beam_size,
             delay_penalty=params.delay_penalty if warmup >= 1.0 else 0.0,
-            reduction=params.reduction,
+            reduction="sum",
             use_double_scores=params.use_double_scores,
         )
+    assert ctc_loss.requires_grad == is_training
 
-    ctc_loss_is_finite = torch.isfinite(ctc_loss)
-    if not torch.all(ctc_loss_is_finite):
-        logging.info("Not all losses are finite!\n" f"ctc_loss: {ctc_loss}")
-        ctc_loss = ctc_loss[ctc_loss_is_finite]
-
-        # If either all simple_loss or pruned_loss is inf or nan,
-        # we stop the training process by raising an exception
-        if torch.all(~ctc_loss_is_finite):
-            raise ValueError(
-                "There are too many utterances in this batch "
-                "leading to inf or nan losses."
-            )
-    loss = ctc_loss.sum()
+    scale = params.att_loss_scale
+    assert 0 <= scale <= 1, scale
+    loss = (1 - scale) * ctc_loss + scale * att_loss
 
     assert loss.requires_grad == is_training
 
@@ -649,6 +669,8 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["att_loss"] = att_loss.detach().cpu().item()
 
     return loss, info
 
@@ -880,28 +902,18 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    if "lang_bpe" in str(params.lang_dir):
-        graph_compiler = BpeCtcTrainingGraphCompiler(
-            params.lang_dir,
-            device=device,
-            sos_token="<sos/eos>",
-            eos_token="<sos/eos>",
-        )
-    elif "lang_phone" in str(params.lang_dir):
-        graph_compiler = CtcTrainingGraphCompiler(
-            lexicon,
-            device=device,
-            need_repeat_flag=params.delay_penalty > 0,
-        )
-        # Manually add the sos/eos ID with their default values
-        # from the BPE recipe which we're adapting here.
-        graph_compiler.sos_id = 1
-        graph_compiler.eos_id = 1
-    else:
-        raise ValueError(
-            f"Unsupported type of lang dir (we expected it to have "
-            f"'lang_bpe' or 'lang_phone' in its name): {params.lang_dir}"
-        )
+    assert "lang_bpe" in str(params.lang_dir), "Currently only supports bpe model."
+    graph_compiler = BpeCtcTrainingGraphCompiler(
+        params.lang_dir,
+        device=device,
+        sos_token="<sos/eos>",
+        eos_token="<sos/eos>",
+    )
+    # sos_id, eos_id will be used in AttentionDecoderModel
+    params.sos_id = graph_compiler.sos_id
+    params.eos_id = graph_compiler.eos_id
+    # <blk> is defined in local/train_bpe_model.py
+    params.vocab_size = graph_compiler.sp.get_piece_size()
 
     if params.dynamic_chunk_training:
         assert (
@@ -911,10 +923,12 @@ def run(rank, world_size, args):
     logging.info(params)
 
     logging.info("About to create model")
-    model = get_ctc_model(params)
+    model = get_ctc_attention_model(params)
 
     num_param = sum([p.numel() for p in model.parameters()])
-    logging.info(f"Number of model parameters: {num_param}")
+    logging.info(f"Number of total model parameters: {num_param}")
+    num_param = sum([p.numel() for p in model.decoder.parameters()])
+    logging.info(f"Number of parameters in attention decoder: {num_param}")
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
@@ -950,6 +964,9 @@ def run(rank, world_size, args):
 
     if params.print_diagnostics:
         diagnostic = diagnostics.attach_diagnostics(model)
+
+    if params.inf_check:
+        register_inf_check_hooks(model)
 
     librispeech = LibriSpeechAsrDataModule(args)
 
