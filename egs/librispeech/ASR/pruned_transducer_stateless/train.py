@@ -69,7 +69,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
-from transformer import Noam
+from optim import Noam
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -84,11 +84,8 @@ from icefall.utils import (
     AttributeDict,
     MetricsTracker,
     display_and_save_batch,
-    measure_gradient_norms,
-    measure_weight_norms,
-    optim_step_and_measure_param_change,
     setup_logger,
-    str2bool,
+    str2bool
 )
 
 
@@ -362,9 +359,10 @@ def get_params() -> AttributeDict:
             "nhead": 8,
             "dim_feedforward": 2048,
             "num_encoder_layers": 12,
-            "vgg_frontend": False,
             # parameters for decoder
-            "embedding_dim": 512,
+            "decoder_dim": 512,
+            # parameters for joiner
+            "joiner_dim": 512,
             # parameters for Noam
             "warm_step": 40000,  # For the 100h subset, use 20000
             "env_info": get_env_info(),
@@ -378,13 +376,11 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     # TODO: We can add an option to switch between Conformer and Transformer
     encoder = Conformer(
         num_features=params.feature_dim,
-        output_dim=params.vocab_size,
         subsampling_factor=params.subsampling_factor,
         d_model=params.encoder_dim,
         nhead=params.nhead,
         dim_feedforward=params.dim_feedforward,
         num_encoder_layers=params.num_encoder_layers,
-        vgg_frontend=params.vgg_frontend,
         dynamic_chunk_training=params.dynamic_chunk_training,
         short_chunk_size=params.short_chunk_size,
         num_left_chunks=params.num_left_chunks,
@@ -396,9 +392,8 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
 def get_decoder_model(params: AttributeDict) -> nn.Module:
     decoder = Decoder(
         vocab_size=params.vocab_size,
-        embedding_dim=params.embedding_dim,
+        decoder_dim=params.decoder_dim,
         blank_id=params.blank_id,
-        unk_id=params.unk_id,
         context_size=params.context_size,
     )
     return decoder
@@ -406,9 +401,10 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
     joiner = Joiner(
-        input_dim=params.vocab_size,
-        inner_dim=params.embedding_dim,
-        output_dim=params.vocab_size,
+        encoder_dim=params.encoder_dim,
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
     )
     return joiner
 
@@ -422,6 +418,10 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
+        encoder_dim=params.encoder_dim,
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
     )
     return model
 
@@ -579,31 +579,7 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
-            reduction="none",
         )
-        simple_loss_is_finite = torch.isfinite(simple_loss)
-        pruned_loss_is_finite = torch.isfinite(pruned_loss)
-        is_finite = simple_loss_is_finite & pruned_loss_is_finite
-        if not torch.all(is_finite):
-            logging.info(
-                "Not all losses are finite!\n"
-                f"simple_loss: {simple_loss}\n"
-                f"pruned_loss: {pruned_loss}"
-            )
-            display_and_save_batch(batch, params=params, sp=sp)
-            simple_loss = simple_loss[simple_loss_is_finite]
-            pruned_loss = pruned_loss[pruned_loss_is_finite]
-
-            # If either all simple_loss or pruned_loss is inf or nan,
-            # we stop the training process by raising an exception
-            if torch.all(~simple_loss_is_finite) or torch.all(~pruned_loss_is_finite):
-                raise ValueError(
-                    "There are too many utterances in this batch "
-                    "leading to inf or nan losses."
-                )
-
-        simple_loss = simple_loss.sum()
-        pruned_loss = pruned_loss.sum()
 
         # loss = params.simple_loss_scale * simple_loss + pruned_loss
         s = params.simple_loss_scale

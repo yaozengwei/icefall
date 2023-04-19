@@ -16,37 +16,49 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Joiner(nn.Module):
-    def __init__(self, input_dim: int, inner_dim: int, output_dim: int):
+    def __init__(
+        self,
+        encoder_dim: int,
+        decoder_dim: int,
+        joiner_dim: int,
+        vocab_size: int,
+    ):
         super().__init__()
 
-        self.inner_linear = nn.Linear(input_dim, inner_dim)
-        self.output_linear = nn.Linear(inner_dim, output_dim)
+        self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
+        self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
+        self.output_linear = nn.Linear(joiner_dim, vocab_size)
 
     def forward(
-        self, encoder_out: torch.Tensor, decoder_out: torch.Tensor
+        self,
+        encoder_out: torch.Tensor,
+        decoder_out: torch.Tensor,
+        project_input: bool = True,
     ) -> torch.Tensor:
         """
         Args:
           encoder_out:
-            Output from the encoder. Its shape is (N, T, s_range, C) during
-            training or (N, C) in case of streaming decoding.
+            Output from the encoder. Its shape is (N, T, s_range, C).
           decoder_out:
-            Output from the decoder. Its shape is (N, T, s_range, C) during
-            training or (N, C) in case of streaming decoding.
+            Output from the decoder. Its shape is (N, T, s_range, C).
+           project_input:
+            If true, apply input projections encoder_proj and decoder_proj.
+            If this is false, it is the user's responsibility to do this
+            manually.
+        Returns:
           Return a tensor of shape (N, T, s_range, C).
         """
         assert encoder_out.ndim == decoder_out.ndim
         assert encoder_out.ndim in (2, 4)
-        assert encoder_out.shape == decoder_out.shape
 
-        logit = encoder_out + decoder_out
+        if project_input:
+            logit = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
+        else:
+            logit = encoder_out + decoder_out
 
-        logit = self.inner_linear(torch.tanh(logit))
+        logit = self.output_linear(torch.tanh(logit))
 
-        output = self.output_linear(F.relu(logit))
-
-        return output
+        return logit
