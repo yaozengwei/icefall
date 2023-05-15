@@ -298,7 +298,7 @@ class SoftmaxFunction(torch.autograd.Function):
 
 
 def softmax(x: Tensor, dim: int):
-    if torch.jit.is_scripting() or torch.jit.is_tracing():
+    if not x.requires_grad or torch.jit.is_scripting() or torch.jit.is_tracing():
         return x.softmax(dim)
 
     return SoftmaxFunction.apply(x, dim)

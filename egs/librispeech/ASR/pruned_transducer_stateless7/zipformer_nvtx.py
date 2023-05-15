@@ -46,6 +46,8 @@ from torch import Tensor, nn
 from icefall.dist import get_rank
 from icefall.utils import is_jit_tracing, make_pad_mask
 
+import nvtx
+
 
 class Zipformer(EncoderInterface):
     """
@@ -257,6 +259,7 @@ class Zipformer(EncoderInterface):
 
         return feature_masks
 
+    @nvtx.annotate("Zipformer", color="blue")
     def forward(
         self,
         x: torch.Tensor,
@@ -419,6 +422,7 @@ class ZipformerEncoderLayer(nn.Module):
                 initial_dropout_rate * final_dropout_rate
             ) * (self.batch_count / warmup_period)
 
+    @nvtx.annotate("ZipformerEncoderLayer", color="blue")
     def forward(
         self,
         src: Tensor,
@@ -628,6 +632,7 @@ class ZipformerEncoder(nn.Module):
             )
         return ans
 
+    @nvtx.annotate("ZipformerEncoder", color="yellow")
     def forward(
         self,
         src: Tensor,
@@ -701,6 +706,7 @@ class DownsampledZipformerEncoder(nn.Module):
             input_dim, output_dim, min_weight=(0.0, 0.25)
         )
 
+    @nvtx.annotate("DownsampledZipformerEncoder", color="red")
     def forward(
         self,
         src: Tensor,
@@ -771,6 +777,7 @@ class AttentionDownsample(torch.nn.Module):
             self.extra_proj = None
         self.downsample = downsample
 
+    @nvtx.annotate("AttentionDownsample", color="red")
     def forward(self, src: Tensor) -> Tensor:
         """
         x: (seq_len, batch_size, in_channels)
@@ -816,6 +823,7 @@ class SimpleUpsample(torch.nn.Module):
         super(SimpleUpsample, self).__init__()
         self.bias = nn.Parameter(torch.randn(upsample, num_channels) * 0.01)
 
+    @nvtx.annotate("SimpleUpsample", color="red")
     def forward(self, src: Tensor) -> Tensor:
         """
         x: (seq_len, batch_size, num_channels)
@@ -949,6 +957,7 @@ class RelPositionalEncoding(torch.nn.Module):
         pe = torch.cat([pe_positive, pe_negative], dim=1)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
+    @nvtx.annotate("RelPositionalEncoding", color="blue")
     def forward(self, x: torch.Tensor) -> Tensor:
         """Add positional encoding.
 
@@ -1066,6 +1075,7 @@ class RelPositionMultiheadAttention(nn.Module):
             grad_scale=0.025,
         )
 
+    @nvtx.annotate("RelPositionMultiheadAttention", color="green")
     def forward(
         self,
         x: Tensor,
@@ -1375,6 +1385,7 @@ class RelPositionMultiheadAttention(nn.Module):
 
         return attn_output, attn_output_weights
 
+    @nvtx.annotate("RelPositionMultiheadAttention_forward2", color="green")
     def forward2(
         self,
         x: Tensor,
@@ -1400,7 +1411,7 @@ class RelPositionMultiheadAttention(nn.Module):
         # now v: (bsz * num_heads, seq_len, head_dim // 2)
         attn_output = torch.bmm(attn_weights, v)
 
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing() and self.training:
+        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             if random.random() < 0.001 or __name__ == "__main__":
                 self._print_attn_stats(attn_weights, attn_output)
 
@@ -1465,6 +1476,7 @@ class PoolingModule(nn.Module):
         super().__init__()
         self.proj = ScaledLinear(d_model, d_model, initial_scale=0.1, bias=False)
 
+    @nvtx.annotate("PoolingModule", color="yellow")
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None):
         """
         Args:
@@ -1505,6 +1517,7 @@ class FeedforwardModule(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.out_proj = ScaledLinear(feedforward_dim, d_model, initial_scale=0.01)
 
+    @nvtx.annotate("FeedforwardModule", color="yellow")
     def forward(self, x: Tensor):
         x = self.in_proj(x)
         x = self.balancer(x)
@@ -1591,6 +1604,7 @@ class ConvolutionModule(nn.Module):
             initial_scale=0.05,
         )
 
+    @nvtx.annotate("ConvolutionModule", color="red")
     def forward(
         self,
         x: Tensor,
@@ -1698,6 +1712,7 @@ class Conv2dSubsampling(nn.Module):
         self.out = ScaledLinear(out_height * layer3_channels, out_channels)
         self.dropout = nn.Dropout(dropout)
 
+    @nvtx.annotate("Conv2dSubsampling", color="red")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Subsample x.
 
@@ -1768,6 +1783,7 @@ class AttentionCombine(nn.Module):
         assert 0 <= random_prob <= 1, random_prob
         assert 0 <= single_prob <= 1, single_prob
 
+    @nvtx.annotate("AttentionCombine", color="red")
     def forward(self, inputs: List[Tensor]) -> Tensor:
         """Forward function.
         Args:
