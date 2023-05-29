@@ -1,9 +1,18 @@
-# --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
-# --------------------------------------------------------
+# Copyright    2023  Xiaomi Corp.             (authors: Zengwei Yao)
+#
+# See ../../../../LICENSE for clarification regarding multiple authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 # This is copied from https://github.com/microsoft/Swin-Transformer/blob/main/data/build.py
@@ -42,7 +51,7 @@ try:
     import timm.data.transforms as timm_transforms
 
     timm_transforms._pil_interp = _pil_interp
-except:
+except:  # noqa
     from timm.data.transforms import _pil_interp
 
 
@@ -155,8 +164,8 @@ class ImageNetClsDataModule:
         group.add_argument(
             "--mixup-switch-prob",
             type=float,
-            default=1.0,
-            help="Probability of performing mixup or cutmix when either/both is enabled",
+            default=0.5,
+            help="Probability of switching to cutmix when both mixup and cutmix enabled",
         )
 
         group.add_argument(
@@ -282,7 +291,7 @@ class ImageNetClsDataModule:
                 num_classes=num_classes,
             )
 
-        return dataset_train, data_loader_train, mixup_fn
+        return data_loader_train, mixup_fn
 
     def build_val_loader(self):
         dataset_val = self.build_dataset(is_training=False)
@@ -305,4 +314,4 @@ class ImageNetClsDataModule:
             drop_last=False,
         )
 
-        return dataset_val, data_loader_val
+        return data_loader_val
