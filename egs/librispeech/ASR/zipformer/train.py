@@ -386,6 +386,19 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--warmup-start",
+        type=float,
+        default=0.5,
+        help="Warmup start point for Eden LRScheduler"
+    )
+
+    parser.add_argument(
+        "--warmup-batches",
+        type=float,
+        default=500.0,
+        help="Warmup batches for Eden LRScheduler"
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -1123,7 +1136,10 @@ def run(rank, world_size, args):
         clipping_scale=2.0,
     )
 
-    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    scheduler = Eden(
+        optimizer, params.lr_batches, params.lr_epochs,
+        warmup_batches=params.warmup_batches, warmup_start=params.warmup_start,
+    )
 
     if checkpoints and "optimizer" in checkpoints:
         logging.info("Loading optimizer state dict")
