@@ -33,7 +33,7 @@ from scaling import (
     ScaledLinear,  # not as in other dirs.. just scales down initial parameter values.
     # Whiten,
     Identity,  # more friendly to backward hooks than nn.Identity(), for diagnostic reasons.
-    # penalize_abs_values_gt,
+    penalize_abs_values_gt,
     softmax,
     ScheduledFloat,
     FloatLike,
@@ -1553,25 +1553,25 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
             attn_scores = attn_scores + pos_scores
 
-        # if torch.jit.is_scripting():
-        #     pass
-        # elif self.training and random.random() < 0.1:
-        #     # This is a harder way of limiting the attention scores to not be
-        #     # too large.  It incurs a penalty if any of them has an absolute
-        #     # value greater than 50.0.  this should be outside the normal range
-        #     # of the attention scores.  We use this mechanism instead of, say,
-        #     # something added to the loss function involving the entropy,
-        #     # because once the entropy gets very small gradients through the
-        #     # softmax can become very small, and we'd get zero derivatives.  The
-        #     # choices of 1.0e-04 as the scale on the penalty makes this
-        #     # mechanism vulnerable to the absolute scale of the loss function,
-        #     # but we view this as a failsafe to avoid "implausible" parameter
-        #     # values rather than a regularization method that should be active
-        #     # under normal circumstances.
-        #     attn_scores = penalize_abs_values_gt(attn_scores,
-        #                                          limit=25.0,
-        #                                          penalty=1.0e-04,
-        #                                          name=self.name)
+        if torch.jit.is_scripting():
+            pass
+        elif self.training and random.random() < 0.1:
+            # This is a harder way of limiting the attention scores to not be
+            # too large.  It incurs a penalty if any of them has an absolute
+            # value greater than 50.0.  this should be outside the normal range
+            # of the attention scores.  We use this mechanism instead of, say,
+            # something added to the loss function involving the entropy,
+            # because once the entropy gets very small gradients through the
+            # softmax can become very small, and we'd get zero derivatives.  The
+            # choices of 1.0e-04 as the scale on the penalty makes this
+            # mechanism vulnerable to the absolute scale of the loss function,
+            # but we view this as a failsafe to avoid "implausible" parameter
+            # values rather than a regularization method that should be active
+            # under normal circumstances.
+            attn_scores = penalize_abs_values_gt(attn_scores,
+                                                 limit=25.0,
+                                                 penalty=1.0e-04,
+                                                 name=self.name)
 
         assert attn_scores.shape == (num_heads, batch_size, seq_len, seq_len)
 

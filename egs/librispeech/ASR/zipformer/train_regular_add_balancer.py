@@ -402,6 +402,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--warm-step",
+        type=float,
+        default=2000,
+        help="Warmup batches for pruned loss"
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -529,7 +536,7 @@ def get_params() -> AttributeDict:
             # parameters for zipformer
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
-            "warm_step": 2000,
+            # "warm_step": 2000,
             "env_info": get_env_info(),
         }
     )
@@ -1167,10 +1174,10 @@ def run(rank, world_size, args):
 
     librispeech = LibriSpeechAsrDataModule(args)
 
-    train_cuts = librispeech.train_clean_100_cuts()
     if params.full_libri:
-        train_cuts += librispeech.train_clean_360_cuts()
-        train_cuts += librispeech.train_other_500_cuts()
+        train_cuts = librispeech.train_all_shuf_cuts()
+    else:
+        train_cuts = librispeech.train_clean_100_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
