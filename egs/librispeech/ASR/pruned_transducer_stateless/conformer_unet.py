@@ -15,16 +15,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+U-Net structure of Conformer
+"""
+
 import copy
 import math
 import warnings
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 from encoder_interface import EncoderInterface
 
-from icefall.utils import make_pad_mask, subsequent_chunk_mask
+from icefall.utils import make_pad_mask
+from scaling import convert_num_channels, limit_param_value
 
 
 class Conformer(EncoderInterface):
@@ -63,55 +68,81 @@ class Conformer(EncoderInterface):
     def __init__(
         self,
         num_features: int,
-        subsampling_factor: int = 4,
-        d_model: int = 256,
-        nhead: int = 4,
-        dim_feedforward: int = 2048,
-        num_encoder_layers: int = 12,
+        output_downsampling_factor: int = 2,
+        downsampling_factor: Tuple[int] = (2, 4),
+        encoder_dim: Union[int, Tuple[int]] = 384,
+        num_encoder_layers: Union[int, Tuple[int]] = 4,
+        num_heads: Union[int, Tuple[int]] = 8,
+        feedforward_dim: Union[int, Tuple[int]] = 1536,
+        cnn_module_kernel: Union[int, Tuple[int]] = 31,
         dropout: float = 0.1,
-        cnn_module_kernel: int = 31,
-        dynamic_chunk_training: bool = False,
-        short_chunk_threshold: float = 0.75,
-        short_chunk_size: int = 25,
-        num_left_chunks: int = -1,
-        causal: bool = False,
     ) -> None:
         super(Conformer, self).__init__()
-        self.num_features = num_features
-        self.subsampling_factor = subsampling_factor
-        if subsampling_factor != 4:
-            raise NotImplementedError("Support only 'subsampling_factor=4'.")
+
+        def _to_tuple(x):
+            """Converts a single int or a 1-tuple of an int to a tuple with the same length
+            as downsampling_factor"""
+            if isinstance(x, int):
+                x = (x,)
+            if len(x) == 1:
+                x = x * len(downsampling_factor)
+            else:
+                assert len(x) == len(downsampling_factor) and isinstance(x[0], int)
+            return x
+
+        self.num_features = num_features  # int
+        self.output_downsampling_factor = output_downsampling_factor  # int
+        self.downsampling_factor = downsampling_factor  # tuple
+        self.encoder_dim = encoder_dim = _to_tuple(encoder_dim)  # tuple
+        num_encoder_layers = _to_tuple(num_encoder_layers)
+        num_heads = _to_tuple(num_heads)
+        feedforward_dim = _to_tuple(feedforward_dim)
+        self.cnn_module_kernel = cnn_module_kernel = _to_tuple(cnn_module_kernel)
 
         # self.encoder_embed converts the input of shape (N, T, num_features)
         # to the shape (N, T//subsampling_factor, d_model).
         # That is, it does two things simultaneously:
         #   (1) subsampling: T -> T//subsampling_factor
         #   (2) embedding: num_features -> d_model
-        self.encoder_embed = Conv2dSubsampling(num_features, d_model)
+        self.encoder_embed = Conv2dSubsampling(num_features, encoder_dim[0], dropout=dropout)
 
-        self.encoder_layers = num_encoder_layers
-        self.d_model = d_model
-        self.cnn_module_kernel = cnn_module_kernel
-        self.causal = causal
+        # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
+        encoders = []
 
-        self.dynamic_chunk_training = dynamic_chunk_training
-        self.short_chunk_threshold = short_chunk_threshold
-        self.short_chunk_size = short_chunk_size
-        self.num_left_chunks = num_left_chunks
+        num_encoders = len(downsampling_factor)
+        for i in range(num_encoders):
+            encoder_layer = ConformerEncoderLayer(
+                d_model=encoder_dim[i],
+                nhead=num_heads[i],
+                dim_feedforward=feedforward_dim[i],
+                dropout=dropout,
+                cnn_module_kernel=cnn_module_kernel[i],
+            )
 
-        self.encoder_pos = RelPositionalEncoding(d_model, dropout)
+            # For the segment of the warmup period, we let the Conv2dSubsampling
+            # layer learn something.  Then we start to warm up the other encoders.
+            encoder = ConformerEncoder(
+                encoder_layer,
+                num_encoder_layers[i],
+                encoder_dim[i],
+                dropout=dropout,
+            )
 
-        encoder_layer = ConformerEncoderLayer(
-            d_model,
-            nhead,
-            dim_feedforward,
-            dropout,
-            cnn_module_kernel,
-            causal,
+            if downsampling_factor[i] != 1:
+                encoder = DownsampledConformerEncoder(
+                    encoder,
+                    dim=encoder_dim[i],
+                    downsample=downsampling_factor[i],
+                    dropout=dropout,
+                )
+
+            encoders.append(encoder)
+
+        self.encoders = nn.ModuleList(encoders)
+
+        self.downsample_output = SimpleDownsample(
+            max(encoder_dim), downsample=output_downsampling_factor, dropout=dropout
         )
-        self.encoder = ConformerEncoder(encoder_layer, num_encoder_layers)
-
-        self._init_state: List[torch.Tensor] = [torch.empty(0)]
 
     def forward(
         self, x: torch.Tensor, x_lens: torch.Tensor
@@ -130,245 +161,61 @@ class Conformer(EncoderInterface):
               of frames in `embeddings` before padding.
         """
         x = self.encoder_embed(x)
-        x, pos_emb = self.encoder_pos(x)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
-        # Caution: We assume the subsampling factor is 4!
-
-        #  lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
-        #
-        # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        lengths = (((x_lens - 1) >> 1) - 1) >> 1
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lengths = (x_lens - 7) // 2
 
         assert x.size(0) == lengths.max().item()
 
         src_key_padding_mask = make_pad_mask(lengths)
 
-        if self.dynamic_chunk_training:
-            assert (
-                self.causal
-            ), "Causal convolution is required for streaming conformer."
-            max_len = x.size(0)
-            chunk_size = torch.randint(1, max_len, (1,)).item()
-            if chunk_size > (max_len * self.short_chunk_threshold):
-                chunk_size = max_len
-            else:
-                chunk_size = chunk_size % self.short_chunk_size + 1
+        outputs = []
+        for i, module in enumerate(self.encoders):
+            ds = self.downsampling_factor[i]
+            x = convert_num_channels(x, self.encoder_dim[i])
 
-            mask = ~subsequent_chunk_mask(
-                size=x.size(0),
-                chunk_size=chunk_size,
-                num_left_chunks=self.num_left_chunks,
-                device=x.device,
+            x = module(
+                x,
+                src_key_padding_mask=(
+                    None
+                    if src_key_padding_mask is None
+                    else src_key_padding_mask[..., ::ds]
+                ),
             )
-            x = self.encoder(
-                x, pos_emb, mask=mask, src_key_padding_mask=src_key_padding_mask
-            )  # (T, N, C)
-        else:
-            x = self.encoder(
-                x, pos_emb, mask=None, src_key_padding_mask=src_key_padding_mask
-            )  # (T, N, C)
+            outputs.append(x)
+
+        def get_full_dim_output():
+            num_encoders = len(self.encoder_dim)
+            assert len(outputs) == num_encoders
+            output_dim = max(self.encoder_dim)
+            output_pieces = [outputs[-1]]
+            cur_dim = self.encoder_dim[-1]
+            for i in range(num_encoders - 2, -1, -1):
+                d = self.encoder_dim[i]
+                if d > cur_dim:
+                    this_output = outputs[i]
+                    output_pieces.append(this_output[..., cur_dim:d])
+                    cur_dim = d
+            assert cur_dim == output_dim
+            return torch.cat(output_pieces, dim=-1)
+
+        # if the last output has the largest dimension, x will be unchanged,
+        # it will be the same as outputs[-1].  Otherwise it will be concatenated
+        # from different pieces of 'outputs', taking each dimension from the
+        # most recent output that has it present.
+        x = get_full_dim_output()
+        x = self.downsample_output(x)
+        # class Downsample has this rounding behavior..
+        assert self.output_downsampling_factor == 2
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            lengths = (lengths + 1) // 2
 
         x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
         return x, lengths
-
-    @torch.jit.export
-    def get_init_state(
-        self, left_context: int, device: torch.device
-    ) -> List[torch.Tensor]:
-        """Return the initial cache state of the model.
-
-        Args:
-          left_context: The left context size (in frames after subsampling).
-
-        Returns:
-          Return the initial state of the model, it is a list containing two
-          tensors, the first one is the cache for attentions which has a shape
-          of (num_encoder_layers, left_context, encoder_dim), the second one
-          is the cache of conv_modules which has a shape of
-          (num_encoder_layers, cnn_module_kernel - 1, encoder_dim).
-
-          NOTE: the returned tensors are on the given device.
-        """
-        if len(self._init_state) == 2 and self._init_state[0].size(1) == left_context:
-            # Note: It is OK to share the init state as it is
-            # not going to be modified by the model
-            return self._init_state
-
-        init_states: List[torch.Tensor] = [
-            torch.zeros(
-                (
-                    self.encoder_layers,
-                    left_context,
-                    self.d_model,
-                ),
-                device=device,
-            ),
-            torch.zeros(
-                (
-                    self.encoder_layers,
-                    self.cnn_module_kernel - 1,
-                    self.d_model,
-                ),
-                device=device,
-            ),
-        ]
-
-        self._init_state = init_states
-
-        return init_states
-
-    @torch.jit.export
-    def streaming_forward(
-        self,
-        x: torch.Tensor,
-        x_lens: torch.Tensor,
-        states: Optional[List[torch.Tensor]] = None,
-        processed_lens: Optional[Tensor] = None,
-        left_context: int = 64,
-        right_context: int = 0,
-        chunk_size: int = 16,
-        simulate_streaming: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """
-        Args:
-          x:
-            The input tensor. Its shape is (batch_size, seq_len, feature_dim).
-          x_lens:
-            A tensor of shape (batch_size,) containing the number of frames in
-            `x` before padding.
-          states:
-            The decode states for previous frames which contains the cached data.
-            It has two elements, the first element is the attn_cache which has
-            a shape of (encoder_layers, left_context, batch, attention_dim),
-            the second element is the conv_cache which has a shape of
-            (encoder_layers, cnn_module_kernel-1, batch, conv_dim).
-            Note: states will be modified in this function.
-          processed_lens:
-            How many frames (after subsampling) have been processed for each sequence.
-          left_context:
-            How many previous frames the attention can see in current chunk.
-            Note: It's not that each individual frame has `left_context` frames
-            of left context, some have more.
-          right_context:
-            How many future frames the attention can see in current chunk.
-            Note: It's not that each individual frame has `right_context` frames
-            of right context, some have more.
-          chunk_size:
-            The chunk size for decoding, this will be used to simulate streaming
-            decoding using masking.
-          simulate_streaming:
-            If setting True, it will use a masking strategy to simulate streaming
-            fashion (i.e. every chunk data only see limited left context and
-            right context). The whole sequence is supposed to be send at a time
-            When using simulate_streaming.
-        Returns:
-          Return a tuple containing 2 tensors:
-            - logits, its shape is (batch_size, output_seq_len, output_dim)
-            - logit_lens, a tensor of shape (batch_size,) containing the number
-              of frames in `logits` before padding.
-            - states, the updated states(i.e. caches) including the information
-              of current chunk.
-        """
-
-        # x: [N, T, C]
-        # Caution: We assume the subsampling factor is 4!
-
-        #  lengths = ((x_lens - 1) // 2 - 1) // 2 # issue an warning
-        #
-        # Note: rounding_mode in torch.div() is available only in torch >= 1.8.0
-        lengths = (((x_lens - 1) >> 1) - 1) >> 1
-
-        if not simulate_streaming:
-            assert states is not None
-            assert processed_lens is not None
-            assert (
-                len(states) == 2
-                and states[0].shape
-                == (self.encoder_layers, left_context, x.size(0), self.d_model)
-                and states[1].shape
-                == (
-                    self.encoder_layers,
-                    self.cnn_module_kernel - 1,
-                    x.size(0),
-                    self.d_model,
-                )
-            ), f"""The length of states MUST be equal to 2, and the shape of
-             first element should be {(self.encoder_layers, left_context, x.size(0), self.d_model)},
-             given {states[0].shape}. the shape of second element should be
-             {(self.encoder_layers, self.cnn_module_kernel - 1, x.size(0), self.d_model)},
-             given {states[1].shape}."""
-
-            lengths -= 2  # we will cut off 1 frame on each side of encoder_embed output
-            src_key_padding_mask = make_pad_mask(lengths)
-
-            processed_mask = torch.arange(left_context, device=x.device).expand(
-                x.size(0), left_context
-            )
-            processed_lens = processed_lens.view(x.size(0), 1)
-            processed_mask = (processed_lens <= processed_mask).flip(1)
-
-            src_key_padding_mask = torch.cat(
-                [processed_mask, src_key_padding_mask], dim=1
-            )
-
-            embed = self.encoder_embed(x)
-
-            # cut off 1 frame on each size of embed as they see the padding
-            # value which causes a training and decoding mismatch.
-            embed = embed[:, 1:-1, :]
-
-            embed, pos_enc = self.encoder_pos(embed, left_context)
-            embed = embed.permute(1, 0, 2)  # (B, T, F) -> (T, B, F)
-
-            x, states = self.encoder.chunk_forward(
-                embed,
-                pos_enc,
-                src_key_padding_mask=src_key_padding_mask,
-                states=states,
-                left_context=left_context,
-                right_context=right_context,
-            )  # (T, B, F)
-        else:
-            assert states is None
-            states = []  # just to make torch.script.jit happy
-            src_key_padding_mask = make_pad_mask(lengths)
-            x = self.encoder_embed(x)
-            x, pos_emb = self.encoder_pos(x)
-            x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
-
-            assert x.size(0) == lengths.max().item()
-
-            if chunk_size < 0:
-                # use full attention
-                chunk_size = x.size(0)
-                left_context = -1
-
-            num_left_chunks = -1
-            if left_context >= 0:
-                assert left_context % chunk_size == 0
-                num_left_chunks = left_context // chunk_size
-
-            mask = ~subsequent_chunk_mask(
-                size=x.size(0),
-                chunk_size=chunk_size,
-                num_left_chunks=num_left_chunks,
-                device=x.device,
-            )
-            x = self.encoder(
-                x,
-                pos_emb,
-                mask=mask,
-                src_key_padding_mask=src_key_padding_mask,
-            )  # (T, N, C)
-
-        x = self.after_norm(x)
-
-        logits = self.encoder_output_layer(x)
-        logits = logits.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-
-        return logits, lengths, states
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -399,7 +246,6 @@ class ConformerEncoderLayer(nn.Module):
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         cnn_module_kernel: int = 31,
-        causal: bool = False,
     ) -> None:
         super(ConformerEncoderLayer, self).__init__()
         self.self_attn = RelPositionMultiheadAttention(d_model, nhead, dropout=0.0)
@@ -418,7 +264,7 @@ class ConformerEncoderLayer(nn.Module):
             nn.Linear(dim_feedforward, d_model),
         )
 
-        self.conv_module = ConvolutionModule(d_model, cnn_module_kernel, causal=causal)
+        self.conv_module = ConvolutionModule(d_model, cnn_module_kernel)
 
         self.norm_ff_macaron = nn.LayerNorm(d_model)  # for the macaron style FNN module
         self.norm_ff = nn.LayerNorm(d_model)  # for the FNN module
@@ -435,7 +281,6 @@ class ConformerEncoderLayer(nn.Module):
         self,
         src: Tensor,
         pos_emb: Tensor,
-        src_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
@@ -468,7 +313,6 @@ class ConformerEncoderLayer(nn.Module):
             src,
             src,
             pos_emb=pos_emb,
-            attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
         )[0]
         src = residual + self.dropout(src_att)
@@ -489,100 +333,6 @@ class ConformerEncoderLayer(nn.Module):
 
         return src
 
-    @torch.jit.export
-    def chunk_forward(
-        self,
-        src: Tensor,
-        pos_emb: Tensor,
-        states: List[Tensor],
-        src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        left_context: int = 0,
-        right_context: int = 0,
-    ) -> Tuple[Tensor, List[Tensor]]:
-        """
-        Pass the input through the encoder layer.
-
-        Args:
-            src: the sequence to the encoder layer (required).
-            pos_emb: Positional embedding tensor (required).
-            states:
-              The decode states for previous frames which contains the cached data.
-              It has two elements, the first element is the attn_cache which has
-              a shape of (left_context, batch, attention_dim),
-              the second element is the conv_cache which has a shape of
-              (cnn_module_kernel-1, batch, conv_dim).
-              Note: states will be modified in this function.
-            src_mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-            left_context:
-              How many previous frames the attention can see in current chunk.
-              Note: It's not that each individual frame has `left_context` frames
-              of left context, some have more.
-            right_context:
-              How many future frames the attention can see in current chunk.
-              Note: It's not that each individual frame has `right_context` frames
-              of right context, some have more.
-        Shape:
-            src: (S, N, E).
-            pos_emb: (N, 2*(S+left_context)-1, E).
-            src_mask: (S, S).
-            src_key_padding_mask: (N, S).
-            S is the source sequence length, N is the batch size, E is the feature number
-        """
-
-        # macaron style feed forward module
-        residual = src
-        src = self.norm_ff_macaron(src)
-        src = residual + self.ff_scale * self.dropout(self.feed_forward_macaron(src))
-
-        # multi-headed self-attention module
-        residual = src
-        src = self.norm_mha(src)
-
-        # We put the attention cache this level (i.e. before linear transformation)
-        # to save memory consumption, when decoding in streaming fashion, the
-        # batch size would be thousands (for 32GB machine), if we cache key & val
-        # separately, it needs extra several GB memory.
-        # TODO(WeiKang): Move cache to self_attn level (i.e. cache key & val
-        # separately) if needed.
-        key = torch.cat([states[0], src], dim=0)
-        val = key
-        if right_context > 0:
-            states[0] = key[
-                -(left_context + right_context) : -right_context, ...  # noqa
-            ]
-        else:
-            states[0] = key[-left_context:, ...]
-
-        src_att = self.self_attn(
-            src,
-            key,
-            val,
-            pos_emb=pos_emb,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            left_context=left_context,
-        )[0]
-        src = residual + self.dropout(src_att)
-
-        # convolution module
-        residual = src
-        src = self.norm_conv(src)
-
-        src, conv_cache = self.conv_module(src, states[1], right_context=right_context)
-        states[1] = conv_cache
-        src = residual + self.dropout(src)
-
-        # feed forward module
-        residual = src
-        src = self.norm_ff(src)
-        src = residual + self.ff_scale * self.dropout(self.feed_forward(src))
-
-        src = self.norm_final(src)
-
-        return src, states
-
 
 class ConformerEncoder(nn.Module):
     r"""ConformerEncoder is a stack of N encoder layers
@@ -599,18 +349,20 @@ class ConformerEncoder(nn.Module):
         >>> out = conformer_encoder(src, pos_emb)
     """
 
-    def __init__(self, encoder_layer: nn.Module, num_layers: int) -> None:
+    def __init__(
+        self, encoder_layer: nn.Module, num_layers: int, d_model: int, dropout: float
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
+        self.d_model = d_model
+        self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
     def forward(
         self,
         src: Tensor,
-        pos_emb: Tensor,
-        mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
@@ -630,76 +382,16 @@ class ConformerEncoder(nn.Module):
             S is the source sequence length, T is the target sequence length, N is the batch size, E is the feature number
 
         """
+        pos_emb = self.encoder_pos(src)
         output = src
 
         for layer_index, mod in enumerate(self.layers):
             output = mod(
                 output,
                 pos_emb,
-                src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
             )
         return output
-
-    @torch.jit.export
-    def chunk_forward(
-        self,
-        src: Tensor,
-        pos_emb: Tensor,
-        states: List[Tensor],
-        mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        left_context: int = 0,
-        right_context: int = 0,
-    ) -> Tuple[Tensor, List[Tensor]]:
-        r"""Pass the input through the encoder layers in turn.
-
-        Args:
-            src: the sequence to the encoder (required).
-            pos_emb: Positional embedding tensor (required).
-            states:
-              The decode states for previous frames which contains the cached data.
-              It has two elements, the first element is the attn_cache which has
-              a shape of (encoder_layers, left_context, batch, attention_dim),
-              the second element is the conv_cache which has a shape of
-              (encoder_layers, cnn_module_kernel-1, batch, conv_dim).
-              Note: states will be modified in this function.
-            mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
-            left_context:
-              How many previous frames the attention can see in current chunk.
-              Note: It's not that each individual frame has `left_context` frames
-              of left context, some have more.
-            right_context:
-              How many future frames the attention can see in current chunk.
-              Note: It's not that each individual frame has `right_context` frames
-              of right context, some have more.
-        Shape:
-            src: (S, N, E).
-            pos_emb: (N, 2*(S+left_context)-1, E).
-            mask: (S, S).
-            src_key_padding_mask: (N, S).
-            S is the source sequence length, T is the target sequence length, N is the batch size, E is the feature number
-
-        """
-        assert not self.training
-        output = src
-
-        for layer_index, mod in enumerate(self.layers):
-            cache = [states[0][layer_index], states[1][layer_index]]
-            output, cache = mod.chunk_forward(
-                output,
-                pos_emb,
-                states=cache,
-                src_mask=mask,
-                src_key_padding_mask=src_key_padding_mask,
-                left_context=left_context,
-                right_context=right_context,
-            )
-            states[0][layer_index] = cache[0]
-            states[1][layer_index] = cache[1]
-
-        return output, states
 
 
 class RelPositionalEncoding(torch.nn.Module):
@@ -719,28 +411,30 @@ class RelPositionalEncoding(torch.nn.Module):
         """Construct an PositionalEncoding object."""
         super(RelPositionalEncoding, self).__init__()
         self.d_model = d_model
-        self.xscale = math.sqrt(self.d_model)
+        # self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+        self.extend_pe(torch.tensor(0.0).expand(max_len))
 
-    def extend_pe(self, x: Tensor, left_context: int = 0) -> None:
+    def extend_pe(self, x: Tensor) -> None:
         """Reset the positional encodings."""
-        x_size_1 = x.size(1) + left_context
         if self.pe is not None:
             # self.pe contains both positive and negative parts
             # the length of self.pe is 2 * input_len - 1
-            if self.pe.size(1) >= x_size_1 * 2 - 1:
+            if self.pe.size(0) >= x.size(0) * 2 - 1:
                 # Note: TorchScript doesn't implement operator== for torch.Device
-                if self.pe.dtype != x.dtype or str(self.pe.device) != str(x.device):
+                if self.pe.dtype != x.dtype or str(self.pe.device) != str(
+                    x.device
+                ):
                     self.pe = self.pe.to(dtype=x.dtype, device=x.device)
                 return
         # Suppose `i` means to the position of query vector and `j` means the
         # position of key vector. We use position relative positions when keys
         # are to the left (i>j) and negative relative positions otherwise (i<j).
-        pe_positive = torch.zeros(x_size_1, self.d_model)
-        pe_negative = torch.zeros(x_size_1, self.d_model)
-        position = torch.arange(0, x_size_1, dtype=torch.float32).unsqueeze(1)
+        T = x.size(0)
+        pe_positive = torch.zeros(T, self.d_model)
+        pe_negative = torch.zeros(T, self.d_model)
+        position = torch.arange(0, T, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, self.d_model, 2, dtype=torch.float32)
             * -(math.log(10000.0) / self.d_model)
@@ -753,35 +447,195 @@ class RelPositionalEncoding(torch.nn.Module):
         # Reserve the order of positive indices and concat both positive and
         # negative indices. This is used to support the shifting trick
         # as in "Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context"
-        pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
-        pe_negative = pe_negative[1:].unsqueeze(0)
-        pe = torch.cat([pe_positive, pe_negative], dim=1)
+        pe_positive = torch.flip(pe_positive, [0])
+        pe_negative = pe_negative[1:]
+        pe = torch.cat([pe_positive, pe_negative], dim=0)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor, left_context: int = 0) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: torch.Tensor) -> Tensor:
         """Add positional encoding.
 
         Args:
-            x (torch.Tensor): Input tensor (batch, time, `*`).
-            left_context (int): left context (in frames) used during streaming decoding.
-                this is used only in real streaming decoding, in other circumstances,
-                it MUST be 0.
+            x (torch.Tensor): Input tensor (time, batch, `*`).
         Returns:
-            torch.Tensor: Encoded tensor (batch, time, `*`).
-            torch.Tensor: Encoded tensor (batch, 2*time-1, `*`).
+            torch.Tensor: Encoded tensor (1, 2*time-1, `*`).
 
         """
-        self.extend_pe(x, left_context)
-        x = x * self.xscale
-        x_size_1 = x.size(1) + left_context
+        self.extend_pe(x)
         pos_emb = self.pe[
-            :,
-            self.pe.size(1) // 2
-            - x_size_1
-            + 1 : self.pe.size(1) // 2  # noqa E203
-            + x.size(1),
+            self.pe.size(0) // 2
+            - x.size(0)
+            + 1 : self.pe.size(0) // 2  # noqa E203
+            + x.size(0),
+            :
         ]
-        return self.dropout(x), self.dropout(pos_emb)
+        pos_emb = pos_emb.unsqueeze(0)
+        return self.dropout(pos_emb)
+
+
+class DownsampledConformerEncoder(nn.Module):
+    r"""
+    DownsampledZipformer2Encoder is a zipformer encoder evaluated at a reduced frame rate,
+    after convolutional downsampling, and then upsampled again at the output, and combined
+    with the origin input, so that the output has the same shape as the input.
+    """
+
+    def __init__(self, encoder: nn.Module, dim: int, downsample: int, dropout: float):
+        super(DownsampledConformerEncoder, self).__init__()
+        self.downsample_factor = downsample
+        self.downsample = SimpleDownsample(dim, downsample, dropout)
+        self.encoder = encoder
+        self.upsample = SimpleUpsample(dim, downsample)
+        self.out_combiner = BypassModule(dim)
+
+    def forward(
+        self,
+        src: Tensor,
+        src_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        r"""Downsample, go through encoder, upsample.
+
+        Args:
+            src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
+            feature_mask: something that broadcasts with src, that we'll multiply `src`
+               by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
+            attn_mask: the attention mask, of shape (batch_size, seq_len, seq_len) or (seq_len, seq_len),
+                 interpreted as (batch_size, tgt_seq_len, src_seq_len) or (tgt_seq_len, src_seq_len).
+                 True means masked position. May be None.
+            src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len); True means
+                 masked position.  May be None.
+
+        Returns: a Tensor with the same shape as src.
+        """
+        src_orig = src
+        src = self.downsample(src)
+
+        src = self.encoder(
+            src,
+            src_key_padding_mask=src_key_padding_mask,
+        )
+        src = self.upsample(src)
+        # remove any extra frames that are not a multiple of downsample_factor
+        src = src[: src_orig.shape[0]]
+
+        return self.out_combiner(src_orig, src)
+
+
+class SimpleDownsample(torch.nn.Module):
+    """
+    Does downsampling with attention, by weighted sum, and a projection..
+    """
+
+    def __init__(self, channels: int, downsample: int, dropout: float):
+        super(SimpleDownsample, self).__init__()
+
+        self.bias = nn.Parameter(torch.zeros(downsample))
+
+        self.name = None  # will be set from training code
+        self.dropout = copy.deepcopy(dropout)
+
+        self.downsample = downsample
+
+    def forward(self, src: Tensor) -> Tensor:
+        """
+        x: (seq_len, batch_size, in_channels)
+        Returns a tensor of shape
+           ( (seq_len+downsample-1)//downsample, batch_size, channels)
+        """
+        (seq_len, batch_size, in_channels) = src.shape
+        ds = self.downsample
+        d_seq_len = (seq_len + ds - 1) // ds
+
+        # Pad to an exact multiple of self.downsample
+        if seq_len != d_seq_len * ds:
+            # right-pad src, repeating the last element.
+            pad = d_seq_len * ds - seq_len
+            src_extra = src[src.shape[0] - 1 :].expand(pad, src.shape[1], src.shape[2])
+            src = torch.cat((src, src_extra), dim=0)
+            assert src.shape[0] == d_seq_len * ds
+
+        src = src.reshape(d_seq_len, ds, batch_size, in_channels)
+
+        weights = self.bias.softmax(dim=0)
+        # weights: (downsample, 1, 1)
+        weights = weights.unsqueeze(-1).unsqueeze(-1)
+
+        # ans1 is the first `in_channels` channels of the output
+        ans = (src * weights).sum(dim=1)
+
+        return ans
+
+
+class SimpleUpsample(torch.nn.Module):
+    """
+    A very simple form of upsampling that mostly just repeats the input, but
+    also adds a position-specific bias.
+    """
+
+    def __init__(self, num_channels: int, upsample: int):
+        super(SimpleUpsample, self).__init__()
+        self.upsample = upsample
+
+    def forward(self, src: Tensor) -> Tensor:
+        """
+        x: (seq_len, batch_size, num_channels)
+        Returns a tensor of shape
+           ( (seq_len*upsample), batch_size, num_channels)
+        """
+        upsample = self.upsample
+        (seq_len, batch_size, num_channels) = src.shape
+        src = src.unsqueeze(1).expand(seq_len, upsample, batch_size, num_channels)
+        src = src.reshape(seq_len * upsample, batch_size, num_channels)
+        return src
+
+
+class BypassModule(nn.Module):
+    """
+    An nn.Module that implements a learnable bypass scale, and also randomized per-sequence
+    layer-skipping.  The bypass is limited during early stages of training to be close to
+    "straight-through", i.e. to not do the bypass operation much initially, in order to
+    force all the modules to learn something.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        skip_rate: float = 0.0,
+        scale_min: float = 0.0,
+        scale_max: float = 1.0,
+    ):
+        super().__init__()
+        self.bypass_scale = nn.Parameter(torch.full((embed_dim,), 0.5))
+        self.skip_rate = skip_rate
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    def _get_bypass_scale(self, batch_size: int):
+        # returns bypass-scale of shape (num_channels,),
+        # or (batch_size, num_channels,).  This is actually the
+        # scale on the non-residual term, so 0 correponds to bypassing
+        # this module.
+        if torch.jit.is_scripting() or not self.training:
+            return self.bypass_scale
+        else:
+            ans = limit_param_value(
+                self.bypass_scale, min=float(self.scale_min), max=float(self.scale_max)
+            )
+            skip_rate = float(self.skip_rate)
+            if skip_rate != 0.0:
+                mask = torch.rand((batch_size, 1), device=ans.device) > skip_rate
+                ans = ans * mask
+                # now ans is of shape (batch_size, num_channels), and is zero for sequences
+                # on which we have randomly chosen to do layer-skipping.
+            return ans
+
+    def forward(self, src_orig: Tensor, src: Tensor):
+        """
+        Args: src_orig and src are both of shape (seq_len, batch_size, num_channels)
+        Returns: something with the same shape as src and src_orig
+        """
+        bypass_scale = self._get_bypass_scale(src.shape[1])
+        return src_orig + (src - src_orig) * bypass_scale
 
 
 class RelPositionMultiheadAttention(nn.Module):
@@ -1367,34 +1221,76 @@ def identity(x):
 
 
 class Conv2dSubsampling(nn.Module):
-    """Convolutional 2D subsampling (to 1/4 length).
+    """Convolutional 2D subsampling (to 1/2 length).
 
     Convert an input of shape (N, T, idim) to an output
     with shape (N, T', odim), where
-    T' = ((T-1)//2 - 1)//2, which approximates T' == T//4
+    T' = (T-3)//2 - 2 == (T-7)//2
 
     It is based on
     https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/subsampling.py  # noqa
     """
 
-    def __init__(self, idim: int, odim: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        layer1_channels: int = 8,
+        layer2_channels: int = 32,
+        layer3_channels: int = 128,
+        dropout: float = 0.1,
+    ) -> None:
         """
         Args:
-          idim:
-            Input dim. The input shape is (N, T, idim).
-            Caution: It requires: T >=7, idim >=7
-          odim:
-            Output dim. The output shape is (N, ((T-1)//2 - 1)//2, odim)
+          in_channels:
+            Number of channels in. The input shape is (N, T, in_channels).
+            Caution: It requires: T >=7, in_channels >=7
+          out_channels
+            Output dim. The output shape is (N, (T-3)//2, out_channels)
+          layer1_channels:
+            Number of channels in layer1
+          layer1_channels:
+            Number of channels in layer2
+          bottleneck:
+            bottleneck dimension for 1d squeeze-excite
         """
-        assert idim >= 7
+        assert in_channels >= 7
         super().__init__()
+
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=odim, kernel_size=3, stride=2),
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=layer1_channels,
+                kernel_size=3,
+                padding=(0, 1),  # (time, freq)
+            ),
             nn.ReLU(),
-            nn.Conv2d(in_channels=odim, out_channels=odim, kernel_size=3, stride=2),
+            nn.Conv2d(
+                in_channels=layer1_channels,
+                out_channels=layer2_channels,
+                kernel_size=3,
+                stride=2,
+                padding=0,
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                in_channels=layer2_channels,
+                out_channels=layer3_channels,
+                kernel_size=3,
+                stride=(1, 2),  # (time, freq)
+            ),
             nn.ReLU(),
         )
-        self.out = nn.Linear(odim * (((idim - 1) // 2 - 1) // 2), odim)
+
+        # just one convnext layer
+        self.convnext = ConvNeXt(layer3_channels, kernel_size=(7, 7))
+
+        out_width = (((in_channels - 1) // 2) - 1) // 2
+
+        self.out = nn.Linear(out_width * layer3_channels, out_channels)
+
+        self.out_norm = nn.LayerNorm(out_channels)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Subsample x.
@@ -1408,9 +1304,102 @@ class Conv2dSubsampling(nn.Module):
         """
         # On entry, x is (N, T, idim)
         x = x.unsqueeze(1)  # (N, T, idim) -> (N, 1, T, idim) i.e., (N, C, H, W)
+
         x = self.conv(x)
-        # Now x is of shape (N, odim, ((T-1)//2 - 1)//2, ((idim-1)//2 - 1)//2)
+        x = self.convnext(x)
+
+        # Now x is of shape (N, odim, ((T-3)//2 - 1)//2, ((idim-1)//2 - 1)//2)
         b, c, t, f = x.size()
-        x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * f))
-        # Now x is of shape (N, ((T-1)//2 - 1))//2, odim)
+
+        x = x.transpose(1, 2).reshape(b, t, c * f)
+        # now x: (N, ((T-1)//2 - 1))//2, out_width * layer3_channels))
+
+        x = self.out(x)
+        x = self.out_norm(x)
+        x = self.dropout(x)
         return x
+
+
+class ConvNeXt(nn.Module):
+    """
+    Our interpretation of the ConvNeXt module as used in https://arxiv.org/pdf/2206.14747.pdf
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_ratio: int = 3,
+        kernel_size: Tuple[int, int] = (7, 7),
+    ):
+        super().__init__()
+        padding = ((kernel_size[0] - 1) // 2, (kernel_size[1] - 1) // 2)
+        hidden_channels = channels * hidden_ratio
+
+        self.depthwise_conv = nn.Conv2d(
+            in_channels=channels,
+            out_channels=channels,
+            groups=channels,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+
+        self.pointwise_conv1 = nn.Conv2d(
+            in_channels=channels, out_channels=hidden_channels, kernel_size=1
+        )
+
+        self.activation = nn.ReLU()
+
+        self.pointwise_conv2 = nn.Conv2d(
+            in_channels=hidden_channels,
+            out_channels=channels,
+            kernel_size=1,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x layout: (N, C, H, W), i.e. (batch_size, num_channels, num_frames, num_freqs)
+
+        The returned value has the same shape as x.
+        """
+        bypass = x
+        x = self.depthwise_conv(x)
+        x = self.pointwise_conv1(x)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+
+        x = bypass + x
+
+        return x
+
+
+def _test_zipformer_main():
+    feature_dim = 50
+    batch_size = 5
+    seq_len = 20
+    feature_dim = 50
+    # Just make sure the forward pass runs.
+
+    c = Conformer(
+        num_features=feature_dim,
+        encoder_dim=(64, 96),
+        num_heads=(4, 4),
+    )
+    batch_size = 5
+    seq_len = 20
+    # Just make sure the forward pass runs.
+    f = c(
+        torch.randn(batch_size, seq_len, feature_dim),
+        torch.full((batch_size,), seq_len, dtype=torch.int64),
+    )
+    assert ((seq_len - 7) // 2 + 1) // 2 == f[0].shape[1], (seq_len, f.shape[1])
+    f[0].sum().backward()
+    c.eval()
+    f = c(
+        torch.randn(batch_size, seq_len, feature_dim),
+        torch.full((batch_size,), seq_len, dtype=torch.int64),
+    )
+    f  # to remove flake8 warnings
+
+
+if __name__ == "__main__":
+    _test_zipformer_main()

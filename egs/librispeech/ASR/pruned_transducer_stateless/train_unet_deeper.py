@@ -58,7 +58,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from conformer import Conformer
+from conformer_unet_deeper import Zipformer2
 from decoder import Decoder
 from joiner import Joiner
 from lhotse.cut import Cut
@@ -91,37 +91,91 @@ from icefall.utils import (
 
 def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "--dynamic-chunk-training",
-        type=str2bool,
-        default=False,
-        help="""Whether to use dynamic_chunk_training, if you want a streaming
-        model, this requires to be True.
-        """,
+        "--num-encoder-layers",
+        type=str,
+        default="2,2,3,4,3,2",
+        help="Number of zipformer encoder layers per stack, comma separated.",
     )
 
     parser.add_argument(
-        "--causal-convolution",
-        type=str2bool,
-        default=False,
-        help="""Whether to use causal convolution, this requires to be True when
-        using dynamic_chunk_training.
-        """,
+        "--downsampling-factor",
+        type=str,
+        default="1,2,4,8,4,2",
+        help="Downsampling factor for each stack of encoder layers.",
     )
 
     parser.add_argument(
-        "--short-chunk-size",
+        "--feedforward-dim",
+        type=str,
+        default="512,768,1024,1536,1024,768",
+        help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--num-heads",
+        type=str,
+        default="4,4,4,8,4,4",
+        help="Number of attention heads in the zipformer encoder layers: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--encoder-dim",
+        type=str,
+        default="192,256,384,512,384,256",
+        help="Embedding dimension in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--query-head-dim",
+        type=str,
+        default="32",
+        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--value-head-dim",
+        type=str,
+        default="12",
+        help="Value dimension per head in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--pos-head-dim",
+        type=str,
+        default="4",
+        help="Positional-encoding dimension per head in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--pos-dim",
         type=int,
-        default=25,
-        help="""Chunk length of dynamic training, the chunk size would be either
-        max sequence length of current batch or uniformly sampled from (1, short_chunk_size).
-        """,
+        default="48",
+        help="Positional-encoding embedding dimension"
     )
 
     parser.add_argument(
-        "--num-left-chunks",
+        "--cnn-module-kernel",
+        type=str,
+        default="31,31,15,15,15,31",
+        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
+        "a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--decoder-dim",
         type=int,
-        default=4,
-        help="How many left context can be seen in chunks when calculating attention.",
+        default=512,
+        help="Embedding dimension in the decoder model.",
+    )
+
+    parser.add_argument(
+        "--joiner-dim",
+        type=int,
+        default=512,
+        help="""Dimension used in the joiner model.
+        Outputs from the encoder and decoder model are projected
+        to this dimension before adding.
+        """,
     )
 
 
@@ -355,14 +409,6 @@ def get_params() -> AttributeDict:
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
-            "encoder_dim": 512,
-            "nhead": 8,
-            "dim_feedforward": 2048,
-            "num_encoder_layers": 12,
-            # parameters for decoder
-            "decoder_dim": 512,
-            # parameters for joiner
-            "joiner_dim": 512,
             # parameters for Noam
             "warm_step": 40000,  # For the 100h subset, use 20000
             "env_info": get_env_info(),
@@ -372,19 +418,24 @@ def get_params() -> AttributeDict:
     return params
 
 
+def to_int_tuple(s: str):
+    return tuple(map(int, s.split(',')))
+
+
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Conformer and Transformer
-    encoder = Conformer(
+    encoder = Zipformer2(
         num_features=params.feature_dim,
-        subsampling_factor=params.subsampling_factor,
-        d_model=params.encoder_dim,
-        nhead=params.nhead,
-        dim_feedforward=params.dim_feedforward,
-        num_encoder_layers=params.num_encoder_layers,
-        dynamic_chunk_training=params.dynamic_chunk_training,
-        short_chunk_size=params.short_chunk_size,
-        num_left_chunks=params.num_left_chunks,
-        causal=params.causal_convolution,
+        output_downsampling_factor=2,
+        downsampling_factor=to_int_tuple(params.downsampling_factor),
+        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+        encoder_dim=to_int_tuple(params.encoder_dim),
+        query_head_dim=to_int_tuple(params.query_head_dim),
+        pos_head_dim=to_int_tuple(params.pos_head_dim),
+        value_head_dim=to_int_tuple(params.value_head_dim),
+        pos_dim=params.pos_dim,
+        num_heads=to_int_tuple(params.num_heads),
+        feedforward_dim=to_int_tuple(params.feedforward_dim),
+        cnn_module_kernel=to_int_tuple(params.cnn_module_kernel),
     )
     return encoder
 
@@ -401,7 +452,7 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
     joiner = Joiner(
-        encoder_dim=params.encoder_dim,
+        encoder_dim=max(to_int_tuple(params.encoder_dim)),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -418,7 +469,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=params.encoder_dim,
+        encoder_dim=max(to_int_tuple(params.encoder_dim)),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -889,11 +940,6 @@ def run(rank, world_size, args):
     params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
 
-    if params.dynamic_chunk_training:
-        assert (
-            params.causal_convolution
-        ), "dynamic_chunk_training requires causal convolution"
-
     logging.info(params)
 
     logging.info("About to create model")
@@ -920,7 +966,7 @@ def run(rank, world_size, args):
 
     optimizer = Noam(
         model.parameters(),
-        model_size=params.encoder_dim,
+        model_size=max(to_int_tuple(params.encoder_dim)),
         factor=params.lr_factor,
         warm_step=params.warm_step,
     )
@@ -1069,6 +1115,11 @@ def scan_pessimistic_batches_for_oom(
                 is_training=True,
             )
             loss.backward()
+
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    print(name)
+
             clip_grad_norm_(model.parameters(), 5.0, 2.0)
             optimizer.step()
         except RuntimeError as e:
