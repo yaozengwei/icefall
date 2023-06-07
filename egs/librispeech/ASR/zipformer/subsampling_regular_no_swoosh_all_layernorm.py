@@ -34,7 +34,7 @@ from scaling import (
     # SwooshR,
     # Whiten,
 )
-from zipformer_regular_no_swoosh import Swish
+from zipformer_regular_no_swoosh_all_layernorm import Swish
 
 
 class ConvNeXt(nn.Module):

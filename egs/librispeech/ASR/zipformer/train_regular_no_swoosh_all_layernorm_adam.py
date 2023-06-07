@@ -63,12 +63,12 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
 # from zipformer import Zipformer2
-from zipformer_regular_no_swoosh_all_layernorm_adam import Zipformer2
+from zipformer_regular_no_swoosh_all_layernorm import Zipformer2
 from scaling import ScheduledFloat
 from decoder import Decoder
 from joiner import Joiner
 # from subsampling import Conv2dSubsampling
-from subsampling_regular_no_swoosh_all_layernorm_adam import Conv2dSubsampling
+from subsampling_regular_no_swoosh_all_layernorm import Conv2dSubsampling
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
@@ -316,26 +316,10 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--base-lr",
+        "--lr-factor",
         type=float,
-        default=0.045,
-        help="The base learning rate."
-    )
-
-    parser.add_argument(
-        "--lr-batches",
-        type=float,
-        default=7500,
-        help="""Number of steps that affects how rapidly the learning rate
-        decreases. We suggest not to change this.""",
-    )
-
-    parser.add_argument(
-        "--lr-epochs",
-        type=float,
-        default=3.5,
-        help="""Number of epochs that affects how rapidly the learning rate decreases.
-        """,
+        default=5.0,
+        help="The lr_factor for Noam optimizer",
     )
 
     parser.add_argument(
@@ -530,7 +514,7 @@ def get_params() -> AttributeDict:
             # parameters for zipformer
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
-            "warm_step": 2000,
+            "warm_step": 40000,
             "env_info": get_env_info(),
         }
     )
@@ -1148,9 +1132,9 @@ def run(rank, world_size, args):
 
     optimizer = Noam(
         model.parameters(),
-        model_size=int(max(params.encoder_dim.split(','))),
-        factor=params.base_lr,
-        warm_step=params.warmup_batches,
+        model_size=max(_to_int_tuple(params.encoder_dim)),
+        factor=params.lr_factor,
+        warm_step=params.warm_step,
     )
 
     if checkpoints and "optimizer" in checkpoints:
@@ -1176,10 +1160,10 @@ def run(rank, world_size, args):
 
     librispeech = LibriSpeechAsrDataModule(args)
 
-    train_cuts = librispeech.train_clean_100_cuts()
     if params.full_libri:
-        train_cuts += librispeech.train_clean_360_cuts()
-        train_cuts += librispeech.train_other_500_cuts()
+        train_cuts = librispeech.train_all_shuf_cuts()
+    else:
+        train_cuts = librispeech.train_clean_100_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
