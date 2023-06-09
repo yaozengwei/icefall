@@ -390,14 +390,14 @@ def get_parser():
     parser.add_argument(
         "--warmup-start",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Warmup start point for Eden LRScheduler"
     )
 
     parser.add_argument(
         "--warmup-batches",
         type=float,
-        default=40000.0,
+        default=500,
         help="Warmup batches for Eden LRScheduler"
     )
 
@@ -529,7 +529,7 @@ def get_params() -> AttributeDict:
             # parameters for zipformer
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
-            "warm_step": 40000,
+            "warm_step": 2000,
             "env_info": get_env_info(),
         }
     )
