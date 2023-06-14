@@ -35,6 +35,7 @@ import torch.multiprocessing as mp
 from cls_datamodule import ImageNetClsDataModule
 from optim import Eden, ScaledAdam
 from utils import AverageMeter, accuracy, fix_random_seed, reduce_tensor
+from scaling import ScheduledFloat
 from timm.data import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from torch import nn
@@ -55,7 +56,7 @@ from icefall.utils import (
     str2bool,
     get_parameter_groups_with_lrs,
 )
-from swin_transformer import SwinTransformer
+from subformer import SwinTransformer
 
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
@@ -94,10 +95,24 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--depths",
+        "--window-size",
+        type=int,
+        default=7,
+        help="Window size. Default: 7",
+    )
+
+    parser.add_argument(
+        "--num-encoder-layers",
         type=str,
         default="2,2,6,2",
-        help="Depth of each Swin Transformer layer.",
+        help="Number of zipformer encoder layers per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--downsampling-factor",
+        type=str,
+        default="2,2,2,2",
+        help="Downsampling factor for each stack of encoder layers.",
     )
 
     parser.add_argument(
@@ -108,10 +123,24 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--window-size",
+        "--query-head-dim",
+        type=str,
+        default="24",
+        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--value-head-dim",
+        type=str,
+        default="12",
+        help="Value dimension per head in encoder stacks: a single int or comma-separated list."
+    )
+
+    parser.add_argument(
+        "--pos-dim",
         type=int,
-        default=7,
-        help="Window size. Default: 7",
+        default=8,
+        help="Positional-encoding dimension in encoder stacks: a single int or comma-separated list."
     )
 
     parser.add_argument(
@@ -119,48 +148,6 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=4.0,
         help="Ratio of mlp hidden dim to embedding dim. Default: 4",
-    )
-
-    parser.add_argument(
-        "--qkv-bias",
-        type=str2bool,
-        default=True,
-        help="If True, add a learnable bias to query, key, value. Default: True",
-    )
-
-    parser.add_argument(
-        "--qk-scale",
-        type=float,
-        default=None,
-        help="Override default qk scale of head_dim ** -0.5 if set. Default: None",
-    )
-
-    parser.add_argument(
-        "--ape",
-        type=str2bool,
-        default=False,
-        help="If True, add absolute position embedding to the patch embedding. Default: False",
-    )
-
-    parser.add_argument(
-        "--patch-norm",
-        type=str2bool,
-        default=True,
-        help="If True, add normalization after patch embedding. Default: True",
-    )
-
-    parser.add_argument(
-        "--drop-rate",
-        type=float,
-        default=0.0,
-        help="Dropout rate",
-    )
-
-    parser.add_argument(
-        "--drop-path-rate",
-        type=float,
-        default=0.1,
-        help="Drop path rate",
     )
 
     parser.add_argument(
@@ -736,16 +723,16 @@ def get_model(params):
         in_chans=params.in_chans,
         num_classes=params.num_classes,
         embed_dim=params.embed_dim,
-        depths=_to_int_tuple(params.depths),
-        num_heads=_to_int_tuple(params.num_heads),
         window_size=params.window_size,
+        num_encoder_layers=_to_int_tuple(params.num_encoder_layers),
+        downsampling_factor=_to_int_tuple(params.downsampling_factor),
+        num_heads=_to_int_tuple(params.num_heads),
+        query_head_dim=_to_int_tuple(params.query_head_dim),
+        value_head_dim=_to_int_tuple(params.value_head_dim),
+        pos_dim=params.pos_dim,
         mlp_ratio=params.mlp_ratio,
-        qkv_bias=params.qkv_bias,
-        qk_scale=params.qk_scale,
-        drop_rate=params.drop_rate,
-        drop_path_rate=params.drop_path_rate,
-        ape=params.ape,
-        patch_norm=params.patch_norm,
+        dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+        warmup_batches=4000.0,
         fused_window_process=params.fused_window_process,
     )
     return model
@@ -874,6 +861,10 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
+
         validate(
             params=params,
             model=model,
@@ -881,10 +872,6 @@ def run(rank, world_size, args):
             world_size=world_size,
             tb_writer=tb_writer,
         )
-
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
 
         save_checkpoint(
             params=params,
