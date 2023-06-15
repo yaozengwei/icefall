@@ -606,11 +606,11 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.norm = BiasNorm(embed_dim)
 
-        # self.balancer1 = Balancer(
-        #     embed_dim, channel_dim=-1,
-        #     min_positive=0.45, max_positive=0.55,
-        #     min_abs=0.2, max_abs=4.0,
-        # )
+        self.balancer1 = Balancer(
+            embed_dim, channel_dim=-1,
+            min_positive=0.45, max_positive=0.55,
+            min_abs=0.2, max_abs=4.0,
+        )
 
         # balancer for output of NonlinAttentionModule
         # self.balancer_na = Balancer(
@@ -772,8 +772,8 @@ class Zipformer2EncoderLayer(nn.Module):
         # src = src + self.sequence_dropout(self.balancer_ff3(self.feed_forward3(src)),
         #                                   ff3_skip_rate)
 
-        # src = self.balancer1(src)
-        # src = self.norm(src)
+        src = self.balancer1(src)
+        src = self.norm(src)
 
         src = self.bypass(src_orig, src)
 
