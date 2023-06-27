@@ -249,6 +249,8 @@ class Subformer(nn.Module):
 
                 x = LearnedDownsamplingModule.upsample(x_orig, x, indexes, weights)
                 # TODO: use the bypass
+                bypass = self.bypasses[i]
+                x = bypass(x_orig, x)
 
         # x = self.encoder(x, pos_emb)
         x = x.permute(1, 0, 2)  # (H*W, B, C) -> (B, H*W, C)
@@ -686,6 +688,8 @@ class LearnedDownsamplingModule(nn.Module):
 
         super().__init__()
 
+        self.name = None
+
         self.to_scores = nn.Linear(embed_dim, 1, bias=False)
         self.to_scores.lr_scale = 0.5
         # score_balancer is just to keep the magnitudes of the scores in
@@ -748,7 +752,7 @@ class LearnedDownsamplingModule(nn.Module):
                                               dim=1)
 
             if random.random() < 0.01 or __name__ == '__main__':
-                logging.info(f"mean weight={weights.mean()}, mean-abs-scores={scores.abs().mean()} positive-scores={(scores>0).to(torch.float32).mean()}, discarded-weights={weights_discarded.mean()}, seq_len={seq_len}, seq_len_reduced={seq_len_reduced}")
+                logging.info(f"LearnedDownsamplingModule: name={self.name}, mean weight={weights.mean()}, mean-abs-scores={scores.abs().mean()} positive-scores={(scores>0).to(torch.float32).mean()}, discarded-weights={weights_discarded.mean()}, seq_len={seq_len}, seq_len_reduced={seq_len_reduced}")
 
 
             if random.random() < 0.5:
@@ -765,7 +769,7 @@ class LearnedDownsamplingModule(nn.Module):
             seq_len_reduced = max(1,
                                   (weights > 0.0).to(torch.int32).sum(dim=-1).max().item())
             if random.random() < 0.02:
-                logging.info(f"seq_len={seq_len}, seq_len_reduced={seq_len_reduced}")
+                logging.info(f"LearnedDownsamplingModule: name={self.name}, seq_len={seq_len}, seq_len_reduced={seq_len_reduced}")
             weights = weights[:, :seq_len_reduced]
 
         indexes = indexes[:, :seq_len_reduced]
