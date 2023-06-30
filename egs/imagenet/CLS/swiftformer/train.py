@@ -872,6 +872,10 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
+
         validate(
             params=params,
             model=model,
@@ -879,10 +883,6 @@ def run(rank, world_size, args):
             world_size=world_size,
             tb_writer=tb_writer,
         )
-
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
 
         save_checkpoint(
             params=params,

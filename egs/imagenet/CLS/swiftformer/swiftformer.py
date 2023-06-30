@@ -10,6 +10,8 @@ from timm.layers import DropPath, trunc_normal_, to_2tuple
 from timm.models.registry import register_model
 import einops
 
+from scaling import Balancer
+
 SwiftFormer_width = {
     'XS': [48, 56, 112, 220],
     'S': [48, 64, 168, 224],
@@ -121,6 +123,7 @@ class Mlp(nn.Module):
         self.fc1 = nn.Conv2d(in_features, hidden_features, 1)
         self.act = act_layer()
         self.fc2 = nn.Conv2d(hidden_features, out_features, 1)
+        self.balancer = Balancer(out_features, channel_dim=1, max_abs=10.0)
         self.drop = nn.Dropout(drop)
         self.apply(self._init_weights)
 
@@ -136,6 +139,7 @@ class Mlp(nn.Module):
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
+        x = self.balancer(x)
         x = self.drop(x)
         return x
 
