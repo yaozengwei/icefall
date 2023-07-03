@@ -919,8 +919,9 @@ def get_model_profile(
         The number of floating-point operations, multiply-accumulate operations (MACs), and parameters in the model.
     """
     assert isinstance(model, nn.Module), "model must be a PyTorch module"
+    assert model.training is False, "model must be in eval mode"
+
     prof = FlopsProfiler(model, module_hoop_mapping=module_hoop_mapping)
-    model.eval()
 
     assert len(args) > 0, "input args must be specified"
 

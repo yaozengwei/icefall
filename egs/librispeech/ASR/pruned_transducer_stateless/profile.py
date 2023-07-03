@@ -22,6 +22,7 @@ Usage: ./pruned_transducer_stateless/profile.py
 
 import argparse
 import logging
+import numpy as np
 import sentencepiece as spm
 import torch
 
@@ -79,12 +80,37 @@ def main():
     logging.info(f"Number of model parameters: {num_param}")
 
     # for 30-second input
-    B, T, D = 1, 3000, 80
+    B, T, D = 20, 3000, 80
     feature = torch.ones(B, T, D, dtype=torch.float32).to(device)
     feature_lens = torch.full((B,), T, dtype=torch.int64).to(device)
 
+    # GPU warm-up
+    for _ in range(5):
+        _ = model(feature, feature_lens)
+
+    # INIT LOGGERS
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+    repetitions = 100
+    timings = np.zeros((repetitions, 1))
+
+    for i in range(repetitions):
+        starter.record()
+        _ = model(feature, feature_lens)
+        ender.record()
+        # WAIT FOR GPU SYNC
+        torch.cuda.synchronize()
+        curr_time = starter.elapsed_time(ender)
+        timings[i] = curr_time
+        # print(curr_time)
+
+    logging.info(f"Throughput: {1.0 / (np.mean(timings) / 1000)} (samples/second)")
+    logging.info(
+        f"Maximum memory allocated so far: {torch.cuda.max_memory_allocated()//1000000} MB"
+    )
+
     flops, params = get_model_profile(model=model, args=(feature, feature_lens))
-    logging.info(f"For the encoder part, params: {params}, flops: {flops}")
+    logging.info(f"FLOPS: {flops}")
 
 
 if __name__ == "__main__":
