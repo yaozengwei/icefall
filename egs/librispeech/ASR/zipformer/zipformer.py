@@ -579,7 +579,7 @@ class Zipformer2EncoderLayer(nn.Module):
                                         value_head_dim)
 
         self.feed_forward1 = FeedforwardModule(embed_dim,
-                                               (feedforward_dim * 3) // 4,
+                                               feedforward_dim,
                                                dropout)
 
         self.feed_forward2 = FeedforwardModule(embed_dim,
@@ -587,7 +587,7 @@ class Zipformer2EncoderLayer(nn.Module):
                                                dropout)
 
         self.feed_forward3 = FeedforwardModule(embed_dim,
-                                               (feedforward_dim * 5) // 4,
+                                               feedforward_dim,
                                                dropout)
 
         self.nonlin_attention = NonlinAttention(embed_dim,
@@ -1678,7 +1678,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
         #  [where seq_len2 represents relative position.]
         pos_scores = torch.matmul(p, pos_emb)
-        
+
         if torch.jit.is_tracing():
             (num_heads, batch_size, time1, n) = pos_scores.shape
             rows = torch.arange(start=time1 - 1, end=-1, step=-1)
