@@ -1533,7 +1533,7 @@ class ActivationDropoutAndLinear(torch.nn.Module):
 
     def forward(self,
                 x: Tensor):
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
+        if torch.jit.is_scripting() or torch.jit.is_tracing() or not self.training:
             if self.activation == 'SwooshL':
                 x = SwooshLForward(x)
             elif self.activation == "SwooshR":
