@@ -865,11 +865,8 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         self.width = width
 
         # linear transformation for positional encoding.
-        self.linear_pos_row = ScaledLinear(
-            embed_dim, pos_dim, bias=False, initial_scale=0.05
-        )
-        self.linear_pos_col = ScaledLinear(
-            embed_dim, pos_dim, bias=False, initial_scale=0.05
+        self.linear_pos = ScaledLinear(
+            embed_dim * 2, pos_dim, bias=False, initial_scale=0.05
         )
 
         self.pe_row = self.generate_pe(length=height)
@@ -923,7 +920,7 @@ class CompactRelPositionalEncoding(torch.nn.Module):
             x (torch.Tensor): Input tensor (batch_size, height, width, num_channels_in)
 
         Returns:
-            positional embedding, of shape (height*width, heigh*width, pos_dim*2).
+            positional embedding, of shape (height*width, heigh*width, pos_dim).
         """
         if self.pe_row.dtype != x.dtype or str(self.pe_row.device) != str(x.device):
             self.pe_row = self.pe_row.to(dtype=x.dtype, device=x.device)
@@ -934,37 +931,34 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         H = self.height
         W = self.width
 
-        # (1, 2 * H - 1, pos_dim)
-        row = self.linear_pos_row(self.dropout(self.pe_row.unsqueeze(0)))
-        # (1, 2 * W - 1, pos_dim)
-        col = self.linear_pos_col(self.dropout(self.pe_col.unsqueeze(0)))
-
         # expand the '1' dimension to seq_len; this introduces a dimension that
         # 'does nothing', just creates copies, as a workaround for lack of torch support
         # for negative strides.
-        row = row.expand(H, 2 * H - 1, self.pos_dim).contiguous()
+        row = self.pe_row.unsqueeze(0).expand(H, 2 * H - 1, self.embed_dim).contiguous()
         (useless_stride, seq_stride, channel_stride) = row.stride()
         row = row.as_strided(
-            (H, H, self.pos_dim),
+            (H, H, self.embed_dim),
             (useless_stride - seq_stride, seq_stride, channel_stride),
             storage_offset=seq_stride * (H - 1),
-        )  # (H, H, pos_dim)
+        )  # (H, H, embed_dim)
 
         # expand the '1' dimension to seq_len; this introduces a dimension that
         # 'does nothing', just creates copies, as a workaround for lack of torch support
         # for negative strides.
-        col = col.expand(W, 2 * W - 1, self.pos_dim).contiguous()
+        col = self.pe_col.unsqueeze(0).expand(W, 2 * W - 1, self.embed_dim).contiguous()
         (useless_stride, seq_stride, channel_stride) = col.stride()
         col = col.as_strided(
-            (W, W, self.pos_dim),
+            (W, W, self.embed_dim),
             (useless_stride - seq_stride, seq_stride, channel_stride),
             storage_offset=seq_stride * (W - 1),
-        )  # (W, W, pos_dim)
+        )  # (W, W, embed_dim)
 
         row = row[:, None, :, None, :].expand(H, W, H, W, -1)
         col = col[None, :, None, :, :].expand(H, W, H, W, -1)
         pos_emb = torch.stack([row, col], dim=-1)
-        pos_emb = pos_emb.view(H * W, H * W, self.pos_dim * 2)
+        pos_emb = pos_emb.view(H * W, H * W, self.embed_dim * 2)
+
+        pos_emb = self.linear_pos(self.dropout(pos_emb))
 
         return pos_emb
 
@@ -1020,7 +1014,7 @@ class SwinZipformer(nn.Module):
         num_heads: Tuple[int, ...] = (3, 6, 12, 24),
         query_head_dim: Tuple[int, ...] = (24,),
         value_head_dim: Tuple[int, ...] = (12,),
-        pos_dim: int = 8,
+        pos_dim: int = 4,
         # feedforward_dim: Tuple[int, ...] = (1536,),
         mlp_ratio: float = 3.0,
         dropout: Optional[FloatLike] = None,  # see code below for default
@@ -1060,10 +1054,9 @@ class SwinZipformer(nn.Module):
         )
         patches_resolution = self.patch_embed.patches_resolution
 
-        assert pos_dim % 2 == 0, pos_dim
         self.pos_enc = CompactRelPositionalEncoding(
             embed_dim=64,
-            pos_dim=pos_dim // 2,
+            pos_dim=pos_dim,
             dropout_rate=0.15,
             height=window_size,
             width=window_size,
@@ -1388,14 +1381,15 @@ def _test_rel_pos_enc():
     pos_enc = CompactRelPositionalEncoding(
         embed_dim=64, pos_dim=4, dropout_rate=0.1, height=7, width=6
     )
+    pos_enc.eval()
     x = torch.randn(2, 7 * 6, 384)
     pos_emb = pos_enc(x)
     pos_emb = pos_enc(x)
     print(pos_emb.shape)
 
-    pos_emb = pos_emb.reshape(7, 6, 7, 6, 8)
+    pos_emb = pos_emb.reshape(7, 6, 7, 6, 4)
     # a simple test
-    assert torch.equal(pos_emb[1, 2, 3, 4, :], pos_emb[2, 3, 4, 5, :])
+    assert torch.equal(pos_emb[1, 2, 3, 4, :], pos_emb[2, 3, 4, 5, :]), pos_emb[1, 2, 3, 4, :] - pos_emb[2, 3, 4, 5, :]
     assert torch.equal(pos_emb[4, 3, 2, 1, :], pos_emb[5, 4, 3, 2, :])
 
 

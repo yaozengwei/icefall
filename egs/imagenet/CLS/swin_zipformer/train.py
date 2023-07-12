@@ -132,7 +132,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--pos-dim",
         type=int,
-        default=8,
+        default=4,
         help="Positional-encoding dimension in encoder stacks: a single int or comma-separated list."
     )
 
