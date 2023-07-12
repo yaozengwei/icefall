@@ -1426,7 +1426,7 @@ class ActivationDropoutAndLinearFunction(torch.autograd.Function):
                 x: Tensor,
                 weight: Tensor,
                 bias: Optional[Tensor],
-                weight_scale: Optional[Tensor],
+                scale: Optional[Tensor],
                 activation: str,
                 dropout_p: float,
                 dropout_shared_dim: Optional[int]):
@@ -1441,9 +1441,14 @@ class ActivationDropoutAndLinearFunction(torch.autograd.Function):
         else:
             dropout_mask = None
 
-        ctx.save_for_backward(x, weight, bias, weight_scale, dropout_mask)
+        ctx.save_for_backward(x, weight, bias, scale, dropout_mask)
 
         ctx.activation = activation
+
+        if scale is not None:
+            for _ in range(x.ndim - 1):
+                scale = scale.unsqueeze(0)
+            x = x * scale
 
         forward_activation_dict = {
             'SwooshL': k2.swoosh_l_forward,
@@ -1456,18 +1461,21 @@ class ActivationDropoutAndLinearFunction(torch.autograd.Function):
         if dropout_mask is not None:
             x = x * dropout_mask
 
-        if weight_scale is None:
-            x = torch.nn.functional.linear(x, weight, bias)
-        else:
-            x = torch.nn.functional.linear(x, weight * weight_scale, bias)
-
+        x = torch.nn.functional.linear(x, weight, bias)
         return x
 
     @staticmethod
     @custom_bwd
     def backward(ctx, ans_grad: Tensor):
         saved = ctx.saved_tensors
-        (x, weight, bias, weight_scale, dropout_mask) = saved
+        (x, weight, bias, scale, dropout_mask) = saved
+
+        x_orig = x.clone()
+
+        if scale is not None:
+            for _ in range(x.ndim - 1):
+                scale = scale.unsqueeze(0)
+            x = x * scale
 
         forward_and_deriv_activation_dict = {
             'SwooshL': k2.swoosh_l_forward_and_deriv,
@@ -1490,13 +1498,7 @@ class ActivationDropoutAndLinearFunction(torch.autograd.Function):
         weight_deriv = torch.matmul(g.t(),
                                     y.reshape(-1, in_channels))
 
-        if weight_scale is None:
-            y_deriv = torch.matmul(ans_grad, weight)
-            weight_scale_deriv = None
-        else:
-            y_deriv = torch.matmul(ans_grad, weight * weight_scale)
-            weight_scale_deriv = weight_deriv * weight
-            weight_deriv *= weight_scale
+        y_deriv = torch.matmul(ans_grad, weight)
 
         bias_deriv = None if bias is None else g.sum(dim=0)
         x_deriv = y_deriv * func_deriv
@@ -1504,7 +1506,14 @@ class ActivationDropoutAndLinearFunction(torch.autograd.Function):
             # order versus func_deriv does not matter
             x_deriv = x_deriv * dropout_mask
 
-        return x_deriv, weight_deriv, bias_deriv, weight_scale_deriv, None, None, None
+        if scale is not None:
+            x_orig_deriv = x_deriv * scale
+            scale_deriv = (x_deriv * x_orig).sum(dim=list(range(x.ndim - 1)))
+        else:
+            x_orig_deriv = x_deriv
+            scale_deriv = None
+
+        return x_orig_deriv, weight_deriv, bias_deriv, scale_deriv, None, None, None
 
 
 class ActivationDropoutAndLinear(torch.nn.Module):
@@ -1540,10 +1549,10 @@ class ActivationDropoutAndLinear(torch.nn.Module):
                  dropout_p: FloatLike = 0.0,
                  dropout_shared_dim: Optional[int] = -1,
                  initial_scale: float = 1.0,
-                 share_weight: bool = False,
-                 weight_scale_min: float = 0.2,
-                 weight_scale_max: float = 5.0,
-                 weight_scale_limit_prob: float = 0.6,):
+                 use_scale: bool = False,
+                 scale_min: float = 0.2,
+                 scale_max: float = 5.0,
+                 scale_limit_prob: float = 0.6):
         super().__init__()
         # create a temporary module of nn.Linear that we'll steal the
         # weights and bias from
@@ -1558,13 +1567,13 @@ class ActivationDropoutAndLinear(torch.nn.Module):
         # something to do with exporting the module..
         self.register_parameter('bias', l.bias)
 
-        if share_weight:
-            self.weight_scale = nn.Parameter(torch.ones(self.weight.shape[0], 1))
-            self.weight_scale_min = weight_scale_min
-            self.weight_scale_max = weight_scale_max
-            self.weight_scale_limit_prob = weight_scale_limit_prob
+        if use_scale:
+            self.scale = nn.Parameter(torch.ones(in_channels))
+            self.scale_min = scale_min
+            self.scale_max = scale_max
+            self.scale_limit_prob = scale_limit_prob
         else:
-            self.weight_scale = None
+            self.scale = None
 
         self.activation = activation
         self.dropout_p = dropout_p
@@ -1573,32 +1582,32 @@ class ActivationDropoutAndLinear(torch.nn.Module):
     def forward(self,
                 x: Tensor):
         if torch.jit.is_scripting() or torch.jit.is_tracing():
+            if self.scale is not None:
+                scale = self.scale
+                for _ in range(x.ndim - 1):
+                    scale = scale.unsqueeze(0)
+                x = x * scale
             if self.activation == 'SwooshL':
                 x = SwooshLForward(x)
             elif self.activation == "SwooshR":
                 x = SwooshRForward(x)
             else:
                 assert False, self.activation
-            if self.weight_scale is None:
-                return torch.nn.functional.linear(x, self.weight, self.bias)
-            else:
-                return torch.nn.functional.linear(
-                    x, self.weight * self.weight_scale, self.bias
-                )
+            return torch.nn.functional.linear(x, self.weight, self.bias)
 
-        if self.weight_scale is None:
-            weight_scale = None
+        if self.scale is None:
+            scale = None
         else:
-            weight_scale = limit_param_value(
-                self.weight_scale,
-                min=self.weight_scale_min,
-                max=self.weight_scale_max,
-                prob=self.weight_scale_limit_prob,
+            scale = limit_param_value(
+                self.scale,
+                min=self.scale_min,
+                max=self.scale_max,
+                prob=self.scale_limit_prob,
                 training=self.training,
             )
 
         return ActivationDropoutAndLinearFunction.apply(
-            x, self.weight, self.bias, weight_scale, self.activation,
+            x, self.weight, self.bias, scale, self.activation,
             float(self.dropout_p), self.dropout_shared_dim,
         )
 
@@ -1852,38 +1861,67 @@ def _test_activation_dropout_and_linear():
     in_channels = 20
     out_channels = 30
 
+    class Scale(nn.Module):
+        def __init__(
+            self,
+            channels: int,
+            scale_min: float = 0.2,
+            scale_max: float = 5.0,
+            scale_limit_prob: float = 0.6,
+        ):
+            super().__init__()
+            self.scale_min = scale_min
+            self.scale_max = scale_max
+            self.scale_limit_prob = scale_limit_prob
+            self.scale = nn.Parameter(torch.ones(channels))
+
+        def forward(self, x: Tensor):
+            scale = limit_param_value(
+                self.scale,
+                min=self.scale_min,
+                max=self.scale_max,
+                prob=self.scale_limit_prob,
+                training=self.training,
+            )
+            for _ in range(x.ndim - 1):
+                scale = scale.unsqueeze(0)
+            return x * scale
+
     for bias in [True, False]:
-        for share_weight in [False, True]:
+        for use_scale in [False, True]:
             # actually we don't test for dropout_p != 0.0 because forward functions will give
             # different answers.  This is because we are using the k2 implementation of
             # swoosh_l an swoosh_r inside SwooshL() and SwooshR(), and they call randn()
             # internally, messing up the random state.
             for dropout_p in [0.0]:
                 for activation in ['SwooshL', 'SwooshR']:
-                    linear = ScaledLinear(
-                        in_channels, out_channels, bias=bias, initial_scale=0.5,
-                    )
-                    if share_weight:
-                        linear = SharedWeightLinear(linear, weight_scale_limit_prob=1.0)
-                    m1 =  nn.Sequential(SwooshL() if activation == 'SwooshL' else SwooshR(),
-                                        Dropout3(p=dropout_p, shared_dim=-1),
-                                        linear)
+                    m1 = [SwooshL() if activation == 'SwooshL' else SwooshR(),
+                          Dropout3(p=dropout_p, shared_dim=-1),
+                          ScaledLinear(
+                              in_channels, out_channels, bias=bias, initial_scale=0.5
+                          )]
+                    if use_scale:
+                        m1 = [Scale(in_channels, scale_limit_prob=1.0)] + m1
+                    m1 = nn.Sequential(*m1)
                     m2 = ActivationDropoutAndLinear(in_channels, out_channels,
                                                     bias=bias, initial_scale=0.5,
                                                     activation=activation,
                                                     dropout_p=dropout_p,
-                                                    share_weight=share_weight,
-                                                    weight_scale_limit_prob=1.0)
+                                                    use_scale=use_scale,
+                                                    scale_limit_prob=1.0)
 
-                    if share_weight:
+                    if use_scale:
+                        m1_linear = m1[3]
                         scale = torch.randn(out_channels, 1)
-                        m1[2].weight_scale.value = scale
-                        m2.weight_scale.value = scale
+                        m1[0].scale.value = scale
+                        m2.scale.value = scale
+                    else:
+                        m1_linear = m1[2]
 
                     with torch.no_grad():
-                        m2.weight[:] = m1[2].weight
+                        m2.weight[:] = m1_linear.weight
                         if bias:
-                            m2.bias[:] = m1[2].bias
+                            m2.bias[:] = m1_linear.bias
                     # make sure forward gives same result.
                     x1 = torch.randn(10, in_channels)
                     x1.requires_grad = True
@@ -1908,13 +1946,10 @@ def _test_activation_dropout_and_linear():
                     print("y1 = ", y1)
                     print("y2 = ", y2)
                     assert torch.allclose(y1, y2, atol=0.02)
-                    assert torch.allclose(m1[2].weight.grad, m2.weight.grad,
+                    assert torch.allclose(m1_linear.weight.grad, m2.weight.grad,
                                           atol=1.0e-05)
                     if bias:
-                        assert torch.allclose(m1[2].bias.grad, m2.bias.grad,
-                                              atol=1.0e-05)
-                    if share_weight:
-                        assert torch.allclose(m1[2].weight_scale.grad, m2.weight_scale.grad,
+                        assert torch.allclose(m1_linear.bias.grad, m2.bias.grad,
                                               atol=1.0e-05)
                     print("x1.grad = ", x1.grad)
                     print("x2.grad = ", x2.grad)
@@ -1925,6 +1960,10 @@ def _test_activation_dropout_and_linear():
                     # the SwooshL() implementation has a noisy gradient due to 1-byte
                     # storage of it.
                     assert isclose(x1.grad, x2.grad)
+                    if use_scale:
+                        print("m1[0].scale.grad = ", m1[0].scale.grad)
+                        print("m2.scale.grad = ", m2.scale.grad)
+                        assert isclose(m1[0].scale.grad, m2.scale.grad)
 
 
 if __name__ == "__main__":

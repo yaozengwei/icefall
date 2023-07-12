@@ -39,8 +39,6 @@ from scaling import (
     FloatLike,
     limit_param_value,
     convert_num_channels,
-    SharedWeightConv1d,
-    SharedWeightLinear,
 )
 from torch import Tensor, nn
 
@@ -591,17 +589,17 @@ class Zipformer2EncoderLayer(nn.Module):
         self.feed_forward1 = FeedforwardModule(embed_dim,
                                                feedforward_dim,
                                                dropout,
-                                               share_weight=False)
+                                               use_scale=False)
 
         self.feed_forward2 = FeedforwardModule(embed_dim,
                                                feedforward_dim,
                                                dropout,
-                                               share_weight=share_ff)
+                                               use_scale=share_ff)
 
         self.feed_forward3 = FeedforwardModule(embed_dim,
                                                feedforward_dim,
                                                dropout,
-                                               share_weight=share_ff)
+                                               use_scale=share_ff)
 
         self.nonlin_attention = NonlinAttention(embed_dim,
                                                 hidden_channels=3 * embed_dim // 4)
@@ -609,12 +607,12 @@ class Zipformer2EncoderLayer(nn.Module):
         self.conv_module1 = ConvolutionModule(embed_dim,
                                               cnn_module_kernel,
                                               causal=causal,
-                                              share_weight=False)
+                                              use_scale=False)
 
         self.conv_module2 = ConvolutionModule(embed_dim,
                                               cnn_module_kernel,
                                               causal=causal,
-                                              share_weight=share_conv)
+                                              use_scale=share_conv)
 
         # TODO: remove it
         self.bypass_scale = nn.Parameter(torch.full((embed_dim,), 0.5))
@@ -667,23 +665,27 @@ class Zipformer2EncoderLayer(nn.Module):
 
         if share_ff:
             self.share_ff_weights()
-        if not causal and share_conv:
-            # TODO: will support causal mode
+        if share_conv:
             self.share_conv_weights()
 
     def share_ff_weights(self):
-        in_proj_weight = self.feed_forward1.in_proj.weight
-        self.feed_forward2.in_proj.weight = in_proj_weight
-        self.feed_forward3.in_proj.weight = in_proj_weight
+        in_proj = self.feed_forward1.in_proj
+        self.feed_forward2.in_proj = in_proj
+        self.feed_forward3.in_proj = in_proj
 
         out_proj_weight = self.feed_forward1.out_proj.weight
         self.feed_forward2.out_proj.weight = out_proj_weight
         self.feed_forward3.out_proj.weight = out_proj_weight
 
+        out_proj_bias = self.feed_forward1.out_proj.bias
+        self.feed_forward2.out_proj.bias = out_proj_bias
+        self.feed_forward3.out_proj.bias = out_proj_bias
+
     def share_conv_weights(self):
-        self.conv_module2.in_proj.weight = self.conv_module1.in_proj.weight
-        self.conv_module2.depthwise_conv.weight = self.conv_module1.depthwise_conv.weight
+        self.conv_module2.in_proj = self.conv_module1.in_proj
+        self.conv_module2.depthwise_conv = self.conv_module1.depthwise_conv
         self.conv_module2.out_proj.weight = self.conv_module1.out_proj.weight
+        self.conv_module2.out_proj.bias = self.conv_module1.out_proj.bias
 
     def get_sequence_dropout_mask(self, x: Tensor, dropout_rate: float) -> Optional[Tensor]:
         if dropout_rate == 0.0 or not self.training or torch.jit.is_scripting() or torch.jit.is_tracing():
@@ -1888,15 +1890,10 @@ class FeedforwardModule(nn.Module):
         embed_dim: int,
         feedforward_dim: int,
         dropout: FloatLike,
-        share_weight: bool = False,
+        use_scale: bool = False,
     ):
         super(FeedforwardModule, self).__init__()
         self.in_proj = nn.Linear(embed_dim, feedforward_dim)
-
-        if share_weight:
-            self.in_proj = SharedWeightLinear(
-                self.in_proj, weight_scale_min=0.2, weight_scale_max=5.0
-            )
 
         self.hidden_balancer = Balancer(feedforward_dim,
                                         channel_dim=-1,
@@ -1911,9 +1908,9 @@ class FeedforwardModule(nn.Module):
                                                    dropout_p=dropout,
                                                    dropout_shared_dim=0, bias=True,
                                                    initial_scale=0.1,
-                                                   share_weight=share_weight,
-                                                   weight_scale_min=0.2,
-                                                   weight_scale_max=5.0)
+                                                   use_scale=use_scale,
+                                                   scale_min=0.2,
+                                                   scale_max=5.0)
 
         self.out_whiten = Whiten(num_groups=1,
                                  whitening_limit=_whitening_schedule(7.5),
@@ -2095,7 +2092,7 @@ class ConvolutionModule(nn.Module):
         self,
         channels: int,
         kernel_size: int, causal: bool,
-        share_weight: bool = False,
+        use_scale: bool = False,
     ) -> None:
         """Construct a ConvolutionModule object."""
         super(ConvolutionModule, self).__init__()
@@ -2108,10 +2105,7 @@ class ConvolutionModule(nn.Module):
         self.in_proj = nn.Linear(
             channels, 2 * bottleneck_dim,
         )
-        if share_weight:
-            self.in_proj = SharedWeightLinear(
-                self.in_proj, weight_scale_min=0.2, weight_scale_max=5.0
-            )
+
         # the gradients on in_proj are a little noisy, likely to do with the
         # sigmoid in glu.
 
@@ -2152,11 +2146,6 @@ class ConvolutionModule(nn.Module):
             groups=bottleneck_dim,
             kernel_size=kernel_size,
             padding=kernel_size // 2)
-        if not causal and share_weight:
-            # TODO: support causal mode
-            self.depthwise_conv = SharedWeightConv1d(
-                self.depthwise_conv, weight_scale_min=0.2, weight_scale_max=5.0
-            )
 
         self.balancer2 = Balancer(
             bottleneck_dim, channel_dim=1,
@@ -2174,7 +2163,7 @@ class ConvolutionModule(nn.Module):
         self.out_proj = ActivationDropoutAndLinear(
             bottleneck_dim, channels, activation='SwooshR',
             dropout_p=0.0, initial_scale=0.05,
-            share_weight=share_weight, weight_scale_min=0.2, weight_scale_max=5.0,
+            use_scale=use_scale, scale_min=0.2, scale_max=5.0,
         )
 
     def forward(
