@@ -88,6 +88,7 @@ class Subformer(nn.Module):
             num_heads: Tuple[int, ...] = (8,),
             feedforward_dim: Tuple[int, ...] = (1536,),
             pos_dim: int = 4,
+            num_conv_layers: int = 4,
             dropout: Optional[FloatLike] = None,  # see code below for default
             warmup_batches: float = 4000.0,
 
@@ -193,14 +194,23 @@ class Subformer(nn.Module):
             in_chans=in_chans,
             embed_dim=encoder_dim[0],
         )
-        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = self.patch_embed.patches_resolution
+
+        if num_conv_layers > 0:
+            conv_dim = encoder_dim[0]
+            conv_layer = ConvolutionModule(
+                channels=conv_dim, kernel_size=3
+            )
+            self.conv_encoder = ConvEncoder(
+                conv_layer, num_layers=num_conv_layers, embed_dim=conv_dim
+            )
 
         self.encoder_pos = CompactRelPositionalEncoding(
             embed_dim=64,
             pos_dim=pos_dim,
             dropout_rate=0.15,
-            height=patches_resolution[0],
-            width=patches_resolution[1],
+            height=self.patches_resolution[0],
+            width=self.patches_resolution[1],
         )
 
         max_encoder_dim = max(encoder_dim)
@@ -221,6 +231,12 @@ class Subformer(nn.Module):
               of frames in `embeddings` before padding.
         """
         x = self.patch_embed(x)  # (B, H*W, C)
+
+        if hasattr(self, 'conv_encoder'):
+            B, _, C = x.size()
+            x = x.view(B, self.patches_resolution[0], self.patches_resolution[1], C)
+            x = self.conv_encoder(x)
+            x = x.view(B, -1, C)
 
         pos_emb = self.encoder_pos(x)  # (H*W, H*W, pos_dim)
         pos_embs = [pos_emb.unsqueeze(0).expand(x.size(0), -1, -1, -1)]  # (B, H*W, H*W, pos_dim)
@@ -1742,6 +1758,184 @@ class PatchEmbed(nn.Module):
         x = self.out_balancer(x)
         x = self.norm(x)
         return x
+
+
+class ConvolutionModule(nn.Module):
+    """ConvolutionModule in Zipformer2 model.
+    Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/zipformer/convolution.py
+
+    Args:
+        channels (int): The number of channels of conv layers.
+        kernel_size (int): Kernerl size of conv layers.
+        bias (bool): Whether to use bias in conv layers (default=True).
+
+    """
+    def __init__(self, channels: int, kernel_size: int) -> None:
+        """Construct a ConvolutionModule object."""
+        super(ConvolutionModule, self).__init__()
+        # kernerl_size should be a odd number for 'SAME' padding
+        assert (kernel_size - 1) % 2 == 0
+
+        bottleneck_dim = channels
+
+        self.in_proj = nn.Linear(
+            channels, 2 * bottleneck_dim,
+        )
+        # the gradients on in_proj are a little noisy, likely to do with the
+        # sigmoid in glu.
+
+        # after in_proj we put x through a gated linear unit (nn.functional.glu).
+        # For most layers the normal rms value of channels of x seems to be in the range 1 to 4,
+        # but sometimes, for some reason, for layer 0 the rms ends up being very large,
+        # between 50 and 100 for different channels.  This will cause very peaky and
+        # sparse derivatives for the sigmoid gating function, which will tend to make
+        # the loss function not learn effectively.  (for most layers the average absolute values
+        # are in the range 0.5..9.0, and the average p(x>0), i.e. positive proportion,
+        # at the output of pointwise_conv1.output is around 0.35 to 0.45 for different
+        # layers, which likely breaks down as 0.5 for the "linear" half and
+        # 0.2 to 0.3 for the part that goes into the sigmoid.  The idea is that if we
+        # constrain the rms values to a reasonable range via a constraint of max_abs=10.0,
+        # it will be in a better position to start learning something, i.e. to latch onto
+        # the correct range.
+        self.balancer1 = Balancer(
+            bottleneck_dim, channel_dim=-1,
+            min_positive=ScheduledFloat((0.0, 0.05), (8000.0, 0.025)),
+            max_positive=1.0,
+            min_abs=1.5,
+            max_abs=ScheduledFloat((0.0, 5.0), (8000.0, 10.0), default=1.0),
+        )
+
+        self.activation1 = Identity()  # for diagnostics
+
+        self.sigmoid = nn.Sigmoid()
+
+        self.activation2 = Identity()  # for diagnostics
+
+        assert kernel_size % 2 == 1
+
+        self.depthwise_conv = nn.Conv2d(
+            in_channels=bottleneck_dim,
+            out_channels=bottleneck_dim,
+            groups=bottleneck_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2)
+
+        self.balancer2 = Balancer(
+            bottleneck_dim, channel_dim=1,
+            min_positive=ScheduledFloat((0.0, 0.1), (8000.0, 0.05)),
+            max_positive=1.0,
+            min_abs=ScheduledFloat((0.0, 0.2), (20000.0, 0.5)),
+            max_abs=10.0,
+        )
+
+        self.whiten = Whiten(num_groups=1,
+                             whitening_limit=_whitening_schedule(7.5),
+                             prob=(0.025, 0.25),
+                             grad_scale=0.01)
+
+        self.out_proj = ActivationDropoutAndLinear(
+            bottleneck_dim, channels, activation='SwooshR',
+            dropout_p=0.0, initial_scale=0.05,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute convolution module.
+
+        Args:
+            x: Input tensor (B, H, W, C).
+        Returns:
+            Tensor: Output tensor (B, H, W, C).
+        """
+
+        x = self.in_proj(x)  # (B, H, W, C)
+
+        x, s = x.chunk(2, dim=-1)
+        s = self.balancer1(s)
+        s = self.sigmoid(s)
+        x = self.activation1(x)  # identity.
+        x = x * s
+        x = self.activation2(x)  # identity
+
+        # (B, H, W, C)
+
+        # exchange the spatial dimensions and the feature dimension
+        x = x.permute(0, 3, 1, 2)  # (B, C, H, W).
+
+        x = self.depthwise_conv(x)
+
+        x = self.balancer2(x)
+        x = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+
+        x = self.whiten(x)  # (B, H, W, C)
+        x = self.out_proj(x)  # (B, H, W, C)
+
+        return x
+
+
+class ConvEncoder(nn.Module):
+    r"""ConvEncoder is a stack of N conv_layers
+
+    Args:
+     encoder_layer: an instance of the ConvolutionModule() class (required).
+        num_layers: the number of sub-encoder-layers in the encoder (required).
+
+    Examples::
+        >>> conv = ConvolutionModule(channels=64, kernel_size=3)
+        >>> encoder = ConvEncoder(conv, num_layers=6)
+        >>> src = torch.rand(10, 56, 56, 64)
+        >>> out = encoder(src)
+    """
+    def __init__(
+            self,
+            conv_layer: nn.Module,
+            num_layers: int,
+            embed_dim: int,
+            skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
+    ) -> None:
+        super().__init__()
+
+        self.layers = nn.ModuleList(
+            [copy.deepcopy(conv_layer) for i in range(num_layers)]
+        )
+
+        self.bypass = BypassModule(embed_dim)
+
+        self.skip_rate = copy.deepcopy(skip_rate)
+
+    def get_sample_dropout_mask(self, x: Tensor, dropout_rate: float) -> Optional[Tensor]:
+        if dropout_rate == 0.0 or not self.training or torch.jit.is_scripting():
+            return None
+        batch_size = x.shape[0]
+        mask = (torch.rand(batch_size, 1, 1, 1, device=x.device) > dropout_rate).to(x.dtype)
+        return mask
+
+    def sample_dropout(self, x: Tensor, dropout_rate: float) -> Tensor:
+        """
+        Apply sequence-level dropout to x.
+        x shape: (B, W, H, C)
+        """
+        dropout_mask = self.get_sample_dropout_mask(x, dropout_rate)
+        if dropout_mask is None:
+            return x
+        else:
+            return x * dropout_mask
+
+    def forward(self, src: Tensor) -> Tensor:
+        r"""Pass the input through the conv-layers in turn.
+
+        Args:
+            src: (B, H, W, C).
+
+        Returns: a Tensor with the same shape as src.
+        """
+        src_orig = src
+
+        skip_rate = float(self.skip_rate) if self.training else 0.0
+
+        for i, mod in enumerate(self.layers):
+            src = src + self.sample_dropout(mod(src), skip_rate)
+
+        return self.bypass(src_orig, src)
 
 
 def _test_rel_pos_enc():
