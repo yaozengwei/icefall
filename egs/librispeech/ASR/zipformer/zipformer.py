@@ -65,8 +65,6 @@ class Zipformer2(EncoderInterface):
             now).
         query_head_dim (int or Tuple[int]): dimension of query and key per attention
            head: per stack, if a tuple..
-        pos_head_dim (int or Tuple[int]): dimension of positional-encoding projection per
-           attention head
         value_head_dim (int or Tuple[int]): dimension of value in each attention head
         num_heads: (int or Tuple[int]): number of heads in the self-attention mechanism.
               Must be at least 4.
@@ -74,7 +72,7 @@ class Zipformer2(EncoderInterface):
         cnn_module_kernel (int or Tuple[int])): Kernel size of convolution module
 
         pos_dim (int): the dimension of each positional-encoding vector prior to projection,
-            e.g. 128.
+            e.g. 4.
 
         dropout (float): dropout rate
         warmup_batches (float): number of batches to warm up over; this controls
@@ -99,12 +97,11 @@ class Zipformer2(EncoderInterface):
             num_encoder_layers: Union[int, Tuple[int]] = 4,
             encoder_unmasked_dim: Union[int, Tuple[int]] = 256,
             query_head_dim: Union[int, Tuple[int]]  = 24,
-            pos_head_dim: Union[int, Tuple[int]]  = 4,
             value_head_dim: Union[int, Tuple[int]] = 12,
             num_heads: Union[int, Tuple[int]] = 8,
             feedforward_dim: Union[int, Tuple[int]] = 1536,
             cnn_module_kernel: Union[int, Tuple[int]] = 31,
-            pos_dim: int = 192,
+            pos_dim: int = 4,
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
             causal: bool = False,
@@ -136,7 +133,6 @@ class Zipformer2(EncoderInterface):
         self.num_encoder_layers = num_encoder_layers
         self.query_head_dim = query_head_dim = _to_tuple(query_head_dim)
         self.value_head_dim = value_head_dim = _to_tuple(value_head_dim)
-        pos_head_dim = _to_tuple(pos_head_dim)
         self.num_heads = num_heads = _to_tuple(num_heads)
         feedforward_dim = _to_tuple(feedforward_dim)
         self.cnn_module_kernel = cnn_module_kernel = _to_tuple(cnn_module_kernel)
@@ -159,7 +155,6 @@ class Zipformer2(EncoderInterface):
                 pos_dim=pos_dim,
                 num_heads=num_heads[i],
                 query_head_dim=query_head_dim[i],
-                pos_head_dim=pos_head_dim[i],
                 value_head_dim=value_head_dim[i],
                 feedforward_dim=feedforward_dim[i],
                 dropout=dropout,
@@ -522,7 +517,7 @@ class Zipformer2EncoderLayer(nn.Module):
     Examples::
         >>> encoder_layer = Zipformer2EncoderLayer(embed_dim=512, nhead=8)
         >>> src = torch.rand(10, 32, 512)
-        >>> pos_emb = torch.rand(32, 19, 512)
+        >>> pos_emb = torch.rand(32, 19, 19, 512)
         >>> out = encoder_layer(src, pos_emb)
     """
     def __init__(
@@ -531,7 +526,6 @@ class Zipformer2EncoderLayer(nn.Module):
             pos_dim: int,
             num_heads: int,
             query_head_dim: int,
-            pos_head_dim: int,
             value_head_dim: int,
             feedforward_dim: int,
             dropout: FloatLike = 0.1,
@@ -568,8 +562,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.self_attn_weights = RelPositionMultiheadAttentionWeights(
             embed_dim, pos_dim=pos_dim, num_heads=num_heads,
-            query_head_dim=query_head_dim, pos_head_dim=pos_head_dim,
-            dropout=0.0,
+            query_head_dim=query_head_dim, dropout=0.0,
         )
 
         self.self_attn1 = SelfAttention(embed_dim, num_heads,
@@ -600,9 +593,6 @@ class Zipformer2EncoderLayer(nn.Module):
         self.conv_module2 = ConvolutionModule(embed_dim,
                                               cnn_module_kernel,
                                               causal=causal)
-
-        # TODO: remove it
-        self.bypass_scale = nn.Parameter(torch.full((embed_dim,), 0.5))
 
         self.norm = BiasNorm(embed_dim)
 
@@ -680,7 +670,8 @@ class Zipformer2EncoderLayer(nn.Module):
         Pass the input through the encoder layer.
         Args:
             src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
-         pos_emb: (1, 2*seq_len-1, pos_emb_dim) or (batch_size, 2*seq_len-1, pos_emb_dim)
+         pos_emb: (batch_size, seq_len, seq_len, pos_dim), with e.g. pos_dim=4: relatie positional
+               embedding tensor.
          chunk_size: the number of frames per chunk, of >= 0; if -1, no chunking.
        feature_mask: something that broadcasts with src, that we'll multiply `src`
               by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
@@ -780,6 +771,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         return src
 
+    # TODO: modify pos_emb for streaming inference
     def streaming_forward(
         self,
         src: Tensor,
@@ -924,7 +916,8 @@ class Zipformer2Encoder(nn.Module):
             final_layerdrop_rate: float = 0.05,
     ) -> None:
         super().__init__()
-        self.encoder_pos = CompactRelPositionalEncoding(pos_dim, dropout_rate=0.15,
+        self.encoder_pos = CompactRelPositionalEncoding(64, pos_dim,
+                                                        dropout_rate=0.15,
                                                         length_factor=1.0)
 
         self.layers = nn.ModuleList(
@@ -1292,14 +1285,18 @@ class CompactRelPositionalEncoding(torch.nn.Module):
 
 
     Args:
-        embed_dim: Embedding dimension.
+        embed_dim: Temporary embedding dimension used inside this module
+         pos_dim: Smaller positional-encoding dim used after a projecction.
         dropout_rate: Dropout rate.
         max_len: Maximum input length: just a heuristic for initialization.
         length_factor: a heuristic scale (should be >= 1.0) which, if larger, gives
            less weight to small differences of offset near the origin.
+        pos_dim: dimension at the output of this module.
     """
     def __init__(
-        self, embed_dim: int,
+            self,
+            embed_dim: int,
+            pos_dim: int,
             dropout_rate: FloatLike,
             max_len: int = 1000,
             length_factor: float = 1.0,
@@ -1314,17 +1311,26 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         self.length_factor = length_factor
         self.extend_pe(torch.tensor(0.0).expand(max_len))
 
-    def extend_pe(self, x: Tensor, left_context_len: int = 0) -> None:
-        """Reset the positional encodings."""
-        T = x.size(0) + left_context_len
+        # linear transformation for positional encoding.
+        self.linear_pos = ScaledLinear(embed_dim,
+                                       pos_dim,
+                                       bias=False,
+                                       initial_scale=0.05)
 
+    def extend_pe(self, x: Tensor) -> None:
+        """Reset the positional encodings."""
         if self.pe is not None:
             # self.pe contains both positive and negative parts
             # the length of self.pe is 2 * input_len - 1
-            if self.pe.size(0) >= T * 2 - 1:
-                self.pe = self.pe.to(dtype=x.dtype, device=x.device)
+            if self.pe.size(0) >= x.size(0) * 2 - 1:
+                # Note: TorchScript doesn't implement operator== for torch.Device
+                if self.pe.dtype != x.dtype or str(self.pe.device) != str(
+                    x.device
+                ):
+                    self.pe = self.pe.to(dtype=x.dtype, device=x.device)
                 return
 
+        T = x.size(0)
         # if T == 4, x would contain [ -3, -2, 1, 0, 1, 2, 3 ]
         x = torch.arange(-(T-1), T,
                          device=x.device).to(torch.float32).unsqueeze(1)
@@ -1349,7 +1355,7 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         # note for machine implementations: if atan is not available, we can use:
         #   x.sign() * ((1 / (x.abs() + 1)) - 1)  * (-math.pi/2)
         #  check on wolframalpha.com: plot(sign(x) *  (1 / ( abs(x) + 1) - 1 ) * -pi/2 , atan(x))
-        x_atan = (x_compressed / length_scale).atan()  # results between -pi and pi
+        x_atan = (x_compressed / length_scale).atan() # results between -pi and pi
 
         cosines = (x_atan * freqs).cos()
         sines = (x_atan * freqs).sin()
@@ -1361,29 +1367,43 @@ class CompactRelPositionalEncoding(torch.nn.Module):
 
         self.pe = pe.to(dtype=x.dtype)
 
-    def forward(self, x: Tensor, left_context_len: int = 0) -> Tensor:
+    def forward(self, x: torch.Tensor) -> Tensor:
         """Create positional encoding.
 
         Args:
-            x (Tensor): Input tensor (time, batch, `*`).
-            left_context_len: (int): Length of cached left context.
+            x (torch.Tensor): Input tensor (seq_len, batch_size, num_channels_in)
 
         Returns:
-            positional embedding, of shape (batch, left_context_len + 2*time-1, `*`).
+            positional embedding, of shape (batch_size, seq_len, seq_len, pos_dim).
         """
-        self.extend_pe(x, left_context_len)
-        x_size_left = x.size(0) + left_context_len
-        # length of positive side: x.size(0) + left_context_len
-        # length of negative side: x.size(0)
+        self.extend_pe(x)
+        seq_len = x.size(0)
         pos_emb = self.pe[
-            self.pe.size(0) // 2
-            - x_size_left
-            + 1 : self.pe.size(0) // 2  # noqa E203
-            + x.size(0),
+            self.pe.size(0) // 2 - seq_len + 1 : self.pe.size(0) // 2 + seq_len,
             :
         ]
         pos_emb = pos_emb.unsqueeze(0)
-        return self.dropout(pos_emb)
+        pos_emb = self.dropout(pos_emb)
+        pos_emb = self.linear_pos(pos_emb)
+
+        # currenly pos_emb: (1, 2*seq_len-1, pos_dim)
+        pos_dim = pos_emb.shape[-1]
+        batch_size = x.size(1)
+        # it doesn't really matter which one we make positive and which negative here, it
+        # would just flip the meaning of the embedding.
+
+        # expand the '1' dimension to seq_len; this introduces a dimension that
+        # 'does nothing', just creates copies, as a workaround for lack of torch support
+        # for negative strides.
+        pos_emb = pos_emb.expand(seq_len, 2*seq_len-1, pos_dim).contiguous()
+
+        (useless_stride, seq_stride, channel_stride) = pos_emb.stride()
+
+        pos_emb = pos_emb.as_strided((batch_size, seq_len, seq_len, pos_dim),
+                                     (0, useless_stride-seq_stride, seq_stride, channel_stride),
+                                     storage_offset=seq_stride * (seq_len - 1))
+
+        return pos_emb  # (batch_size, seq_len, seq_len, pos_dim)
 
 
 class RelPositionMultiheadAttentionWeights(nn.Module):
@@ -1397,10 +1417,9 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
     Args:
            embed_dim: number of channels at the input to this module, e.g. 256
-             pos_dim: dimension of the positional encoding vectors, e.g. 128.
+           pos_dim: dimension of the projected positional encoding, e.g. 4.
            num_heads:  number of heads to compute weights for, e.g. 8
      query_head_dim: dimension of the query (and key), per head.  e.g. 24.
-       pos_head_dim: dimension of the projected positional encoding per head, e.g. 4.
             dropout: dropout probability for attn_output_weights. Default: 0.0.
        pos_emb_skip_rate: probability for skipping the pos_emb part of the scores on
                      any given call to forward(), in training time.
@@ -1412,7 +1431,6 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             pos_dim: int,
             num_heads: int,
             query_head_dim: int,
-            pos_head_dim: int,
             dropout: float = 0.0,
             pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
                                                           (4000.0, 0.0))
@@ -1420,14 +1438,14 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.pos_dim = pos_dim
         self.query_head_dim = query_head_dim
-        self.pos_head_dim = pos_head_dim
         self.dropout = dropout
         self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
         self.name = None  # will be overwritten in training code; for diagnostics.
 
         key_head_dim = query_head_dim
-        in_proj_dim = (query_head_dim + key_head_dim + pos_head_dim) * num_heads
+        in_proj_dim = (query_head_dim + key_head_dim + pos_dim) * num_heads
 
         # the initial_scale is supposed to take over the "scaling" factor of
         # head_dim ** -0.5 that has been used in previous forms of attention,
@@ -1458,12 +1476,6 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
                                      max_abs=100.0,
                                      prob=0.025)
 
-        # linear transformation for positional encoding.
-        self.linear_pos = ScaledLinear(pos_dim,
-                                       num_heads * pos_head_dim,
-                                       bias=False,
-                                       initial_scale=0.05)
-
         # the following are for diagnosics only, see --print-diagnostics option
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
@@ -1478,7 +1490,8 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         r"""
         Args:
             x: input of shape (seq_len, batch_size, embed_dim)
-            pos_emb: Positional embedding tensor, of shape (1, 2*seq_len - 1, pos_dim)
+            pos_emb: a Tensor of shape broadcasting with (batch_size, seq_len, seq_len, pos_dim)
+               (e.g. pos_dim=4), encoding relative positions.
             key_padding_mask: a bool tensor of shape (batch_size, seq_len).  Positions that
                are True in this mask will be ignored as sources in the attention weighting.
             attn_mask: mask of shape (seq_len, seq_len) or (batch_size, seq_len, seq_len),
@@ -1490,7 +1503,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         """
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
+        pos_dim = self.pos_dim
         num_heads = self.num_heads
 
         seq_len, batch_size, _ = x.shape
@@ -1502,19 +1515,18 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = x[...,query_dim:2*query_dim]
         # p is the position-encoding query
         p = x[...,2*query_dim:]
-        assert p.shape[-1] == num_heads * pos_head_dim
+        assert p.shape[-1] == num_heads * pos_dim
 
         q = self.copy_query(q)  # for diagnostics only, does nothing.
         k = self.whiten_keys(self.balance_keys(k))  # does nothing in the forward pass.
         p = self.copy_pos_query(p)  # for diagnostics only, does nothing.
 
         q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
-        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
+        p = p.reshape(seq_len, batch_size, num_heads, pos_dim)
         k = k.reshape(seq_len, batch_size, num_heads, query_head_dim)
 
         # time1 refers to target, time2 refers to source.
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
-        p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
         k = k.permute(2, 1, 3, 0)  # (head, batch, d_k, time2)
 
         attn_scores = torch.matmul(q, k)
@@ -1527,34 +1539,13 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             use_pos_scores = True
 
         if use_pos_scores:
-            pos_emb = self.linear_pos(pos_emb)
-            seq_len2 = 2 * seq_len - 1
-            pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 3, 1)
-            # pos shape now: (head, {1 or batch_size}, pos_dim, seq_len2)
+            #                   pos_emb: (batch_size, tgt_seq_len, src_seq_len, pos_dim)
+            p = p.permute(1, 0, 3, 2)  # (batch_size, tgt_seq_len, pos_dim, num_heads)
 
-            # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
-            #  [where seq_len2 represents relative position.]
-            pos_scores = torch.matmul(p, pos_emb)
-            # the following .as_strided() expression converts the last axis of pos_scores from relative
-            # to absolute position.  I don't know whether I might have got the time-offsets backwards or
-            # not, but let this code define which way round it is supposed to be.
-            if torch.jit.is_tracing():
-                (num_heads, batch_size, time1, n) = pos_scores.shape
-                rows = torch.arange(start=time1 - 1, end=-1, step=-1)
-                cols = torch.arange(seq_len)
-                rows = rows.repeat(batch_size * num_heads).unsqueeze(-1)
-                indexes = rows + cols
-                pos_scores = pos_scores.reshape(-1, n)
-                pos_scores = torch.gather(pos_scores, dim=1, index=indexes)
-                pos_scores = pos_scores.reshape(num_heads, batch_size, time1, seq_len)
-            else:
-                pos_scores = pos_scores.as_strided((num_heads, batch_size, seq_len, seq_len),
-                                                   (pos_scores.stride(0),
-                                                    pos_scores.stride(1),
-                                                    pos_scores.stride(2)-pos_scores.stride(3),
-                                                    pos_scores.stride(3)),
-                                                   storage_offset=pos_scores.stride(3) * (seq_len - 1))
-
+            pos_scores = torch.matmul(pos_emb, p)
+            # pos_scores: (batch_size, tgt_seq_len, src_seq_len, num_heads)
+            pos_scores = pos_scores.permute(3, 0, 1, 2)
+            # pos_scores: (num_heads, batch_size, tgt_seq_len, src_seq_len)
             attn_scores = attn_scores + pos_scores
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
@@ -1678,7 +1669,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         # (head, batch, time1, pos_dim) x (head, 1, pos_dim, seq_len2) -> (head, batch, time1, seq_len2)
         #  [where seq_len2 represents relative position.]
         pos_scores = torch.matmul(p, pos_emb)
-        
+
         if torch.jit.is_tracing():
             (num_heads, batch_size, time1, n) = pos_scores.shape
             rows = torch.arange(start=time1 - 1, end=-1, step=-1)

@@ -174,16 +174,9 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--pos-head-dim",
-        type=str,
-        default="4",
-        help="Positional-encoding dimension per head in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
         "--pos-dim",
         type=int,
-        default="48",
+        default="4",
         help="Positional-encoding embedding dimension",
     )
 
@@ -568,7 +561,6 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         encoder_dim=_to_int_tuple(params.encoder_dim),
         encoder_unmasked_dim=_to_int_tuple(params.encoder_unmasked_dim),
         query_head_dim=_to_int_tuple(params.query_head_dim),
-        pos_head_dim=_to_int_tuple(params.pos_head_dim),
         value_head_dim=_to_int_tuple(params.value_head_dim),
         pos_dim=params.pos_dim,
         num_heads=_to_int_tuple(params.num_heads),
