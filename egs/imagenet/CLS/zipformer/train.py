@@ -55,7 +55,8 @@ from icefall.utils import (
     str2bool,
     get_parameter_groups_with_lrs,
 )
-from swin_transformer import SwinTransformer
+from scaling import ScheduledFloat
+from zipformer import Zipformer2
 
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
@@ -87,87 +88,82 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--embed-dim",
-        type=int,
-        default=96,
-        help="Patch embedding dimension. Default: 96",
+        "--num-encoder-layers",
+        type=str,
+        default="2,2,3,4,3,2",
+        help="Number of zipformer encoder layers per stack, comma separated.",
     )
 
     parser.add_argument(
-        "--depths",
+        "--downsampling-factor",
         type=str,
-        default="2,2,6,2",
-        help="Depth of each Swin Transformer layer.",
+        default="1,2,4,8,4,2",
+        help="Downsampling factor for each stack of encoder layers.",
+    )
+
+    parser.add_argument(
+        "--encoder-dim",
+        type=str,
+        default="64,128,256,512,256,128",
+        help="Embedding dimension in encoder stacks: a single int or comma-separated list.",
+    )
+
+    parser.add_argument(
+        "--encoder-unmasked-dim",
+        type=str,
+        default="64,128,192,256,192,128",
+        help="Unmasked dimensions in the encoders, relates to augmentation during training.  "
+        "A single int or comma-separated list.  Must be <= each corresponding encoder_dim.",
+    )
+
+    parser.add_argument(
+        "--block-size",
+        type=str,
+        default="7,7,7,7,7,7",
+        help="Block size in attention modules, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--select-topk",
+        type=str,
+        default="25,25,25,0,25,25",
+        help="Number of tokens outside block to be selected, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--feedforward-dim",
+        type=str,
+        default="192,384,768,1536,768,384",
+        help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--cnn-module-kernel",
+        type=str,
+        default="5,5,3,3,3,5",
+        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
+        "a single int or comma-separated list.",
     )
 
     parser.add_argument(
         "--num-heads",
         type=str,
-        default="3,6,12,24",
-        help="Number of attention heads in different layers.",
+        default="2,4,4,8,4,4",
+        help="Number of attention heads in the zipformer encoder layers: a single int or comma-separated list.",
     )
 
     parser.add_argument(
-        "--window-size",
-        type=int,
-        default=7,
-        help="Window size. Default: 7",
+        "--query-head-dim",
+        type=str,
+        default="32",
+        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list.",
     )
 
     parser.add_argument(
-        "--mlp-ratio",
-        type=float,
-        default=4.0,
-        help="Ratio of mlp hidden dim to embedding dim. Default: 4",
-    )
-
-    parser.add_argument(
-        "--qkv-bias",
-        type=str2bool,
-        default=True,
-        help="If True, add a learnable bias to query, key, value. Default: True",
-    )
-
-    parser.add_argument(
-        "--qk-scale",
-        type=float,
-        default=None,
-        help="Override default qk scale of head_dim ** -0.5 if set. Default: None",
-    )
-
-    parser.add_argument(
-        "--ape",
-        type=str2bool,
-        default=False,
-        help="If True, add absolute position embedding to the patch embedding. Default: False",
-    )
-
-    parser.add_argument(
-        "--patch-norm",
-        type=str2bool,
-        default=True,
-        help="If True, add normalization after patch embedding. Default: True",
-    )
-
-    parser.add_argument(
-        "--drop-rate",
-        type=float,
-        default=0.0,
-        help="Dropout rate",
-    )
-
-    parser.add_argument(
-        "--drop-path-rate",
-        type=float,
-        default=0.1,
-        help="Drop path rate",
-    )
-
-    parser.add_argument(
-        "--fused-window-process",
-        type=str2bool,
-        default=False,
-        help="If True, use one kernel to fused window shift & window partition for acceleration, similar for the reversed part. Default: False",
+        "--value-head-dim",
+        type=str,
+        default="12",
+        help="Value dimension per head in encoder stacks: a single int or comma-separated list.",
     )
 
 
@@ -730,23 +726,24 @@ def _to_int_tuple(s: str):
 
 
 def get_model(params):
-    model = SwinTransformer(
+    model = Zipformer2(
         img_size=params.img_size,
         patch_size=params.patch_size,
         in_chans=params.in_chans,
         num_classes=params.num_classes,
-        embed_dim=params.embed_dim,
-        depths=_to_int_tuple(params.depths),
+        downsampling_factor=_to_int_tuple(params.downsampling_factor),
+        encoder_dim=_to_int_tuple(params.encoder_dim),
+        num_encoder_layers=_to_int_tuple(params.num_encoder_layers),
+        encoder_unmasked_dim=_to_int_tuple(params.encoder_unmasked_dim),
+        query_head_dim=_to_int_tuple(params.query_head_dim),
+        value_head_dim=_to_int_tuple(params.value_head_dim),
         num_heads=_to_int_tuple(params.num_heads),
-        window_size=params.window_size,
-        mlp_ratio=params.mlp_ratio,
-        qkv_bias=params.qkv_bias,
-        qk_scale=params.qk_scale,
-        drop_rate=params.drop_rate,
-        drop_path_rate=params.drop_path_rate,
-        ape=params.ape,
-        patch_norm=params.patch_norm,
-        fused_window_process=params.fused_window_process,
+        feedforward_dim=_to_int_tuple(params.feedforward_dim),
+        cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
+        block_size=_to_int_tuple(params.block_size),
+        select_topk=_to_int_tuple(params.select_topk),
+        dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+        warmup_batches=4000.0,
     )
     return model
 
