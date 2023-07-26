@@ -76,11 +76,12 @@ class Subformer(nn.Module):
     def __init__(
             self,
             img_size: int = 224,
-            patch_size: int = 16,
+            patch_size: int = 4,
             in_chans: int = 3,
             num_classes: int = 1000,
             structure: str = "S(S)S",
-            encoder_dim: Tuple[int, ...] = (384, 512, 384),
+            embed_dim: int = 64,
+            encoder_dim: Tuple[int, ...] = (256, 384, 256),
             downsampling_factor: Tuple[int, ...] = (2,),
             num_encoder_layers: Union[int, Tuple[int, ...]] = (4,),
             query_head_dim: Tuple[int, ...]  = (24,),
@@ -88,7 +89,7 @@ class Subformer(nn.Module):
             num_heads: Tuple[int, ...] = (8,),
             feedforward_dim: Tuple[int, ...] = (1536,),
             pos_dim: int = 4,
-            num_conv_layers: int = 4,
+            num_conv_layers: Tuple[int, ...] = (4, 4),
             dropout: Optional[FloatLike] = None,  # see code below for default
             warmup_batches: float = 4000.0,
 
@@ -121,6 +122,40 @@ class Subformer(nn.Module):
         value_head_dim = _to_tuple(value_head_dim)
         num_heads = _to_tuple(num_heads)
         feedforward_dim = _to_tuple(feedforward_dim)
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+        self.patches_resolution = self.patch_embed.patches_resolution
+
+        conv_encoders = []
+        for num in num_conv_layers:
+            conv_layer = ConvolutionModule(
+                channels=embed_dim, kernel_size=3
+            )
+            # TODO: add layer warmup
+            conv_encoders.append(ConvEncoder(
+                conv_layer, num_layers=num, embed_dim=embed_dim, use_patch_merging=True,
+            ))
+            embed_dim *= 2
+            self.patches_resolution = (self.patches_resolution[0] // 2,
+                                       self.patches_resolution[1] // 2)
+
+        assert embed_dim == encoder_dim[0], (embed_dim, encoder_dim[0])
+
+        self.conv_encoders = nn.ModuleList(conv_encoders)
+
+        self.encoder_pos = CompactRelPositionalEncoding(
+            embed_dim=64,
+            pos_dim=pos_dim,
+            dropout_rate=0.15,
+            height=self.patches_resolution[0],
+            width=self.patches_resolution[1],
+        )
 
         if len(downsampling_factor) == 1:
             downsampling_factor = downsampling_factor * num_downsamplers
@@ -187,32 +222,6 @@ class Subformer(nn.Module):
         self.downsamplers = nn.ModuleList(downsamplers)
         self.bypasses = nn.ModuleList(bypasses)
 
-        # split image into non-overlapping patches
-        self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=encoder_dim[0],
-        )
-        self.patches_resolution = self.patch_embed.patches_resolution
-
-        if num_conv_layers > 0:
-            conv_dim = encoder_dim[0]
-            conv_layer = ConvolutionModule(
-                channels=conv_dim, kernel_size=3
-            )
-            self.conv_encoder = ConvEncoder(
-                conv_layer, num_layers=num_conv_layers, embed_dim=conv_dim
-            )
-
-        self.encoder_pos = CompactRelPositionalEncoding(
-            embed_dim=64,
-            pos_dim=pos_dim,
-            dropout_rate=0.15,
-            height=self.patches_resolution[0],
-            width=self.patches_resolution[1],
-        )
-
         max_encoder_dim = max(encoder_dim)
         self.norm = BiasNorm(max_encoder_dim)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
@@ -230,17 +239,16 @@ class Subformer(nn.Module):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-        x = self.patch_embed(x)  # (B, H*W, C)
+        x = self.patch_embed(x)  # (B, H, W, C)
 
-        if hasattr(self, 'conv_encoder'):
-            B, _, C = x.size()
-            x = x.view(B, self.patches_resolution[0], self.patches_resolution[1], C)
-            x = self.conv_encoder(x)
-            x = x.view(B, -1, C)
+        if hasattr(self, 'conv_encoders'):
+            for conv_encoder in self.conv_encoders:
+                x = conv_encoder(x)
 
         pos_emb = self.encoder_pos(x)  # (H*W, H*W, pos_dim)
         pos_embs = [pos_emb.unsqueeze(0).expand(x.size(0), -1, -1, -1)]  # (B, H*W, H*W, pos_dim)
 
+        x = x.view(x.size(0), -1, x.size(-1))  # (B, H*W, C)
         x = x.permute(1, 0, 2)  # (B, H*W, C) -> (H*W, B, C)
 
         downsample_info = []
@@ -1754,7 +1762,7 @@ class PatchEmbed(nn.Module):
         # FIXME look at relaxing size constraints
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
+        x = self.proj(x).permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
         x = self.out_balancer(x)
         x = self.norm(x)
         return x
@@ -1770,7 +1778,7 @@ class ConvolutionModule(nn.Module):
         bias (bool): Whether to use bias in conv layers (default=True).
 
     """
-    def __init__(self, channels: int, kernel_size: int) -> None:
+    def __init__(self, channels: int = 64, kernel_size: int = 3) -> None:
         """Construct a ConvolutionModule object."""
         super(ConvolutionModule, self).__init__()
         # kernerl_size should be a odd number for 'SAME' padding
@@ -1890,6 +1898,7 @@ class ConvEncoder(nn.Module):
             conv_layer: nn.Module,
             num_layers: int,
             embed_dim: int,
+            use_patch_merging: bool = True,
             skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
     ) -> None:
         super().__init__()
@@ -1899,6 +1908,9 @@ class ConvEncoder(nn.Module):
         )
 
         self.bypass = BypassModule(embed_dim)
+
+        if use_patch_merging:
+            self.patch_merging = PatchMerging(embed_dim)
 
         self.skip_rate = copy.deepcopy(skip_rate)
 
@@ -1935,7 +1947,52 @@ class ConvEncoder(nn.Module):
         for i, mod in enumerate(self.layers):
             src = src + self.sample_dropout(mod(src), skip_rate)
 
-        return self.bypass(src_orig, src)
+        src = self.bypass(src_orig, src)
+
+        if hasattr(self, "patch_merging"):
+            src = self.patch_merging(src)
+
+        return src
+
+
+class PatchMerging(nn.Module):
+    r""" Patch Merging Layer.
+
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.balancer = Balancer(
+            dim * 2, channel_dim=-1,
+            min_positive=0.45, max_positive=0.55,
+            min_abs=0.2, max_abs=4.0,
+        )
+        self.norm = BiasNorm(dim * 2, channel_dim=-1)
+
+    def forward(self, x):
+        """
+        x: B, H, W, C
+        """
+        B, H, W, C = x.shape
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+
+        x = self.reduction(x)  # (B, H/2, W/2, 2*C)
+        x = self.balancer(x)
+        x = self.norm(x)
+
+        return x
 
 
 def _test_rel_pos_enc():
@@ -1955,7 +2012,7 @@ def _test_rel_pos_enc():
 
 
 def _test_subformer():
-    model = Subformer(num_classes=10)
+    model = Subformer(num_classes=10, )
 
     for i in range(2):
         x = torch.randn(2, 3, 224, 224)
