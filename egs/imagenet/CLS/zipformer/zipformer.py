@@ -691,7 +691,7 @@ class Zipformer2Encoder(nn.Module):
         src = self.linear_k(src)
         src = src.view(batch, -1, src.size(-1)).transpose(1, 2)   # (batch, channel, height*width)
 
-        # inner product
+        # pair-wise inner product between block embeddings and all tokens
         scores = torch.matmul(block_emb, src)  # (batch, num_block_tot, height*width)
 
         scores = self.score_balancer(scores.unsqueeze(-1)).squeeze(-1)
@@ -716,14 +716,14 @@ class Zipformer2Encoder(nn.Module):
         # (batch, num_block_tot, topk, topk*2)
         diffs = sscores[..., :topk].unsqueeze(-1) - sscores[..., :topk * 2].unsqueeze(2)
 
-        diffs_rms = (diffs ** 2).mean(dim=(1, 2, 3), keepdim=True).sqrt()
-        # diffs_rms: (batch, 1, 1, 1)
+        diffs_rms = (diffs ** 2).mean().sqrt()
         diffs = diffs * (alpha / (diffs_rms + eps))
         # (batch, num_block_tot, topk)
         weights = (diffs.sigmoid().sum(-1) - topk).tanh()
 
         if random.random() < 0.01 or __name__ == "__main__":
-            logging.info(f"{self.name}, mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
+            logging.info(f"{self.name}, diffs_rms: {diffs_rms.item()}")
+            logging.info(f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
 
         # (batch, num_block_tot, topk)
         indexes = indexes[..., :topk]
