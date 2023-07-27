@@ -34,6 +34,7 @@ from scaling import (
     FloatLike,
     limit_param_value,
     convert_num_channels,
+    Dropout2,
 )
 from torch import Tensor, nn
 
@@ -165,8 +166,9 @@ class Zipformer2(nn.Module):
             # For the segment of the warmup period, we let the Conv2dSubsampling
             # layer learn something.  Then we start to warm up the other encoders.
             encoder = Zipformer2Encoder(
-                encoder_layer,
-                num_encoder_layers[i],
+                resolution=(cur_img_size, cur_img_size),
+                encoder_layer=encoder_layer,
+                num_layers=num_encoder_layers[i],
                 block_size=block_size[i],
                 select_topk=select_topk[i],
                 dropout=dropout,
@@ -574,6 +576,7 @@ class Zipformer2Encoder(nn.Module):
     """
     def __init__(
             self,
+            resolution: Tuple[int],
             encoder_layer: nn.Module,
             num_layers: int,
             dropout: float,
@@ -581,6 +584,7 @@ class Zipformer2Encoder(nn.Module):
             warmup_end: float,
             block_size: int = 4,
             select_topk: int = 16,
+            select_dim: int = 64,
             initial_layerdrop_rate: float = 0.5,
             final_layerdrop_rate: float = 0.05,
     ) -> None:
@@ -588,12 +592,15 @@ class Zipformer2Encoder(nn.Module):
 
         self.name = None
 
+        self.resolution = resolution
+
         self.block_size = block_size
         self.select_topk = select_topk
 
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
+        self.embed_dim = encoder_layer.embed_dim
         self.num_layers = num_layers
 
         assert 0 <= warmup_begin <= warmup_end
@@ -607,10 +614,12 @@ class Zipformer2Encoder(nn.Module):
                                                              default=0.0)
             cur_begin = cur_end
 
+        self.pos_embed = nn.Parameter(torch.randn(1, *resolution, self.embed_dim) * .02)
+        self.pos_dropout = Dropout2(p=0.1)
+
         if select_topk > 0:
-            embed_dim = encoder_layer.embed_dim
-            self.linear_q = nn.Linear(embed_dim, 64)
-            self.linear_k = nn.Linear(embed_dim, 64)
+            self.linear_q = nn.Linear(self.embed_dim, select_dim)
+            self.linear_k = nn.Linear(self.embed_dim, select_dim)
             self.score_balancer = Balancer(1, channel_dim=-1, min_abs=1.0)
 
     def forward(
@@ -634,6 +643,11 @@ class Zipformer2Encoder(nn.Module):
         Returns: a Tensor with the same shape as src.
         """
         batch, height, width, channel = src.size()
+
+        assert (height, width) == self.resolution
+
+        # apply absolute positional embedding
+        src = self.pos_dropout(src + self.pos_embed)
 
         block_size = self.block_size
         select_topk = self.select_topk
