@@ -647,7 +647,7 @@ class Zipformer2Encoder(nn.Module):
         assert (height, width) == self.resolution
 
         # apply absolute positional embedding
-        src = self.pos_dropout(src + self.pos_embed)
+        src = src + self.pos_dropout(self.pos_embed)
 
         block_size = self.block_size
         select_topk = self.select_topk
