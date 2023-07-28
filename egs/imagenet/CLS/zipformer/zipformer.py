@@ -620,7 +620,7 @@ class Zipformer2Encoder(nn.Module):
         if select_topk > 0:
             self.linear_q = nn.Linear(self.embed_dim, select_dim)
             self.linear_k = nn.Linear(self.embed_dim, select_dim)
-            self.score_balancer = Balancer(1, channel_dim=-1, min_abs=1.0)
+            self.score_balancer = Balancer(1, channel_dim=-1, min_abs=1.0, max_abs=10.0)
 
     def forward(
         self,
@@ -730,13 +730,14 @@ class Zipformer2Encoder(nn.Module):
         # (batch, num_block_tot, topk, topk*2)
         diffs = sscores[..., :topk].unsqueeze(-1) - sscores[..., :topk * 2].unsqueeze(2)
 
-        diffs_rms = (diffs ** 2).mean().sqrt()
-        diffs = diffs * (alpha / (diffs_rms + eps))
+        # diffs_rms = (diffs ** 2).mean().sqrt()
+        # diffs = diffs * (alpha / (diffs_rms + eps))
         # (batch, num_block_tot, topk)
         weights = (diffs.sigmoid().sum(-1) - topk).tanh()
 
         if random.random() < 0.01 or __name__ == "__main__":
-            logging.info(f"{self.name}, diffs_rms: {diffs_rms.item()}")
+            # logging.info(f"{self.name}, diffs_rms: {diffs_rms.item()}")
+            logging.info(f"{self.name}, diffs: min-abs-diffs={diffs.abs().min()}, max-abs-diffs={diffs.abs().max()}")
             logging.info(f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
 
         # (batch, num_block_tot, topk)
