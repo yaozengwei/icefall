@@ -104,7 +104,7 @@ class Zipformer2(nn.Module):
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
             shift_block: bool = True,
-            dilate_block: bool = True,
+            dilate_block: bool = False,
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
     ) -> None:
@@ -614,9 +614,6 @@ class Zipformer2Encoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, *resolution, self.embed_dim) * .02)
         self.pos_dropout = Dropout2(p=0.1)
 
-        # Currently, we only suport one type
-        assert not (shift_block and dilate_block), (shift_block, dilate_block)
-
         if shift_block:
             shifted_indexes = self.generate_shifted_indexes()
         else:
@@ -677,13 +674,20 @@ class Zipformer2Encoder(nn.Module):
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             output = output * feature_mask
 
-        reordered_indexes = self.shifted_indexes if self.shifted_indexes is not None else self.dilated_indexes
+        reordered_indexes_list = [None]
+        # reordered_indexes = self.shifted_indexes if self.shifted_indexes is not None else self.dilated_indexes
+        if self.shifted_indexes is not None:
+            reordered_indexes_list.append(self.shifted_indexes)
+        if self.dilated_indexes is not None:
+            reordered_indexes_list.append(self.dilated_indexes)
 
+        num_types = len(reordered_indexes_list)
+        # assert self.num_layers >= num_types
         for i, mod in enumerate(self.layers):
             # shift blocks between successive layers
             output = mod(
                 output,
-                reordered_indexes=reordered_indexes if i % 2 != 0 else None,
+                reordered_indexes=reordered_indexes_list[i % num_types],
             )
 
             if not torch.jit.is_scripting() and not torch.jit.is_tracing():
@@ -1493,7 +1497,7 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
         encoder_dim=(64,128,256,512),
         encoder_unmasked_dim=(64,128,192,256),
         downsampling_factor=(1,2,4,8),
-        num_encoder_layers=(2,2,2,2),
+        num_encoder_layers=(3,3,3,3),
         feedforward_dim=(192,384,768,1536),
         num_heads=(2,2,4,4),
         cnn_module_kernel=(3,3,3,3),
@@ -1520,3 +1524,4 @@ if __name__ == "__main__":
     _test_zipformer_main(False, False)
     _test_zipformer_main(True, False)
     _test_zipformer_main(False, True)
+    _test_zipformer_main(True, True)
