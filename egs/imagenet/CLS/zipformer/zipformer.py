@@ -103,7 +103,7 @@ class Zipformer2(nn.Module):
             feedforward_dim: Union[int, Tuple[int]] = 1536,
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
-            select_topk: Union[int, Tuple[int]] = 16,
+            shift_block: bool = True,
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
     ) -> None:
@@ -149,7 +149,7 @@ class Zipformer2(nn.Module):
         for i in range(num_encoders):
             cur_img_size = img_size // downsampling_factor[i]
             assert cur_img_size % block_size[i] == 0
-            assert cur_img_size ** 2 - block_size[i] ** 2 >= select_topk[i]
+            assert block_size[i] % 2 == 0, block_size[i]
 
             encoder_layer = Zipformer2EncoderLayer(
                 embed_dim=encoder_dim[i],
@@ -160,7 +160,6 @@ class Zipformer2(nn.Module):
                 dropout=dropout,
                 cnn_module_kernel=cnn_module_kernel[i],
                 block_size=block_size[i],
-                select_topk=select_topk[i],
             )
 
             # For the segment of the warmup period, we let the Conv2dSubsampling
@@ -170,7 +169,7 @@ class Zipformer2(nn.Module):
                 encoder_layer=encoder_layer,
                 num_layers=num_encoder_layers[i],
                 block_size=block_size[i],
-                select_topk=select_topk[i],
+                shift_block=shift_block if cur_img_size > block_size[i] else False,
                 dropout=dropout,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
                 warmup_end=warmup_batches * (i + 2) / (num_encoders + 1),
@@ -465,15 +464,13 @@ class Zipformer2EncoderLayer(nn.Module):
             return x * dropout_mask
 
     def forward(
-        self, src: Tensor, indexes: Optional[Tensor] = None, weights: Optional[Tensor] = None
+        self, src: Tensor, reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
         Args:
             src: the sequence to the encoder (required): shape (batch_size, height, width, channel)
-            weights: (batch, num_block_tot, select_topk)
-            indexes: (batch, num_block_tot, select_topk)
-              where num_block_tot = (height // block_size) * (width // block_size)
+            reordered_indexes (Optional): (1, height, width, 1)
 
         Returns:
            A tensor which has the same shape as src
@@ -488,7 +485,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src, indexes=indexes, weights=weights,
+            src, reordered_indexes=reordered_indexes
         )
 
         src = src + self.feed_forward1(src)
@@ -508,11 +505,11 @@ class Zipformer2EncoderLayer(nn.Module):
             selected_attn_weights = selected_attn_weights * (1.0 / selected_attn_weights.sum(dim=-1, keepdim=True))
 
         na = self.balancer_na(self.nonlin_attention(
-            src, indexes=indexes, weights=weights, attn_weights=selected_attn_weights))
+            src, reordered_indexes=reordered_indexes, attn_weights=selected_attn_weights))
 
         src = src + (na if self_attn_dropout_mask is None else na * self_attn_dropout_mask)
 
-        self_attn = self.self_attn1(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
+        self_attn = self.self_attn1(src, reordered_indexes=reordered_indexes, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
 
@@ -532,7 +529,7 @@ class Zipformer2EncoderLayer(nn.Module):
         # bypass in the middle of the layer.
         src = self.bypass_mid(src_orig, src)
 
-        self_attn = self.self_attn2(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
+        self_attn = self.self_attn2(src, reordered_indexes=reordered_indexes, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
 
@@ -583,8 +580,7 @@ class Zipformer2Encoder(nn.Module):
             warmup_begin: float,
             warmup_end: float,
             block_size: int = 4,
-            select_topk: int = 16,
-            select_dim: int = 64,
+            shift_block: bool = True,
             initial_layerdrop_rate: float = 0.5,
             final_layerdrop_rate: float = 0.05,
     ) -> None:
@@ -593,9 +589,7 @@ class Zipformer2Encoder(nn.Module):
         self.name = None
 
         self.resolution = resolution
-
         self.block_size = block_size
-        self.select_topk = select_topk
 
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
@@ -617,10 +611,20 @@ class Zipformer2Encoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, *resolution, self.embed_dim) * .02)
         self.pos_dropout = Dropout2(p=0.1)
 
-        if select_topk > 0:
-            self.linear_q = nn.Linear(self.embed_dim, select_dim)
-            self.linear_k = nn.Linear(self.embed_dim, select_dim)
-            self.score_balancer = Balancer(1, channel_dim=-1, min_abs=1.0, max_abs=10.0)
+        if shift_block:
+            shifted_indexes = self.generate_shifted_indexes()
+        else:
+            shifted_indexes = None
+        self.register_buffer("shifted_indexes", shifted_indexes)
+
+    def generate_shifted_indexes(self):
+        # (height, width)
+        resolution = self.resolution
+        indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
+        shift = self.block_size // 2
+        # (1, height * width, 1)
+        shifted_indexes = indexes.roll(shifts=(shift, shift), dims=(0, 1))
+        return shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
 
     def forward(
         self,
@@ -631,15 +635,8 @@ class Zipformer2Encoder(nn.Module):
 
         Args:
             src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
-            chunk_size: the number of frames per chunk, of >= 0; if -1, no chunking.
             feature_mask: something that broadcasts with src, that we'll multiply `src`
                by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
-            attn_mask: the attention mask, of shape (batch_size, seq_len, seq_len) or (seq_len, seq_len),
-                 interpreted as (batch_size, tgt_seq_len, src_seq_len) or (tgt_seq_len, src_seq_len).
-                 True means masked position. May be None.
-            src_key_padding_mask:  the mask for padding, of shape (batch_size, seq_len); True means
-                 masked position.  May be None.
-
         Returns: a Tensor with the same shape as src.
         """
         batch, height, width, channel = src.size()
@@ -649,101 +646,22 @@ class Zipformer2Encoder(nn.Module):
         # apply absolute positional embedding
         src = src + self.pos_dropout(self.pos_embed)
 
-        block_size = self.block_size
-        select_topk = self.select_topk
-
-        if select_topk > 0:
-            # weights: (batch, num_block_tot, topk)
-            # indexes: (batch, num_block_tot, topk)
-            indexes, weights = self.get_select_weight_index(
-                src, block_size=block_size, topk=select_topk
-            )
-        else:
-            indexes = None
-            weights = None
-
         output = src
 
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             output = output * feature_mask
 
         for i, mod in enumerate(self.layers):
-            output = mod(output, indexes=indexes, weights=weights)
+            # shift blocks between successive layers
+            output = mod(
+                output,
+                reordered_indexes=self.shifted_indexes if i % 2 != 0 else None,
+            )
 
             if not torch.jit.is_scripting() and not torch.jit.is_tracing():
                 output = output * feature_mask
 
         return output
-
-    def get_select_weight_index(
-        self, src: Tensor, block_size: int, topk: int, alpha: float = 10.0, eps: float = 0.001
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Get weights and indexes of selected tokens for each block.
-
-        Args:
-            src: (batch, height, width, channel)
-
-        Returns:
-            weights: (batch, num_block_tot, topk)
-            indexes: (batch, num_block_tot, topk)
-        """
-        batch, height, width, channel = src.size()
-
-        assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
-        num_block_h = height // block_size
-        num_block_w = width // block_size
-        num_block_tot = num_block_h * num_block_w
-        blocks = src.reshape(
-            batch, num_block_h, block_size, num_block_w, block_size, channel)
-        # (batch, num_block_h, num_block_w, channel)
-        block_emb = blocks.mean(dim=(2, 4))
-
-        block_emb = block_emb.view(batch, -1, channel)   # (batch, num_block_tot, channel)
-        block_emb = self.linear_q(block_emb)
-
-        src = self.linear_k(src)
-        src = src.view(batch, -1, src.size(-1)).transpose(1, 2)   # (batch, channel, height*width)
-
-        # pair-wise inner product between block embeddings and all tokens
-        scores = torch.matmul(block_emb, src)  # (batch, num_block_tot, height*width)
-
-        scores = self.score_balancer(scores.unsqueeze(-1)).squeeze(-1)
-        if random.random() < 0.01 or __name__ == "__main__":
-            logging.info(f"scores: abs-min={scores.abs().min()}, abs-max={scores.abs().max()}")
-
-        # Generate a mask of shape (num_block_tot, height * width).
-        # mask[i, j] == True if j-th token is in i-th block
-        arange = torch.arange(num_block_tot, device=src.device)
-        # (num_block_tot, num_block_tot)
-        mask = (arange.unsqueeze(-1) == arange.unsqueeze(0)).view(
-            num_block_tot, num_block_h, 1, num_block_w, 1)
-        mask = mask.expand(num_block_tot, num_block_h, block_size, num_block_w, block_size)
-        mask = mask.contiguous().view(num_block_tot, height * width)
-
-        # Prevent selecting duplicate tokens (within that block)
-        scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
-
-        # (batch, num_block_tot, height*width)
-        sscores, indexes = scores.sort(dim=-1, descending=True)
-        assert height * width >= topk * 2, (height * width, topk * 2)
-        # (batch, num_block_tot, topk, topk*2)
-        diffs = sscores[..., :topk].unsqueeze(-1) - sscores[..., :topk * 2].unsqueeze(2)
-
-        # diffs_rms = (diffs ** 2).mean().sqrt()
-        # diffs = diffs * (alpha / (diffs_rms + eps))
-        # (batch, num_block_tot, topk)
-        weights = (diffs.sigmoid().sum(-1) - topk).tanh()
-
-        if random.random() < 0.01 or __name__ == "__main__":
-            # logging.info(f"{self.name}, diffs_rms: {diffs_rms.item()}")
-            logging.info(f"{self.name}, diffs: min-abs-diffs={diffs.abs().min()}, max-abs-diffs={diffs.abs().max()}")
-            logging.info(f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
-
-        # (batch, num_block_tot, topk)
-        indexes = indexes[..., :topk]
-
-        return indexes, weights
 
 
 class BypassModule(nn.Module):
@@ -990,20 +908,17 @@ class MultiheadAttentionWeights(nn.Module):
     def forward(
         self,
         x: Tensor,
-        indexes: Optional[Tensor] = None,
-        weights: Optional[Tensor] = None,
+        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         r"""
         Args:
             x: input of shape (batch_size, height, width, channel)
-            weights: (batch, num_block_tot, select_topk)
-            indexes: (batch, num_block_tot, select_topk)
-              where num_block_tot = (height // block_size) * (width // block_size)
+            reordered_indexes (Optional): (1, height, width, 1)
         Returns:
            a tensor of attention weights, of shape
-           (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+           (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
         """
-        batch_size, height, width, _ = x.shape
+        batch_size, height, width, channel = x.shape
         block_size = self.block_size
         assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
 
@@ -1011,7 +926,13 @@ class MultiheadAttentionWeights(nn.Module):
         num_block_h = height // block_size
         num_block_w = width // block_size
         num_block_tot = num_block_h * num_block_w
-        select_topk = self.select_topk
+
+        if reordered_indexes is not None:
+            x = x.reshape(batch_size, num_tokens, channel)
+            assert reordered_indexes.shape == (1, num_tokens, 1)
+            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
+            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
+            x = reordered_x.view(batch_size, height, width, channel)
 
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
@@ -1025,26 +946,6 @@ class MultiheadAttentionWeights(nn.Module):
         query = self.copy_query(query)  # for diagnostics only, does nothing.
         key = self.whiten_keys(self.balance_keys(key))  # does nothing in the forward pass.
 
-        if select_topk > 0:
-            # select top-k tokens in key vectors
-            select_key = key.reshape(batch_size, num_tokens, query_dim)
-            select_key = select_key.unsqueeze(1).expand(batch_size, num_block_tot, num_tokens, query_dim)
-            # indexes: (batch, num_block_tot, select_topk)
-            # weights: (batch, num_block_tot, select_topk)
-            # (batch, num_block_tot, select_topk, channel)
-            indexes_expanded = indexes.unsqueeze(-1).expand(
-                batch_size, num_block_tot, select_topk, query_dim)
-            select_key = torch.gather(select_key, dim=2, index=indexes_expanded)
-            # multiply selected key tokens by weights
-            select_key = select_key * weights.unsqueeze(-1)
-
-            select_key = select_key.reshape(
-                batch_size, num_block_tot, select_topk, num_heads, query_head_dim)
-            # (num_heads, batch_size, num_block_tot, query_head_dim, select_topk)
-            select_key = select_key.permute(3, 0, 1, 4, 2)
-        else:
-            assert indexes is None and weights is None
-
         query = query.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, query_head_dim)
         query = query.permute(5, 0, 1, 3, 2, 4, 6)
@@ -1057,11 +958,7 @@ class MultiheadAttentionWeights(nn.Module):
         # now key: (head, batch, num_block_h, num_block_w, query_head_dim, block_size, block_size)
         key = key.reshape(num_heads, batch_size, num_block_tot, query_head_dim, block_size ** 2)
 
-        if select_topk > 0:
-            # (num_heads, batch_size, num_block_tot, query_head_dim, block_size**2+select_topk)
-            key = torch.cat([key, select_key], dim=-1)
-
-        # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2+select_topk)
+        # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2)
         attn_scores = torch.matmul(query, key)
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
@@ -1085,7 +982,7 @@ class MultiheadAttentionWeights(nn.Module):
                                                  name=self.name)
 
         assert attn_scores.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
 
         # We use our own version of softmax, defined in scaling.py, which should
         # save a little of the memory used in backprop by, if we are in
@@ -1156,22 +1053,19 @@ class SelfAttention(nn.Module):
         self,
         x: Tensor,
         attn_weights: Tensor,
-        indexes: Optional[Tensor] = None,
-        weights: Optional[Tensor] = None,
+        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
             x: input tensor, of shape (batch_size, height, width, channel)
-            indexes: (batch, num_block_tot, select_topk)
-              where num_block_tot = (height // block_size) * (width // block_size)
-            weights: (batch, num_block_tot, select_topk)
+            reordered_indexes (Optional): (1, height, width, 1)
             attn_weights: a tensor of shape
-              (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+              (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
               Expect attn_weights.sum(dim=-1) == 1.
         Returns:
            a tensor with the same shape as x.
         """
-        (batch_size, height, width, _) = x.shape
+        (batch_size, height, width, channel) = x.shape
 
         num_heads = self.num_heads
         value_head_dim = self.value_head_dim
@@ -1184,41 +1078,24 @@ class SelfAttention(nn.Module):
         num_block_h = height // block_size
         num_block_w = width // block_size
         num_block_tot = num_block_h * num_block_w
-        select_topk = self.select_topk
 
         assert attn_weights.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+
+        if reordered_indexes is not None:
+            x = x.reshape(batch_size, num_tokens, -1)
+            assert reordered_indexes.shape == (1, height * width, 1)
+            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
+            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
+            x = reordered_x.view(batch_size, height, width, channel)
 
         x = self.in_proj(x)  # (batch_size, height, width, num_heads * value_head_dim)
-
-        if select_topk > 0:
-            select_x = x.reshape(batch_size, num_tokens, value_dim)
-            select_x = select_x.unsqueeze(1).expand(batch_size, num_block_tot, num_tokens, value_dim)
-            # indexes: (batch, num_block_tot, select_topk)
-            # weights: (batch, num_block_tot, select_topk)
-            indexes_expanded = indexes.unsqueeze(-1).expand(
-                batch_size, num_block_tot, select_topk, value_dim)
-            select_x = torch.gather(select_x, dim=2, index=indexes_expanded)
-            # now select_x: (batch, num_block_tot, select_topk, channel)
-            # multiply selected key tokens by weights
-            select_x = select_x * weights.unsqueeze(-1)
-
-            select_x = select_x.reshape(
-                batch_size, num_block_tot, select_topk, num_heads, value_head_dim)
-            select_x = select_x.permute(3, 0, 1, 2, 4)
-            # now select_x: (head, batch, num_block_tot, select_topk, value_head_dim)
-        else:
-            assert indexes is None and weights is None
 
         x = x.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, value_head_dim)
         x = x.permute(5, 0, 1, 3, 2, 4, 6)
         # now x: (head, batch, num_block_h, num_block_w, block_size, block_size, value_head_dim)
         x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, value_head_dim)
-
-        if select_topk > 0:
-            # (head, batch, num_block_tot, block_size**2+select_topk, value_head_dim)
-            x = torch.cat([x, select_x], dim=3)
 
         # (head, batch, num_block_tot, block_size**2, value_head_dim)
         x = torch.matmul(attn_weights, x)
@@ -1232,6 +1109,13 @@ class SelfAttention(nn.Module):
         # returned value is of shape (batch, height, width, channel), like the input.
         x = self.out_proj(x)
         x = self.whiten(x)
+
+        if reordered_indexes is not None:
+            # recover to original order
+            x = x.reshape(batch_size, height * width, channel)
+            new_x = torch.zeros_like(x)
+            new_x.scatter_(dim=1, index=reordered_indexes, src=x)
+            x = new_x.reshape(batch_size, height, width, channel)
 
         return x
 
@@ -1332,24 +1216,32 @@ class NonlinAttention(nn.Module):
         self,
         x: Tensor,
         attn_weights: Tensor,
-        indexes: Optional[Tensor] = None,
-        weights: Optional[Tensor] = None,
+        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """.
         Args:
             x: a Tensor of shape (seq_len, batch_size, num_channels)
-            indexes: (batch, num_block_tot, select_topk)
-              where num_block_tot = (height // block_size) * (width // block_size)
-            weights: (batch, num_block_tot, select_topk)
+            reordered_indexes (Optional): (1, height, width, 1)
             attn_weights: a tensor of shape
               (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
               Expect attn_weights.sum(dim=-1) == 1.
         Returns:
            a Tensor with the same shape as x
         """
-        (batch_size, height, width, _) = x.shape
+        (batch_size, height, width, channel) = x.shape
         block_size = self.block_size
+        num_tokens = height * width  # total number of tokens
+        num_block_h = height // block_size
+        num_block_w = width // block_size
+        num_block_tot = num_block_h * num_block_w
         assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
+
+        if reordered_indexes is not None:
+            x = x.reshape(batch_size, num_tokens, -1)
+            assert reordered_indexes.shape == (1, height * width, 1)
+            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
+            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
+            x = reordered_x.view(batch_size, height, width, -1)
 
         x = self.in_proj(x)
 
@@ -1365,46 +1257,18 @@ class NonlinAttention(nn.Module):
         x = self.identity1(x)  # diagnostics only, it's the identity.
         # now x: (batch, height, width, channel)
 
-        num_tokens = height * width  # total number of tokens
-        num_block_h = height // block_size
-        num_block_w = width // block_size
-        num_block_tot = num_block_h * num_block_w
-        select_topk = self.select_topk
         num_heads = attn_weights.shape[0]
         assert attn_weights.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
 
         hidden_dim = self.hidden_channels
         head_dim = hidden_dim // num_heads
-
-        if select_topk > 0:
-            select_x = x.reshape(batch_size, num_tokens, hidden_dim)
-            select_x = select_x.unsqueeze(1).expand(batch_size, num_block_tot, num_tokens, hidden_dim)
-            # indexes: (batch, num_block_tot, select_topk)
-            # weights: (batch, num_block_tot, select_topk)
-            indexes_expanded = indexes.unsqueeze(-1).expand(
-                batch_size, num_block_tot, select_topk, hidden_dim)
-            select_x = torch.gather(select_x, dim=2, index=indexes_expanded)
-            # now select_x: (batch, num_block_tot, select_topk, channel)
-            # multiply selected key tokens by weights
-            select_x = select_x * weights.unsqueeze(-1)
-
-            select_x = select_x.reshape(
-                batch_size, num_block_tot, select_topk, num_heads, head_dim)
-            select_x = select_x.permute(3, 0, 1, 2, 4)
-            # now select_x: (head, batch, num_block_tot, select_topk, head_dim)
-        else:
-            assert indexes is None and weights is None
 
         x = x.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, head_dim)
         x = x.permute(5, 0, 1, 3, 2, 4, 6)
         # now x: (head, batch, num_block_h, num_block_w, block_size, block_size, head_dim)
         x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, head_dim)
-
-        if select_topk > 0:
-            # (head, batch, num_block_tot, block_size**2+select_topk, head_dim)
-            x = torch.cat([x, select_x], dim=3)
 
         # (head, batch, num_block_tot, block_size**2, head_dim)
         x = torch.matmul(attn_weights, x)
@@ -1421,6 +1285,14 @@ class NonlinAttention(nn.Module):
 
         x = self.out_proj(x)
         x = self.whiten2(x)
+
+        if reordered_indexes is not None:
+            # recover to original order
+            x = x.reshape(batch_size, height * width, channel)
+            new_x = torch.zeros_like(x)
+            new_x.scatter_(dim=1, index=reordered_indexes, src=x)
+            x = new_x.reshape(batch_size, height, width, channel)
+
         return x
 
 
@@ -1589,15 +1461,16 @@ def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
-        encoder_dim=(64,128,256,512,256,128),
-        encoder_unmasked_dim=(64,128,192,256,192,128),
-        downsampling_factor=(1,2,4,8,4,2),
-        num_encoder_layers=(2,2,2,3,2,2),
-        feedforward_dim=(192,384,768,1536,768,384),
-        num_heads=(2,4,4,8,4,4),
-        cnn_module_kernel=(5,5,3,3,3,5),
-        block_size=(7,7,7,7,7,7),
-        select_topk=(25,25,25,0,25,25),
+        patch_size=7,
+        encoder_dim=(64,128,256,512),
+        encoder_unmasked_dim=(64,128,192,256),
+        downsampling_factor=(1,2,4,8),
+        num_encoder_layers=(2,2,2,2),
+        feedforward_dim=(192,384,768,1536),
+        num_heads=(2,2,4,4),
+        cnn_module_kernel=(3,3,3,3),
+        block_size=(4,4,4,4),
+        shift_block=True,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -1615,4 +1488,5 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    _test_zipformer_main()
+    _test_zipformer_main(False)
+    _test_zipformer_main(True)

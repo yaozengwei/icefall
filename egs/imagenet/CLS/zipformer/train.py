@@ -124,10 +124,10 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--select-topk",
-        type=str,
-        default="25,25,25,0,25,25",
-        help="Number of tokens outside block to be selected, per stack, comma separated.",
+        "--shift-block",
+        type=str2bool,
+        default=True,
+        help="Whether to shift the block between sucessive layers",
     )
 
     parser.add_argument(
@@ -741,7 +741,7 @@ def get_model(params):
         feedforward_dim=_to_int_tuple(params.feedforward_dim),
         cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
-        select_topk=_to_int_tuple(params.select_topk),
+        shift_block=params.shift_block,
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
         warmup_batches=4000.0,
     )
