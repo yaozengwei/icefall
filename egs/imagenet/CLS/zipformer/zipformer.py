@@ -104,6 +104,7 @@ class Zipformer2(nn.Module):
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
             shift_block: bool = True,
+            dilate_block: bool = True,
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
     ) -> None:
@@ -170,6 +171,7 @@ class Zipformer2(nn.Module):
                 num_layers=num_encoder_layers[i],
                 block_size=block_size[i],
                 shift_block=shift_block if cur_img_size > block_size[i] else False,
+                dilate_block=dilate_block if cur_img_size > block_size[i] else False,
                 dropout=dropout,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
                 warmup_end=warmup_batches * (i + 2) / (num_encoders + 1),
@@ -581,6 +583,7 @@ class Zipformer2Encoder(nn.Module):
             warmup_end: float,
             block_size: int = 4,
             shift_block: bool = True,
+            dilate_block: bool = False,
             initial_layerdrop_rate: float = 0.5,
             final_layerdrop_rate: float = 0.05,
     ) -> None:
@@ -611,11 +614,20 @@ class Zipformer2Encoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, *resolution, self.embed_dim) * .02)
         self.pos_dropout = Dropout2(p=0.1)
 
+        # Currently, we only suport one type
+        assert not (shift_block and dilate_block), (shift_block, dilate_block)
+
         if shift_block:
             shifted_indexes = self.generate_shifted_indexes()
         else:
             shifted_indexes = None
         self.register_buffer("shifted_indexes", shifted_indexes)
+
+        if dilate_block:
+            dilated_indexes = self.generate_dilated_indexes()
+        else:
+            dilated_indexes = None
+        self.register_buffer("dilated_indexes", dilated_indexes)
 
     def generate_shifted_indexes(self):
         # (height, width)
@@ -624,7 +636,21 @@ class Zipformer2Encoder(nn.Module):
         shift = self.block_size // 2
         # (1, height * width, 1)
         shifted_indexes = indexes.roll(shifts=(shift, shift), dims=(0, 1))
-        return shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
+        shifted_indexes = shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
+        return shifted_indexes
+
+    def generate_dilated_indexes(self):
+        # (height, width)
+        resolution = self.resolution
+        indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
+        indexes = torch.stack([
+            indexes[::2, ::2], indexes[::2, 1::2], indexes[1::2, ::2], indexes[1::2, 1::2]
+        ], dim=0)
+        indexes = indexes.view(2, 2, resolution[0] // 2, resolution[1] // 2).permute(0, 2, 1, 3)
+        # now indexes: (2, resolution[0] // 1, 2, resolution[1])
+        # (1, height * width, 1)
+        dilated_indexes = indexes.flatten().unsqueeze(0).unsqueeze(-1)
+        return dilated_indexes
 
     def forward(
         self,
@@ -651,11 +677,13 @@ class Zipformer2Encoder(nn.Module):
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             output = output * feature_mask
 
+        reordered_indexes = self.shifted_indexes if self.shifted_indexes is not None else self.dilated_indexes
+
         for i, mod in enumerate(self.layers):
             # shift blocks between successive layers
             output = mod(
                 output,
-                reordered_indexes=self.shifted_indexes if i % 2 != 0 else None,
+                reordered_indexes=reordered_indexes if i % 2 != 0 else None,
             )
 
             if not torch.jit.is_scripting() and not torch.jit.is_tracing():
@@ -1457,7 +1485,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
-def _test_zipformer_main():
+def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
@@ -1470,7 +1498,8 @@ def _test_zipformer_main():
         num_heads=(2,2,4,4),
         cnn_module_kernel=(3,3,3,3),
         block_size=(4,4,4,4),
-        shift_block=True,
+        shift_block=shift_block,
+        dilate_block=dilate_block,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -1488,5 +1517,6 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    _test_zipformer_main(False)
-    _test_zipformer_main(True)
+    _test_zipformer_main(False, False)
+    _test_zipformer_main(True, False)
+    _test_zipformer_main(False, True)

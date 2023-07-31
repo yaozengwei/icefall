@@ -131,6 +131,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--dilate-block",
+        type=str2bool,
+        default=False,
+        help="Whether to dilate the block between sucessive layers",
+    )
+
+    parser.add_argument(
         "--feedforward-dim",
         type=str,
         default="192,384,768,1536,768,384",
@@ -742,6 +749,7 @@ def get_model(params):
         cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
         shift_block=params.shift_block,
+        dilate_block=params.dilate_block,
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
         warmup_batches=4000.0,
     )
