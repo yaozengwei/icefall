@@ -1517,10 +1517,63 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
     f  # to remove flake8 warnings
 
 
+def _test_shifted_indexes():
+    # shifted indxes
+    resolution = (8, 8)
+    indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
+    shift = 2
+    # (1, height * width, 1)
+    shifted_indexes = indexes.roll(shifts=(shift, shift), dims=(0, 1))
+    shifted_indexes = shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
+
+    batch_size = 2
+    num_tokens = resolution[0] * resolution[1]
+    channel = 32
+    x = torch.randn(batch_size, num_tokens, channel)
+
+    reordered_indexes = shifted_indexes
+    reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
+    reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
+
+    new_x = torch.zeros_like(x)
+    new_x.scatter_(dim=1, index=reordered_indexes, src=reordered_x)
+
+    assert torch.allclose(new_x, x)
+
+
+def _test_ditaled_indexes():
+    # dilated indxes
+    resolution = (8, 8)
+    indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
+    indexes = torch.stack([
+        indexes[::2, ::2], indexes[::2, 1::2], indexes[1::2, ::2], indexes[1::2, 1::2]
+    ], dim=0)
+    indexes = indexes.view(2, 2, resolution[0] // 2, resolution[1] // 2).permute(0, 2, 1, 3)
+    # now indexes: (2, resolution[0] // 1, 2, resolution[1])
+    # (1, height * width, 1)
+    dilated_indexes = indexes.flatten().unsqueeze(0).unsqueeze(-1)
+
+    batch_size = 2
+    num_tokens = resolution[0] * resolution[1]
+    channel = 32
+    x = torch.randn(batch_size, num_tokens, channel)
+
+    reordered_indexes = dilated_indexes
+    reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
+    reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
+
+    new_x = torch.zeros_like(x)
+    new_x.scatter_(dim=1, index=reordered_indexes, src=reordered_x)
+
+    assert torch.allclose(new_x, x)
+
+
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+    _test_shifted_indexes()
+    _test_ditaled_indexes()
     _test_zipformer_main(False, False)
     _test_zipformer_main(True, False)
     _test_zipformer_main(False, True)
