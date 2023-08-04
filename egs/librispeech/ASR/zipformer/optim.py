@@ -100,6 +100,15 @@ class BatchedOptimizer(Optimizer):
         # one for each batch in `batches`.
         tuples = []
 
+        def divide_into_blocks(num_element, block_size):
+            # returns (num_blocks, block_size)
+            for i in range(block_size, num_element // 2 + 1):
+                if num_element % i == 0:
+                    return num_element // i, i
+            return 1, num_element
+
+        new_shape_list = []
+
         for batch, batch_names in zip(batches, batches_names):
             p = batch[0]
             # we arbitrarily store the state in the
@@ -110,15 +119,51 @@ class BatchedOptimizer(Optimizer):
             grad = torch.stack(
                 [torch.zeros_like(p) if p.grad is None else p.grad for p in batch]
             )
-            p_stacked.grad = grad
             stacked_params_dict[key] = p_stacked
+
+            shape = list(p.shape)
+            if len(shape) > 1:
+                # E.g., for shape [256, 512] and block_size of 64,
+                # new_shape is [4, 64, 4, 64]
+                new_shape = [i for d in shape for i in divide_into_blocks(d, 64)]
+                # E.g., [5, 4, 64, 4, 64]
+                p_stacked = p_stacked.reshape(len(batch), *new_shape)
+                # E.g., [1, 2, 3, 4]
+                dims = list(range(1, len(new_shape) + 1))
+                # E.g., of shape (5, 4, 4, 64, 64)
+                p_stacked = p_stacked.permute(0, *dims[::2], *dims[1::2])
+                # E.g., of shape (80, 64, 64)
+                p_stacked = p_stacked.reshape(-1, *new_shape[1::2])
+
+                # Same operation on grad
+                grad = grad.reshape(len(batch), *new_shape)
+                # E.g., of shape (5, 4, 4, 64, 64)
+                grad = grad.permute(0, *dims[::2], *dims[1::2])
+                # E.g., of shape (80, 64, 64)
+                grad = grad.reshape(-1, *new_shape[1::2])
+                p_stacked.grad = grad
+
+                new_shape_list.append(new_shape)
+            else:
+                p_stacked.grad = grad
+                # batch of scalars
+                new_shape_list.append(None)
             tuples.append((p_stacked, state, batch_names))
 
         yield tuples  # <-- calling code will do the actual optimization here!
 
-        for ((stacked_params, _state, _names), batch) in zip(tuples, batches):
+        for ((stacked_params, _state, _names), batch, new_shape) in zip(tuples, batches, new_shape_list):
+            shape = list(batch[0].shape)
+            if len(shape) > 1:
+                p_stacked = stacked_params.reshape(len(batch), *new_shape[::2], *new_shape[1::2])
+                dims = [j for i in range(1, len(shape) + 1) for j in (i, i + len(shape))]
+                p_stacked = p_stacked.permute(0, *dims)
+                p_stacked = p_stacked.reshape(len(batch), *shape)
+            else:
+                p_stacked = stacked_params
+                assert new_shape is None
             for i, p in enumerate(batch):  # batch is list of Parameter
-                p.copy_(stacked_params[i])
+                p.copy_(p_stacked[i])
 
 
 class ScaledAdam(BatchedOptimizer):
