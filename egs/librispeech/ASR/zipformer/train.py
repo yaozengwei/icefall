@@ -349,6 +349,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--optim-block-size",
+        type=int,
+        default=64,
+        help="""Block size used in optimizer.
+        """,
+    )
+
+    parser.add_argument(
         "--ref-duration",
         type=float,
         default=600,
@@ -1148,6 +1156,7 @@ def run(rank, world_size, args):
         get_parameter_groups_with_lrs(model, lr=params.base_lr, include_names=True),
         lr=params.base_lr,  # should have no effect
         clipping_scale=2.0,
+        block_size=params.optim_block_size,
     )
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)

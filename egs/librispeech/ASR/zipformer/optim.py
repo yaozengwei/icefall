@@ -37,8 +37,9 @@ class BatchedOptimizer(Optimizer):
       params:
     """
 
-    def __init__(self, params, defaults):
+    def __init__(self, params, defaults, block_size: int = 64):
         super(BatchedOptimizer, self).__init__(params, defaults)
+        self.block_size = block_size
 
     @contextlib.contextmanager
     def batched_params(self, param_group, group_params_names):
@@ -125,7 +126,7 @@ class BatchedOptimizer(Optimizer):
             if len(shape) > 1:
                 # E.g., for shape [256, 512] and block_size of 64,
                 # new_shape is [4, 64, 4, 64]
-                new_shape = [i for d in shape for i in divide_into_blocks(d, 64)]
+                new_shape = [i for d in shape for i in divide_into_blocks(d, self.block_size)]
                 # E.g., [5, 4, 64, 4, 64]
                 p_stacked = p_stacked.reshape(len(batch), *new_shape)
                 # E.g., [1, 2, 3, 4]
@@ -225,6 +226,7 @@ class ScaledAdam(BatchedOptimizer):
         scalar_max=10.0,
         size_update_period=4,
         clipping_update_period=100,
+        block_size=64,
     ):
 
         defaults = dict(
@@ -245,7 +247,7 @@ class ScaledAdam(BatchedOptimizer):
         # this flag will be set to False in funciton _get_names_of_parameters.
         self.show_dominant_parameters = True
         param_groups, parameters_names = self._get_names_of_parameters(params)
-        super(ScaledAdam, self).__init__(param_groups, defaults)
+        super(ScaledAdam, self).__init__(param_groups, defaults, block_size=block_size)
         assert len(self.param_groups) == len(parameters_names)
         self.parameters_names = parameters_names
 
@@ -536,9 +538,9 @@ class ScaledAdam(BatchedOptimizer):
                 logging.warn(
                     f"Scaling gradients by {ans}, model_norm_threshold={model_norm_threshold}"
                 )
-                if self.show_dominant_parameters:
-                    assert p.shape[0] == len(param_names)
-                    self._show_gradient_dominating_parameter(tuples, tot_sumsq)
+                # if self.show_dominant_parameters:
+                #     assert p.shape[0] == len(param_names)
+                #     self._show_gradient_dominating_parameter(tuples, tot_sumsq)
             return ans
 
     def _show_gradient_dominating_parameter(
