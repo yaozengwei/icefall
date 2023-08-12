@@ -150,7 +150,7 @@ class Zipformer2(nn.Module):
         for i in range(num_encoders):
             cur_img_size = img_size // downsampling_factor[i]
             assert cur_img_size % block_size[i] == 0
-            assert block_size[i] % 2 == 0, block_size[i]
+            # assert block_size[i] % 2 == 0, block_size[i]
 
             encoder_layer = Zipformer2EncoderLayer(
                 embed_dim=encoder_dim[i],
@@ -806,9 +806,12 @@ class SimpleDownsample(torch.nn.Module):
         self.bias = nn.Parameter(torch.zeros(downsample ** 2))
 
         self.name = None  # will be set from training code
-        self.dropout = copy.deepcopy(dropout)
+        # self.dropout = copy.deepcopy(dropout)
 
         self.downsample = downsample
+
+        self.reduction = ScaledLinear(downsample ** 2 * channels, channels, bias=True, initial_scale=0.01)
+        self.dropout = Dropout2(p=ScheduledFloat((0.0, 0.25), (5000.0, 0.025)))
 
     def forward(self,
                 src: Tensor) -> Tensor:
@@ -832,6 +835,11 @@ class SimpleDownsample(torch.nn.Module):
 
         # (batch, d_height, d_width, channel)
         ans = (src * weights).sum(dim=3)
+
+        src = src.view(batch, d_height, d_width, ds * ds * channel)
+        src = self.reduction(src)
+
+        ans = ans + self.dropout(src)
 
         return ans
 
