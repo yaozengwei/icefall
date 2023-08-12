@@ -93,17 +93,16 @@ class Zipformer2(nn.Module):
             patch_size: int = 4,
             in_chans: int = 3,
             num_classes: int = 1000,
-            downsampling_factor: Tuple[int] = (2, 2),
+            downsampling_factor: Tuple[int] = (1, 2, 2, 2),
             encoder_dim: Union[int, Tuple[int]] = 384,
             num_encoder_layers: Union[int, Tuple[int]] = 4,
-            encoder_unmasked_dim: Union[int, Tuple[int]] = 256,
             query_head_dim: Union[int, Tuple[int]] = 32,
             value_head_dim: Union[int, Tuple[int]] = 12,
             num_heads: Union[int, Tuple[int]] = 8,
             feedforward_dim: Union[int, Tuple[int]] = 1536,
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
-            shift_block: bool = True,
+            shift_block: bool = False,
             dilate_block: bool = False,
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
@@ -127,7 +126,6 @@ class Zipformer2(nn.Module):
 
         self.downsampling_factor = downsampling_factor # tuple
         self.encoder_dim = encoder_dim = _to_tuple(encoder_dim) # tuple
-        self.encoder_unmasked_dim = encoder_unmasked_dim = _to_tuple(encoder_unmasked_dim) # tuple
         num_encoder_layers = _to_tuple(num_encoder_layers)
         self.num_encoder_layers = num_encoder_layers
         self.query_head_dim = query_head_dim = _to_tuple(query_head_dim)
@@ -136,19 +134,16 @@ class Zipformer2(nn.Module):
         feedforward_dim = _to_tuple(feedforward_dim)
         self.cnn_module_kernel = cnn_module_kernel = _to_tuple(cnn_module_kernel)
 
-        for u,d in zip(encoder_unmasked_dim, encoder_dim):
-            assert u <= d
-
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=encoder_dim[0])
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
-
-        img_size = img_size // patch_size
+        cur_img_size = img_size // patch_size
+        last_embed_dim = encoder_dim[0]
         num_encoders = len(downsampling_factor)
         for i in range(num_encoders):
-            cur_img_size = img_size // downsampling_factor[i]
+            cur_img_size = cur_img_size // downsampling_factor[i]
             assert cur_img_size % block_size[i] == 0
             # assert block_size[i] % 2 == 0, block_size[i]
 
@@ -181,75 +176,20 @@ class Zipformer2(nn.Module):
             if downsampling_factor[i] != 1:
                 encoder = DownsampledZipformer2Encoder(
                     encoder,
-                    dim=encoder_dim[i],
+                    in_channel=last_embed_dim,
+                    out_channel=encoder_dim[i],
                     downsample=downsampling_factor[i],
                     dropout=dropout,
                 )
 
+            last_embed_dim = encoder_dim[i]
             encoders.append(encoder)
 
         self.encoders = nn.ModuleList(encoders)
 
-        max_encoder_dim = max(encoder_dim)
-        self.norm = BiasNorm(max_encoder_dim)
-        self.head = nn.Linear(max_encoder_dim, num_classes)
-
-    def get_feature_masks(
-            self,
-            x: Tensor) -> Union[List[float], List[Tensor]]:
-        """
-        In eval mode, returns [1.0] * num_encoders; in training mode, returns a number of
-        randomized feature masks, one per encoder.
-        On e.g. 15% of frames, these masks will zero out all enocder dims larger than
-        some supplied number, e.g. >256, so in effect on those frames we are using
-        a smaller encoer dim.
-
-        We generate the random masks at this level because we want the 2 masks to 'agree'
-        all the way up the encoder stack. This will mean that the 1st mask will have
-        mask values repeated self.zipformer_subsampling_factor times.
-
-        Args:
-           x: the embeddings (needed for the shape and dtype and device), of shape
-             (batch_size, height, width, encoder_dims0)
-        """
-        num_encoders = len(self.encoder_dim)
-        if not self.training:
-            return [ 1.0 ] * num_encoders
-
-        (batch_size, height, width, _encoder_dims0) = x.shape
-
-        assert self.encoder_dim[0] == _encoder_dims0
-
-        feature_mask_dropout_prob = 0.125
-
-        # mask1 shape: (batch_size, 1, 1, 1)
-        mask1 = (torch.rand(batch_size, 1, 1, 1,
-                            device=x.device) >
-                 feature_mask_dropout_prob).to(x.dtype)
-
-        # mask2 has additional sequences masked, about twice the number.
-        mask2 = torch.logical_and(mask1,
-                                  (torch.rand(batch_size, 1, 1, 1,
-                                              device=x.device) >
-                                   feature_mask_dropout_prob).to(x.dtype))
-
-        # dim: (1, batch_size, 2)
-        mask = torch.cat((mask1, mask2), dim=-1)
-
-        feature_masks = []
-        for i in range(num_encoders):
-            channels = self.encoder_dim[i]
-            feature_mask = torch.ones(batch_size, 1, 1, channels,
-                                      dtype=x.dtype, device=x.device)
-            u1 = self.encoder_unmasked_dim[i]
-            u2 = u1 + (channels - u1) // 2
-
-            feature_mask[:, :, :, u1:u2] *= mask[..., 0:1]
-            feature_mask[:, :, :, u2:] *= mask[..., 1:2]
-
-            feature_masks.append(feature_mask)
-
-        return feature_masks
+        # TODO: test removing it
+        self.norm = BiasNorm(last_embed_dim)
+        self.head = nn.Linear(last_embed_dim, num_classes)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -262,43 +202,13 @@ class Zipformer2(nn.Module):
         """
         x = self.patch_embed(x)  # (batch, height, width, channel)
 
-        outputs = []
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            feature_masks = [1.0] * len(self.encoder_dim)
-        else:
-            feature_masks = self.get_feature_masks(x)
-
         for i, module in enumerate(self.encoders):
-            x = convert_num_channels(x, self.encoder_dim[i])
-            x = module(x, feature_mask=feature_masks[i])
-            outputs.append(x)
-
-        # if the last output has the largest dimension, x will be unchanged,
-        # it will be the same as outputs[-1].  Otherwise it will be concatenated
-        # from different pieces of 'outputs', taking each dimension from the
-        # most recent output that has it present.
-        x = self._get_full_dim_output(outputs)
-        # now x: (batch, height, width, channel)
+            x = module(x)
 
         x = self.norm(x)
         x = self.head(x.mean(dim=(1, 2)))
 
         return x
-
-    def _get_full_dim_output(self, outputs: List[Tensor]):
-        num_encoders = len(self.encoder_dim)
-        assert len(outputs) == num_encoders
-        output_dim = max(self.encoder_dim)
-        output_pieces = [ outputs[-1] ]
-        cur_dim = self.encoder_dim[-1]
-        for i in range(num_encoders - 2, -1, -1):
-            d = self.encoder_dim[i]
-            if d > cur_dim:
-                this_output = outputs[i]
-                output_pieces.append(this_output[..., cur_dim:d])
-                cur_dim = d
-        assert cur_dim == output_dim
-        return torch.cat(output_pieces, dim=-1)
 
 
 def _whitening_schedule(x: float, ratio: float = 2.0) -> ScheduledFloat:
@@ -575,7 +485,7 @@ class Zipformer2Encoder(nn.Module):
     """
     def __init__(
             self,
-            resolution: Tuple[int],
+            resolution: Tuple[int, int],
             encoder_layer: nn.Module,
             num_layers: int,
             dropout: float,
@@ -652,14 +562,11 @@ class Zipformer2Encoder(nn.Module):
     def forward(
         self,
         src: Tensor,
-        feature_mask: Union[Tensor, float] = 1.0,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
             src: the sequence to the encoder (required): shape (seq_len, batch_size, embedding_dim).
-            feature_mask: something that broadcasts with src, that we'll multiply `src`
-               by at every layer: if a Tensor, likely of shape (seq_len, batch_size, embedding_dim)
         Returns: a Tensor with the same shape as src.
         """
         batch, height, width, channel = src.size()
@@ -670,9 +577,6 @@ class Zipformer2Encoder(nn.Module):
         src = src + self.pos_dropout(self.pos_embed)
 
         output = src
-
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-            output = output * feature_mask
 
         reordered_indexes_list = [None]
         # reordered_indexes = self.shifted_indexes if self.shifted_indexes is not None else self.dilated_indexes
@@ -689,9 +593,6 @@ class Zipformer2Encoder(nn.Module):
                 output,
                 reordered_indexes=reordered_indexes_list[i % num_types],
             )
-
-            if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-                output = output * feature_mask
 
         return output
 
@@ -759,21 +660,18 @@ class DownsampledZipformer2Encoder(nn.Module):
     """
     def __init__(self,
                  encoder: nn.Module,
-                 dim: int,
+                 in_channel: int,
+                 out_channel: int,
                  downsample: int,
                  dropout: FloatLike):
         super(DownsampledZipformer2Encoder, self).__init__()
         self.downsample_factor = downsample
-        self.downsample = SimpleDownsample(dim, downsample, dropout)
+        self.downsample = Downsample(in_channel, out_channel, downsample, dropout)
         self.num_layers = encoder.num_layers
         self.encoder = encoder
-        self.upsample = SimpleUpsample(dim, downsample)
-        self.out_combiner = BypassModule(dim, straight_through_rate=0)
 
     def forward(
-        self,
-        src: Tensor,
-        feature_mask: Union[Tensor, float] = 1.0,
+        self, src: Tensor,
     ) -> Tensor:
         r"""Downsample, go through encoder, upsample.
 
@@ -784,41 +682,37 @@ class DownsampledZipformer2Encoder(nn.Module):
 
         Returns: a Tensor with the same shape as src.
         """
-        src_orig = src
         src = self.downsample(src)
+        src = self.encoder(src)
 
-        src = self.encoder(src, feature_mask=feature_mask)
-        src = self.upsample(src)
-
-        return self.out_combiner(src_orig, src)
+        return src
 
 
-class SimpleDownsample(torch.nn.Module):
+class Downsample(torch.nn.Module):
     """
     Does downsampling with attention, by weighted sum, and a projection..
     """
     def __init__(self,
-                 channels: int,
+                 in_channel: int,
+                 out_channel: int,
                  downsample: int,
                  dropout: FloatLike):
-        super(SimpleDownsample, self).__init__()
+        super(Downsample, self).__init__()
 
-        self.bias = nn.Parameter(torch.zeros(downsample ** 2))
+        # self.bias = nn.Parameter(torch.zeros(downsample ** 2))
 
         self.name = None  # will be set from training code
-        # self.dropout = copy.deepcopy(dropout)
 
         self.downsample = downsample
 
-        self.reduction = ScaledLinear(downsample ** 2 * channels, channels, bias=True, initial_scale=0.01)
-        self.dropout = Dropout2(p=ScheduledFloat((0.0, 0.25), (5000.0, 0.025)))
+        self.reduction = nn.Linear(downsample ** 2 * in_channel, out_channel, bias=False)
 
     def forward(self,
                 src: Tensor) -> Tensor:
         """
-        x: (batch, height, width, channel)
+        x: (batch, height, width, in_channel)
         Returns a tensor of shape
-           (batch, height // ds, width // ds, channel)
+           (batch, height // ds, width // ds, out_channel)
         """
         batch, height, width, channel = src.shape
         ds = self.downsample
@@ -827,21 +721,19 @@ class SimpleDownsample(torch.nn.Module):
         d_width = width // ds
 
         src = src.reshape(batch, d_height, ds, d_width, ds, channel).permute(0, 1, 3, 2, 4, 5)
-        src = src.reshape(batch, d_height, d_width, ds * ds, channel)
+        # src = src.reshape(batch, d_height, d_width, ds * ds, channel)
 
-        weights = self.bias.softmax(dim=0)
-        # weights: (ds * ds , 1)
-        weights = weights.unsqueeze(-1)
+        # weights = self.bias.softmax(dim=0)
+        # # weights: (ds * ds , 1)
+        # weights = weights.unsqueeze(-1)
 
-        # (batch, d_height, d_width, channel)
-        ans = (src * weights).sum(dim=3)
+        # # (batch, d_height, d_width, channel)
+        # ans = (src * weights).sum(dim=3)
 
-        src = src.view(batch, d_height, d_width, ds * ds * channel)
+        src = src.reshape(batch, d_height, d_width, ds * ds * channel)
         src = self.reduction(src)
 
-        ans = ans + self.dropout(src)
-
-        return ans
+        return src
 
 
 class SimpleUpsample(torch.nn.Module):
@@ -1503,8 +1395,7 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
     c = Zipformer2(
         patch_size=7,
         encoder_dim=(64,128,256,512),
-        encoder_unmasked_dim=(64,128,192,256),
-        downsampling_factor=(1,2,4,8),
+        downsampling_factor=(1,2,2,2),
         num_encoder_layers=(3,3,3,3),
         feedforward_dim=(192,384,768,1536),
         num_heads=(2,2,4,4),
@@ -1580,8 +1471,8 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    _test_shifted_indexes()
-    _test_ditaled_indexes()
+    # _test_shifted_indexes()
+    # _test_ditaled_indexes()
     _test_zipformer_main(False, False)
     _test_zipformer_main(True, False)
     _test_zipformer_main(False, True)
