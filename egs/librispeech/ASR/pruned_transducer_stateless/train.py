@@ -364,7 +364,7 @@ def get_params() -> AttributeDict:
             # parameters for joiner
             "joiner_dim": 512,
             # parameters for Noam
-            "warm_step": 40000,  # For the 100h subset, use 20000
+            "warm_step": 10000,  # 10k, as in the Conformer paper
             "env_info": get_env_info(),
         }
     )
@@ -862,7 +862,7 @@ def run(rank, world_size, args):
     params.update(vars(args))
     if params.full_libri is False:
         params.valid_interval = 800
-        params.warm_step = 20000
+    #     params.warm_step = 20000
 
     fix_random_seed(params.seed)
     if world_size > 1:
