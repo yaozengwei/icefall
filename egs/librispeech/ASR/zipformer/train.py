@@ -398,6 +398,15 @@ def get_parser():
         default=500.0,
         help="Warmup batches for Eden LRScheduler"
     )
+
+    parser.add_argument(
+        "--scalar-lr-scale",
+        type=float,
+        default=0.1,
+        help="""A scaling factor on the learning rate, that we use to update the
+        scale of each parameter tensor and scalar parameters of the mode"""
+    )
+
     parser.add_argument(
         "--seed",
         type=int,
@@ -1134,6 +1143,7 @@ def run(rank, world_size, args):
             model, lr=params.base_lr, include_names=True),
         lr=params.base_lr,   # should have no effect
         clipping_scale=2.0,
+        scalar_lr_scale=params.scalar_lr_scale,
     )
 
     scheduler = Eden(
