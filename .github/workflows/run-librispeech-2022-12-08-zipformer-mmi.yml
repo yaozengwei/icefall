@@ -64,7 +64,7 @@ jobs:
         run: |
           grep -v '^#' ./requirements-ci.txt  | xargs -n 1 -L 1 pip install
           pip uninstall -y protobuf
-          pip install --no-binary protobuf protobuf
+          pip install --no-binary protobuf protobuf==3.20.*
 
       - name: Cache kaldifeat
         id: my-cache
@@ -72,7 +72,7 @@ jobs:
         with:
           path: |
             ~/tmp/kaldifeat
-          key: cache-tmp-${{ matrix.python-version }}-2022-09-25
+          key: cache-tmp-${{ matrix.python-version }}-2023-05-22
 
       - name: Install kaldifeat
         if: steps.my-cache.outputs.cache-hit != 'true'
@@ -123,7 +123,7 @@ jobs:
           ln -sfv ~/tmp/fbank-libri egs/librispeech/ASR/data/fbank
           ls -lh egs/librispeech/ASR/data/*
 
-          sudo apt-get -qq install git-lfs tree sox
+          sudo apt-get -qq install git-lfs tree
           export PYTHONPATH=$PWD:$PYTHONPATH
           export PYTHONPATH=~/tmp/kaldifeat/kaldifeat/python:$PYTHONPATH
           export PYTHONPATH=~/tmp/kaldifeat/build/lib:$PYTHONPATH
@@ -163,5 +163,5 @@ jobs:
         uses: actions/upload-artifact@v2
         if: github.event_name == 'schedule' || github.event.label.name == 'run-decode'
         with:
-          name: torch-${{ matrix.torch }}-python-${{ matrix.python-version }}-ubuntu-18.04-cpu-zipformer_mmi-2022-12-08
+          name: torch-${{ matrix.torch }}-python-${{ matrix.python-version }}-ubuntu-latest-cpu-zipformer_mmi-2022-12-08
           path: egs/librispeech/ASR/zipformer_mmi/exp/

@@ -22,11 +22,11 @@ concurrency:
 
 jobs:
   run_librispeech_lstm_transducer_stateless2_2022_09_03:
-    if: github.event.label.name == 'ready' || github.event.label.name == 'LODR' || github.event.label.name == 'shallow-fusion' || github.event.label.name == 'ncnn' || github.event.label.name == 'onnx' || github.event_name == 'push' || github.event_name == 'schedule'
+    if: github.event.label.name == 'ready' || github.event.label.name == 'LODR' || github.event.label.name == 'shallow-fusion' || github.event_name == 'push' || github.event_name == 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-18.04]
+        os: [ubuntu-latest]
         python-version: [3.8]
 
       fail-fast: false
@@ -47,7 +47,7 @@ jobs:
         run: |
           grep -v '^#' ./requirements-ci.txt  | xargs -n 1 -L 1 pip install
           pip uninstall -y protobuf
-          pip install --no-binary protobuf protobuf
+          pip install --no-binary protobuf protobuf==3.20.*
 
       - name: Cache kaldifeat
         id: my-cache
@@ -55,7 +55,7 @@ jobs:
         with:
           path: |
             ~/tmp/kaldifeat
-          key: cache-tmp-${{ matrix.python-version }}-2022-09-25
+          key: cache-tmp-${{ matrix.python-version }}-2023-05-22
 
       - name: Install kaldifeat
         if: steps.my-cache.outputs.cache-hit != 'true'
@@ -106,7 +106,7 @@ jobs:
           ln -sfv ~/tmp/fbank-libri egs/librispeech/ASR/data/fbank
           ls -lh egs/librispeech/ASR/data/*
 
-          sudo apt-get -qq install git-lfs tree sox
+          sudo apt-get -qq install git-lfs tree
           export PYTHONPATH=$PWD:$PYTHONPATH
           export PYTHONPATH=~/tmp/kaldifeat/kaldifeat/python:$PYTHONPATH
           export PYTHONPATH=~/tmp/kaldifeat/build/lib:$PYTHONPATH
@@ -139,9 +139,10 @@ jobs:
           cd egs/librispeech/ASR
           tree lstm_transducer_stateless2/exp
           cd lstm_transducer_stateless2/exp
-          echo "===modified_beam_search_rnnlm_shallow_fusion==="
-          find modified_beam_search_rnnlm_shallow_fusion  -name "log-*" -exec grep -n --color "best for test-clean" {} + | sort -n -k2
-          find modified_beam_search_rnnlm_shallow_fusion  -name "log-*" -exec grep -n --color "best for test-other" {} + | sort -n -k2
+          echo "===modified_beam_search_lm_shallow_fusion==="
+          echo "===Using RNNLM==="
+          find modified_beam_search_lm_shallow_fusion  -name "log-*rnn*" -exec grep -n --color "best for test-clean" {} + | sort -n -k2
+          find modified_beam_search_lm_shallow_fusion  -name "log-*rnn*" -exec grep -n --color "best for test-other" {} + | sort -n -k2
 
       - name: Display decoding results for lstm_transducer_stateless2
         if: github.event.label.name == 'LODR'
@@ -151,12 +152,12 @@ jobs:
           tree lstm_transducer_stateless2/exp
           cd lstm_transducer_stateless2/exp
           echo "===modified_beam_search_rnnlm_LODR==="
-          find modified_beam_search_rnnlm_LODR  -name "log-*" -exec grep -n --color "best for test-clean" {} + | sort -n -k2
-          find modified_beam_search_rnnlm_LODR  -name "log-*" -exec grep -n --color "best for test-other" {} + | sort -n -k2
+          find modified_beam_search_LODR  -name "log-*" -exec grep -n --color "best for test-clean" {} + | sort -n -k2
+          find modified_beam_search_LODR  -name "log-*" -exec grep -n --color "best for test-other" {} + | sort -n -k2
 
       - name: Upload decoding results for lstm_transducer_stateless2
         uses: actions/upload-artifact@v2
         if: github.event_name == 'schedule' || github.event.label.name == 'shallow-fusion' || github.event.label.name == 'LODR'
         with:
-          name: torch-${{ matrix.torch }}-python-${{ matrix.python-version }}-ubuntu-18.04-cpu-lstm_transducer_stateless2-2022-09-03
+          name: torch-${{ matrix.torch }}-python-${{ matrix.python-version }}-ubuntu-latest-cpu-lstm_transducer_stateless2-2022-09-03
           path: egs/librispeech/ASR/lstm_transducer_stateless2/exp/

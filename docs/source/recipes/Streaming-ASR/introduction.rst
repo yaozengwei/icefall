@@ -30,8 +30,9 @@ In icefall, we implement the streaming conformer the way just like what `WeNet <
    See :doc:`Pruned transducer statelessX <librispeech/pruned_transducer_stateless>` for more details.
 
 .. HINT::
-   If you want to adapt a non-streaming conformer model to be streaming, please refer
-   to `this pull request <https://github.com/k2-fsa/icefall/pull/454>`_.
+   If you want to modify a non-streaming conformer recipe to support both streaming and non-streaming, please refer
+   to `this pull request <https://github.com/k2-fsa/icefall/pull/454>`_.  After adding the code needed by streaming training,
+   you have to re-train it with the extra arguments mentioned in the docs above to get a streaming model.
 
 
 Streaming Emformer
@@ -44,9 +45,9 @@ the input features.
 
 We have three variants of Emformer models in ``icefall``.
 
- - ``pruned_stateless_emformer_rnnt2`` using Emformer from torchaudio, see `LibriSpeech recipe <https://github.com/k2-fsa/icefall/tree/master/egs/librispeech/ASR/pruned_stateless_emformer_rnnt2>`_.
+ - ``pruned_stateless_emformer_rnnt2`` using Emformer from torchaudio, see `LibriSpeech recipe <https://github.com/k2-fsa/icefall/tree/master/egs/librispeech/ASR/pruned_stateless_emformer_rnnt2>`__.
  - ``conv_emformer_transducer_stateless`` using ConvEmformer implemented by ourself. Different from the Emformer in torchaudio,
    ConvEmformer has a convolution in each layer and uses the mechanisms in our reworked conformer model.
-   See `LibriSpeech recipe <https://github.com/k2-fsa/icefall/tree/master/egs/librispeech/ASR/conv_emformer_transducer_stateless>`_.
+   See `LibriSpeech recipe <https://github.com/k2-fsa/icefall/tree/master/egs/librispeech/ASR/conv_emformer_transducer_stateless>`__.
  - ``conv_emformer_transducer_stateless2`` using ConvEmformer implemented by ourself. The only difference from the above one is that
    it uses a simplified memory bank. See `LibriSpeech recipe <https://github.com/k2-fsa/icefall/tree/master/egs/librispeech/ASR/conv_emformer_transducer_stateless2>`_.

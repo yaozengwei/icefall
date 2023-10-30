@@ -18,14 +18,13 @@ log "Downloading pre-commputed fbank from $fbank_url"
 git clone https://huggingface.co/csukuangfj/aishell-test-dev-manifests
 ln -s $PWD/aishell-test-dev-manifests/data .
 
-log "Downloading pre-trained model from $repo_url"
 repo_url=https://huggingface.co/csukuangfj/icefall-aishell-pruned-transducer-stateless3-2022-06-20
+log "Downloading pre-trained model from $repo_url"
 git clone $repo_url
 repo=$(basename $repo_url)
 
 log "Display test files"
 tree $repo/
-soxi $repo/test_wavs/*.wav
 ls -lh $repo/test_wavs/*.wav
 
 pushd $repo/exp

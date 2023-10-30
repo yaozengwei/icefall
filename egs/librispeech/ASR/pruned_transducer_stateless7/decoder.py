@@ -56,7 +56,6 @@ class Decoder(nn.Module):
         self.embedding = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=decoder_dim,
-            padding_idx=blank_id,
         )
         self.blank_id = blank_id
 
@@ -72,6 +71,10 @@ class Decoder(nn.Module):
                 groups=decoder_dim // 4,  # group size == 4
                 bias=False,
             )
+        else:
+            # To avoid `RuntimeError: Module 'Decoder' has no attribute 'conv'`
+            # when inference with torch.jit.script and context_size == 1
+            self.conv = nn.Identity()
 
     def forward(self, y: torch.Tensor, need_pad: bool = True) -> torch.Tensor:
         """
@@ -87,7 +90,11 @@ class Decoder(nn.Module):
         y = y.to(torch.int64)
         # this stuff about clamp() is a temporary fix for a mismatch
         # at utterance start, we use negative ids in beam_search.py
-        embedding_out = self.embedding(y.clamp(min=0)) * (y >= 0).unsqueeze(-1)
+        if torch.jit.is_tracing():
+            # This is for exporting to PNNX via ONNX
+            embedding_out = self.embedding(y)
+        else:
+            embedding_out = self.embedding(y.clamp(min=0)) * (y >= 0).unsqueeze(-1)
         if self.context_size > 1:
             embedding_out = embedding_out.permute(0, 2, 1)
             if need_pad is True:
