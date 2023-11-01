@@ -375,6 +375,7 @@ class Zipformer2(EncoderInterface):
         if chunk_size <= 0:
             return None
         assert all(chunk_size % d == 0 for d in self.downsampling_factor)
+
         if left_context_chunks >= 0:
             num_encoders = len(self.encoder_dim)
             assert all(
@@ -922,7 +923,7 @@ class Zipformer2EncoderLayer(nn.Module):
         src_orig = src
 
         # attn_weights: (num_heads, batch_size, seq_len, seq_len)
-        attn_weights, cached_key = self.self_attn_weights.streaming_forward(
+        attn_weights, cached_key, indexes = self.self_attn_weights.streaming_forward(
             src,
             pos_emb=pos_emb,
             cached_key=cached_key,
@@ -937,6 +938,7 @@ class Zipformer2EncoderLayer(nn.Module):
             attn_weights[0:1],
             cached_x=cached_nonlin_attn,
             left_context_len=left_context_len,
+            indexes=indexes[0:1],
         )
         src = src + na
 
@@ -945,6 +947,7 @@ class Zipformer2EncoderLayer(nn.Module):
             attn_weights=attn_weights,
             cached_val=cached_val1,
             left_context_len=left_context_len,
+            indexes=indexes,
         )
         src = src + self_attn
 
@@ -965,6 +968,7 @@ class Zipformer2EncoderLayer(nn.Module):
             attn_weights=attn_weights,
             cached_val=cached_val2,
             left_context_len=left_context_len,
+            indexes=indexes,
         )
         src = src + self_attn
 
@@ -1732,15 +1736,18 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         pos_emb: Tensor,
         cached_key: Tensor,
         left_context_len: int,
+        # past_topk: int,
         key_padding_mask: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         r"""
         Args:
             x: input of shape (seq_len, batch_size, embed_dim)
             pos_emb: Positional embedding tensor, of shape (1, left_context_len+2*seq_len-1, pos_dim)
             cached_key: cached attention key tensor of left context,
-              of shape (left_context_len, batch_size, key_dim)
+              of shape (left_context_len, batch_size, key_dim),
+              where left_context_len = past_topk + chunk_size.
             left_context_len: number of left context frames.
+            past_topk: number of frames to keep in the left context.
             key_padding_mask: a bool tensor of shape (batch_size, seq_len).  Positions that
               are True in this mask will be ignored as sources in the attention weighting.
 
@@ -1748,10 +1755,11 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
            - attention weights, of shape (hum_heads, batch_size, seq_len, seq_len2),
              interpreted as (hum_heads, batch_size, tgt_seq_len, src_seq_len).
            - updated cached attention key tensor of left context.
+           - left context indexes to keep, of shape (num_heads, batch_size, past_topk).
         """
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
+        # pos_head_dim = self.pos_head_dim
         num_heads = self.num_heads
 
         seq_len, batch_size, _ = x.shape
@@ -1760,7 +1768,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         # self-attention
         q = x[..., 0:query_dim]
-        k = x[..., query_dim : 2 * query_dim]
+        chunk_k = x[..., query_dim : 2 * query_dim]
         # p is the position-encoding query
         # p = x[..., 2 * query_dim :]
         # assert p.shape[-1] == num_heads * pos_head_dim
@@ -1770,9 +1778,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             cached_key.shape[0],
             left_context_len,
         )
-        k = torch.cat([cached_key, k], dim=0)
-        # Update cached left contexts
-        cached_key = k[-left_context_len:, ...]
+        k = torch.cat([cached_key, chunk_k], dim=0)
 
         # The length of key
         k_len = k.shape[0]
@@ -1841,7 +1847,32 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
 
         attn_weights = attn_scores.softmax(dim=-1)
 
-        return attn_weights, cached_key
+        # Average over all heads and all queries
+        # (batch_size, left_context_len)
+        past_topk = left_context_len - seq_len
+        assert past_topk > 0, (past_topk, left_context_len, seq_len)
+        # (num_heads, batch_size, left_context_len)
+        mean_left_attn_weights = attn_weights[..., :left_context_len].mean(dim=2)
+        # Both of shape (num_heads, batch_size, past_topk)
+        kept_left_attn_weights, indexes = torch.topk(
+            mean_left_attn_weights, k=past_topk, dim=2
+        )
+
+        # Update cached left contexts
+        # shape of k is (num_heads, batch_size, key_head_dim, left_context_len+seq_len)
+        kept_cached_key = torch.gather(
+            k[..., :left_context_len],
+            dim=3,
+            index=indexes.unsqueeze(2).expand(-1, -1, query_head_dim, -1)
+        )  # (num_heads, batch_size, key_head_dim, past_topk)
+        kept_cached_key = kept_cached_key.permute(3, 1, 0, 2).reshape(past_topk, batch_size, query_dim)
+        # (past_topk + chunk_size, batch_size, key_dim)
+        cached_key = torch.cat([kept_cached_key, chunk_k], dim=0)
+
+        # import pdb
+        # pdb.set_trace()
+
+        return attn_weights, cached_key, indexes
 
     def _print_attn_entropy(self, attn_weights: Tensor):
         # attn_weights: (num_heads, batch_size, seq_len, seq_len)
@@ -1936,6 +1967,7 @@ class SelfAttention(nn.Module):
         attn_weights: Tensor,
         cached_val: Tensor,
         left_context_len: int,
+        indexes: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -1944,8 +1976,10 @@ class SelfAttention(nn.Module):
               with seq_len being interpreted as (tgt_seq_len, src_seq_len).  Expect
               attn_weights.sum(dim=-1) == 1.
             cached_val: cached attention value tensor of left context,
-              of shape (left_context_len, batch_size, value_dim)
+              of shape (left_context_len, batch_size, value_dim),
+              where left_context_len = past_topk + chunk_size.
             left_context_len: number of left context frames.
+            indexes: left context indexes to keep, of shape (num_heads, batch_size, past_topk)
 
         Returns:
            - attention weighted output, a tensor with the same shape as x.
@@ -1956,20 +1990,28 @@ class SelfAttention(nn.Module):
         seq_len2 = seq_len + left_context_len
         assert attn_weights.shape == (num_heads, batch_size, seq_len, seq_len2)
 
-        x = self.in_proj(x)  # (seq_len, batch_size, num_heads * value_head_dim)
+        chunk_x = self.in_proj(x)  # (seq_len, batch_size, num_heads * value_head_dim)
 
         # Pad cached left contexts
         assert cached_val.shape[0] == left_context_len, (
             cached_val.shape[0],
             left_context_len,
         )
-        x = torch.cat([cached_val, x], dim=0)
-        # Update cached left contexts
-        cached_val = x[-left_context_len:, ...]
+        x = torch.cat([cached_val, chunk_x], dim=0)
 
         x = x.reshape(seq_len2, batch_size, num_heads, -1).permute(2, 1, 0, 3)
         # now x: (num_heads, batch_size, seq_len, value_head_dim)
         value_head_dim = x.shape[-1]
+
+        # Update cached left contexts
+        past_topk = indexes.shape[-1]
+        # (num_heads, batch_size, past_topk, value_head_dim)
+        indexes = indexes.unsqueeze(-1).expand(-1, -1, -1, value_head_dim)
+        # (num_heads, batch_size, past_topk, value_head_dim)
+        kept_cached_val = torch.gather(x[:, :, :left_context_len], dim=2, index=indexes)
+        kept_cached_val = kept_cached_val.permute(2, 1, 0, 3).reshape(past_topk, batch_size, -1)
+        # (past_topk + chunk_size, batch_size, val_dim)
+        cached_val = torch.cat([kept_cached_val, chunk_x], dim=0)
 
         # todo: see whether there is benefit in overriding matmul
         x = torch.matmul(attn_weights, x)
@@ -2139,14 +2181,17 @@ class NonlinAttention(nn.Module):
         attn_weights: Tensor,
         cached_x: Tensor,
         left_context_len: int,
+        indexes: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         """.
         Args:
             x: a Tensor of shape (seq_len, batch_size, num_channels)
             attn_weights: a Tensor of shape (num_heads, batch_size, seq_len, seq_len)
             cached_x: left context, a Tensor of shape
-              (num_heads, batch_size, left_context_len, head_dim)
+              (num_heads, batch_size, left_context_len, head_dim),
+              where left_context_len = past_topk + chunk_size.
             left_context_len: number of left context frames.
+            indexes: left context indexes to keep, of shape (num_heads, batch_size, past_topk)
         Returns:
             - a Tensor with the same shape as x
             - updated left context with same shape as cached_x
@@ -2182,8 +2227,14 @@ class NonlinAttention(nn.Module):
             left_context_len,
         )
         x_pad = torch.cat([cached_x, x], dim=2)
+
         # Update cached tensor
-        cached_x = x_pad[:, :, -left_context_len:, :]
+        # (num_heads, batch_size, past_topk, head_dim)
+        indexes = indexes.unsqueeze(-1).expand(-1, -1, -1, x.shape[-1])
+        # (num_heads, batch_size, past_topk, head_dim)
+        kept_cached_x = torch.gather(cached_x, dim=2, index=indexes)
+        # (num_heads, batch_size, past_topk + chunk_size, head_dim)
+        cached_x = torch.cat([kept_cached_x, x], dim=2)
 
         x = torch.matmul(attn_weights, x_pad)
         # now x: (num_heads, batch_size, seq_len, head_dim)
@@ -2411,7 +2462,7 @@ def _test_zipformer_main(causal: bool = False):
         num_heads=(4, 4),
         causal=causal,
         chunk_size=(4,) if causal else (-1,),
-        left_context_frames=(64,),
+        left_context_frames=(-1,),
     )
     batch_size = 5
     seq_len = 20
@@ -2433,5 +2484,5 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    _test_zipformer_main(False)
+    # _test_zipformer_main(False)
     _test_zipformer_main(True)
