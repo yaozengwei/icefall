@@ -3,7 +3,7 @@
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
-export CUDA_VISIBLE_DEVICES="3"
+export CUDA_VISIBLE_DEVICES="0"
 world_size=1
 
 set -eou pipefail
@@ -15,6 +15,9 @@ stop_stage=4
 output_dir=$PWD/data/cases_and_punc
 
 num_codebooks=4
+prompt_num_codebook_frames=225
+
+. shared/parse_options.sh || exit 1
 
 log() {
   # This function is from espnet
@@ -24,7 +27,7 @@ log() {
 
 if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
   log "Stage 2: Perform speech encoding"
-  for subset in dev test_clean test_other small; do
+  for subset in dev test_clean test_other small medium large; do
     ./transducer_discrete/encode_speech.py \
       --world-size $world_size \
       --num-workers 24 \
@@ -34,6 +37,16 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
       --manifest-out-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
       --max-duration 1000 \
       --master-port 12345
+  done
+fi
+
+if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
+  log "Stage 3: Prepare acoutic prompts "
+  for subset in test_clean test_other small; do
+    ./transducer_discrete/prepare_prompt.py \
+      --subset $subset \
+      --manifest-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
+      --prompt-num-codebook-frames $prompt_num_codebook_frames
   done
 fi
 

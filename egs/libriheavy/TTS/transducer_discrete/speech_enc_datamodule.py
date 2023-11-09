@@ -45,7 +45,7 @@ class SpeechEncodingDataset(torch.utils.data.Dataset):
             'cuts': list of Cuts  # when return_cuts=True
         }
     """
-    def __init__(self, return_cuts: bool = True, sampling_rate: int = 22050):
+    def __init__(self, return_cuts: bool = True, sampling_rate: int = 24000):
         super().__init__()
         self.return_cuts = return_cuts
         self.sampling_rate = sampling_rate
@@ -131,7 +131,7 @@ class SpeechEncDataModule:
         group.add_argument(
             "--sampling-rate",
             type=int,
-            default=22050,
+            default=24000,
             help="Target sampling rate.",
         )
 

@@ -100,7 +100,7 @@ def get_params() -> AttributeDict:
     """Return a dict containing speech encoding parameters."""
     params = AttributeDict(
         {
-            "codebook_frame_shift": 320,  # The hop_length in EnCodec is 320
+            "codebook_frame_shift": 320,  # The hop_length in EnCodec is 320 samples
             # Supported bandwidths are 1.5kbps (n_q = 2), 3 kbps (n_q = 4),
             # 6 kbps (n_q = 8) and 12 kbps (n_q = 16) and 24kbps (n_q = 32).
             "num_codebooks_to_bandwidths": {2: 1.5, 4: 3.0, 8: 6.0, 16: 12.0, 32: 24.0}
@@ -214,6 +214,7 @@ def run(rank, world_size, args):
 
     model = EncodecModel.encodec_model_24khz()
     model.set_target_bandwidth(params.num_codebooks_to_bandwidths[params.num_codebooks])
+    assert params.sampling_rate == model.sample_rate, (params.sampling_rate, model.sample_rate)
 
     device = torch.device("cpu")
     if torch.cuda.is_available():
@@ -277,8 +278,8 @@ def main():
     manifest_out_dir.mkdir(parents=True, exist_ok=True)
 
     args.suffix = ".jsonl.gz"
-    args.cuts_filename = f"libriheavy_cuts_{args.subset}"
-    args.codebooks_filename = f"libriheavy_codebooks_{args.subset}"
+    args.cuts_filename = f"libriheavy_cuts_{subset}"
+    args.codebooks_filename = f"libriheavy_codebooks_{subset}"
 
     out_cuts_filename = manifest_out_dir / (args.cuts_filename + args.suffix)
     if out_cuts_filename.is_file():
