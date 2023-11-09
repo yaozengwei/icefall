@@ -29,6 +29,7 @@ from typing import List, Union
 
 from encodec import EncodecModel
 from speech_enc_datamodule import SpeechEncDataModule
+from icefall.dist import cleanup_dist, setup_dist
 from icefall.utils import AttributeDict, setup_logger
 from lhotse import CutSet, load_manifest_lazy
 from lhotse.cut import Cut, MonoCut
@@ -187,7 +188,7 @@ def encode_dataset(
 
 
 @torch.no_grad()
-def run(rank, world_size, args, in_cuts):
+def run(rank, world_size, args):
     """
     Args:
       rank:
@@ -200,13 +201,15 @@ def run(rank, world_size, args, in_cuts):
     params = get_params()
     params.update(vars(args))
 
+    if world_size > 1:
+        setup_dist(rank, world_size, params.master_port)
+
+    setup_logger(f"{params.log_dir}/log-encode-{params.num_codebooks}-codebooks")
+    logging.info("Encoding started")
+
     assert params.num_codebooks in params.num_codebooks_to_bandwidths, (
         f"Supported codebook numbers are {params.num_codebooks_to_bandwidths.keys()}"
     )
-
-    setup_logger(f"{params.log_dir}/log-encode-codebooks")
-    logging.info("Encoding started")
-
     logging.info(f"{params}")
 
     model = EncodecModel.encodec_model_24khz()
@@ -221,7 +224,6 @@ def run(rank, world_size, args, in_cuts):
     model.eval()
 
     if world_size > 1:
-        in_cuts = in_cuts[rank]
         out_cuts_filename = params.manifest_out_dir / (
             f"{params.cuts_filename}_job_{rank}" + params.suffix
         )
@@ -237,6 +239,7 @@ def run(rank, world_size, args, in_cuts):
     # we will store new cuts with encoded codebooks.
     args.return_cuts = True
     data_module = SpeechEncDataModule(args)
+    in_cuts = load_manifest_lazy(args.manifest_in_dir / (args.cuts_filename + args.suffix))
     dl = data_module.dataloader(in_cuts)
 
     cuts_writer = CutSet.open_writer(out_cuts_filename, overwrite=True)
@@ -256,6 +259,10 @@ def run(rank, world_size, args, in_cuts):
     logging.info(f"Codebooks saved to {codebooks_filename}")
 
     logging.info("Done!")
+
+    if world_size > 1:
+        torch.distributed.barrier()
+        cleanup_dist()
 
 
 def main():
@@ -278,30 +285,18 @@ def main():
         print(f"{out_cuts_filename} already exists - skipping.")
         return
 
-    in_cuts_filename = args.manifest_in_dir / (args.cuts_filename + args.suffix)
-    in_cuts = load_manifest_lazy(in_cuts_filename)
-
     world_size = args.world_size
     assert world_size >= 1
     if world_size > 1:
-        chunk_size = (len(in_cuts) + (world_size - 1)) // world_size
-        # Each manifest is saved at: ``{output_dir}/{prefix}.{split_idx}.jsonl.gz``
-        splits = in_cuts.split_lazy(
-            output_dir=args.manifest_in_dir / "split",
-            chunk_size=chunk_size,
-            prefix=args.cuts_filename,
-        )
-        assert len(splits) == world_size, (len(splits), world_size)
-        mp.spawn(run, args=(world_size, args, splits), nprocs=world_size, join=True)
+        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
 
         files_to_combine = f"{manifest_out_dir}/{args.cuts_filename}_job_*{args.suffix}"
         os.system(f"lhotse combine {files_to_combine} {out_cuts_filename}")
         print(f"Combined to {out_cuts_filename}")
 
         os.system(f"rm {files_to_combine}")
-        os.system(f"rm -r {args.manifest_in_dir}/split")
     else:
-        run(rank=0, world_size=world_size, args=args, in_cuts=in_cuts)
+        run(rank=0, world_size=world_size, args=args)
 
 
 torch.set_num_threads(1)
