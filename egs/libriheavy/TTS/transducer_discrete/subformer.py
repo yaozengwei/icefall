@@ -332,7 +332,7 @@ class Subformer(EncoderInterface):
             ans.masked_fill_(attn_mask, float('-inf'))
 
         if src_key_padding_mask is not None:
-            ans = ans * src_key_padding_mask.unsqueeze(1).logical_not()
+            ans.masked_fill_(src_key_padding_mask.unsqueeze(1), float('-inf'))
             # now ans: (batch_size, seq_len, seq_len).
 
         return ans
