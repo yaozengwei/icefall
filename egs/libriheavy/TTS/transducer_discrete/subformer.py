@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c)  2021  University of Chinese Academy of Sciences (author: Han Zhu)
+# Copyright          2023  Xiaomi Corp.        (authors: Daniel Povey)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -218,7 +218,7 @@ class Subformer(EncoderInterface):
         """
         Args:
           x:
-            The input tensor. Its shape is (batch_size, seq_len, feature_dim).
+            The input tensor. Its shape is (seq_len, batch_size, feature_dim).
           x_lens:
             A tensor of shape (batch_size,) containing the number of frames in
             `x` before padding.
@@ -232,7 +232,7 @@ class Subformer(EncoderInterface):
 
         Returns:
           Return a tuple containing 2 tensors:
-            - embeddings: its shape is (batch_size, output_seq_len, max(encoder_dim))
+            - embeddings: its shape is (output_seq_len, batch_size, max(encoder_dim))
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
