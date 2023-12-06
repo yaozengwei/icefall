@@ -169,8 +169,8 @@ def encode_dataset(
             encoded_frames = model.encode(audio)
             assert len(encoded_frames) == 1, len(encoded_frames)
             codebooks = encoded_frames[0][0].transpose(1, 2).cpu().numpy()  # (B, T', n_q)
-            assert np.min(codebooks) >= 0
-            assert np.max(codebooks) < 1024
+            assert np.min(codebooks) >= 0, np.min(codebooks)
+            assert np.max(codebooks) < 1024, np.max(codebooks)
 
             frame_shift_in_second = params.codebook_frame_shift / params.sampling_rate
             futures.append(

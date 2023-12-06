@@ -82,6 +82,8 @@ class TtsModel(nn.Module):
         self.simple_am_proj = ScaledLinear(encoder_dim, vocab_size, initial_scale=0.25)
         self.simple_lm_proj = ScaledLinear(decoder_dim, vocab_size, initial_scale=0.25)
 
+        self.cached = None  # used to cache encoder out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -94,6 +96,7 @@ class TtsModel(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
+        cache_encoder_out: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -156,26 +159,32 @@ class TtsModel(nn.Module):
             prompt_lens.shape,
         )
 
-        # forward prompt-encoder
-        prompt = self.prompt_embed(prompt)
-        prompt_out, prompt_out_lens = self.prompt_encoder(
-            x=prompt,
-            x_lens=prompt_lens,
-            src_key_padding_mask=make_pad_mask(prompt_lens),
-        )
-        prompt_out = prompt_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
+        if self.cached is None:
+            # forward prompt-encoder
+            prompt = self.prompt_embed(prompt)
+            prompt_out, prompt_out_lens = self.prompt_encoder(
+                x=prompt,
+                x_lens=prompt_lens,
+                src_key_padding_mask=make_pad_mask(prompt_lens),
+            )
+            prompt_out = prompt_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
 
-        # forward text-encoder with audio prompt output
-        x_out = self.text_embed(x)
-        x_out = x_out.transpose(0, 1),  # (N, T, D) -> (T, N, D)
-        encoder_out, encoder_out_lens = self.text_encoder(
-            x=x_out,
-            x_lens=x_lens,
-            src_key_padding_mask=make_pad_mask(x_lens),
-            memory=prompt_out,
-            memory_key_padding_mask=make_pad_mask(prompt_out_lens),
-        )
-        encoder_out = encoder_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
+            # forward text-encoder with audio prompt output
+            x_out = self.text_embed(x)
+            x_out = x_out.transpose(0, 1),  # (N, T, D) -> (T, N, D)
+            encoder_out, encoder_out_lens = self.text_encoder(
+                x=x_out,
+                x_lens=x_lens,
+                src_key_padding_mask=make_pad_mask(x_lens),
+                memory=prompt_out,
+                memory_key_padding_mask=make_pad_mask(prompt_out_lens),
+            )
+            encoder_out = encoder_out.transpose(0, 1)  # (T, N, D) -> (N, T, D)
+
+            if cache_encoder_out:
+                self.cached = (encoder_out, encoder_out_lens)
+        else:
+            (encoder_out, encoder_out_lens) = self.cached
 
         # Now for the decoder, i.e., the prediction module
         num_codebooks = self.num_codebooks
