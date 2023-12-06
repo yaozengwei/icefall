@@ -15,7 +15,7 @@ stop_stage=4
 output_dir=$PWD/data/cases_and_punc
 
 num_codebooks=4
-prompt_num_codebook_frames=225
+prompt_duration=10
 
 . shared/parse_options.sh || exit 1
 
@@ -42,11 +42,11 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   log "Stage 3: Prepare acoutic prompts "
-  for subset in test_clean test_other small; do
+  for subset in dev test_clean test_other small medium large; do
     ./transducer_discrete/prepare_prompt.py \
       --subset $subset \
       --manifest-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
-      --prompt-num-codebook-frames $prompt_num_codebook_frames
+      --prompt-duration $prompt_duration
   done
 fi
 

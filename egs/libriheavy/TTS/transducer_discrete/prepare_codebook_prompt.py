@@ -21,7 +21,6 @@ import copy
 import logging
 import random
 from pathlib import Path
-from tqdm import tqdm
 
 from lhotse import CutSet, load_manifest_lazy
 from lhotse.serialization import SequentialJsonlWriter
@@ -48,10 +47,12 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--prompt-duration",
-        type=float,
-        default=10.0,
-        help="""Duration in seconds of acoustic prompt.""",
+        "--prompt-num-codebook-frames",
+        type=int,
+        default=225,
+        help="""Number of codebook frames for acoustic prompt. E.g, with
+        sampling_rate=24000, codebook_frame_shift=320, the prompt audio duration for
+        prompt_num_codebooks_frames=225 is 225 * 320 / 24000 = 3.0 seconds.""",
     )
 
     return parser
@@ -60,42 +61,30 @@ def get_parser():
 def prepare_prompt(
     in_cuts: CutSet,
     cuts_writer: SequentialJsonlWriter,
-    prompt_duration: float,
+    prompt_num_codebook_frames: int,
 ):
-    for speaker in tqdm(in_cuts.speakers):
-        # filter cuts for each speaker
+
+    for speaker in in_cuts.speakers:
+        # filter cuts for one speaker
         cuts = in_cuts.filter(lambda s: s.supervisions[0].speaker == speaker)
+        # shuffle the cuts to generate prompt pairs, using cuts[i+1] as prompt of cuts[i]
+        cuts = cuts.to_eager().shuffle()
 
-        cuts = cuts.to_eager()
         num_cuts = len(cuts)
-        if num_cuts < 2:
-            logging.info(
-                f"Skip for speaker {speaker} since the number of cuts is less than 2"
+        for i in range(num_cuts):
+            cut = copy.deepcopy(cuts[i])
+            # use next cut as prompt cut
+            prompt_cut = cuts[(i + 1) % num_cuts]
+            cut.prompt_cut = prompt_cut
+            assert prompt_cut.codebooks.num_frames >= prompt_num_codebook_frames, (
+                prompt_cut.id,
+                prompt_cut.codebooks.num_frames,
+                prompt_num_codebook_frames
             )
-            continue
-
-        cuts_prompt = cuts.shuffle()
-
-        for cut, cut_p in zip(cuts, cuts_prompt):
-            if cut.id == cut_p.id:
-                while True:
-                    index = random.randint(0, num_cuts - 1)
-                    cut_p = cuts[index]
-                    if cut.id != cut_p.id:
-                        break
-
-            cut = copy.deepcopy(cut)
-            cut_p = copy.deepcopy(cut_p)
-
-            cur_prompt_duration = min(prompt_duration, cut_p.duration)
-            # select a random start in prompt_cut
-            prompt_start = random.uniform(
-                0.0, cut_p.duration - cur_prompt_duration
+            # select a random frame start
+            cut.prompt_codebook_frame_start = random.randint(
+                0, prompt_cut.codebooks.num_frames - prompt_num_codebook_frames
             )
-            cut_p.start = cut_p.start + prompt_start
-            cut_p.duration = cur_prompt_duration
-
-            cut.prompt_cut = cut_p
             cuts_writer.write(cut, flush=False)
 
 
@@ -114,12 +103,15 @@ def main():
         logging.info(f"{out_cuts_filename} already exists - skipping.")
         return
 
-    logging.info(f"Preparing prompt manifests for subset {subset}")
+    logging.info("Preparing prompt manifests for subset")
 
     in_cuts = load_manifest_lazy(manifest_dir / f"libriheavy_cuts_{subset}{suffix}")
     cuts_writer = CutSet.open_writer(out_cuts_filename, overwrite=True)
 
-    prepare_prompt(in_cuts, cuts_writer, args.prompt_duration)
+    in_cuts = in_cuts.filter(
+        lambda s: s.codebooks.num_frames >= args.prompt_num_codebook_frames
+    )
+    prepare_prompt(in_cuts, cuts_writer, args.prompt_num_codebook_frames)
 
     cuts_writer.close()
     logging.info(f"Cuts saved to {out_cuts_filename}")
