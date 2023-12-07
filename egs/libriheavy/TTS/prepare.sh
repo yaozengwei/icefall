@@ -46,7 +46,8 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
     ./transducer_discrete/prepare_prompt.py \
       --subset $subset \
       --manifest-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
-      --prompt-duration $prompt_duration
+      --prompt-duration $prompt_duration \
+      --num-jobs 10
   done
 fi
 

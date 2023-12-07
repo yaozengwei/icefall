@@ -20,11 +20,13 @@ import argparse
 import copy
 import logging
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
+from typing import Optional
 
 from lhotse import CutSet, load_manifest_lazy
-from lhotse.serialization import SequentialJsonlWriter
+from lhotse.manipulation import combine
 
 
 def get_parser():
@@ -51,52 +53,98 @@ def get_parser():
         "--prompt-duration",
         type=float,
         default=10.0,
-        help="""Duration in seconds of acoustic prompt.""",
+        help="Duration in seconds of acoustic prompt.",
+    )
+
+    parser.add_argument(
+        "--num-jobs",
+        type=int,
+        default=1,
+        help="The number of parallel processes.",
     )
 
     return parser
 
 
+def add_prompt(cuts: CutSet, prompt_duration: float) -> CutSet:
+    """Add prompt_cut for each cut."""
+    new_cuts = []
+    num_cuts = len(cuts)
+    cuts_prompt = cuts.shuffle()
+    for cut, cut_p in zip(cuts, cuts_prompt):
+        if cut.id == cut_p.id:
+            # select another cut_p with different id
+            while True:
+                index = random.randint(0, num_cuts - 1)
+                cut_p = cuts[index]
+                if cut.id != cut_p.id:
+                    break
+
+        cut = copy.deepcopy(cut)
+        cut_p = copy.deepcopy(cut_p)
+
+        cur_prompt_duration = min(prompt_duration, cut_p.duration)
+        # select a random start in prompt_cut
+        prompt_start = random.uniform(
+            0.0, cut_p.duration - cur_prompt_duration
+        )
+        cut_p.start = cut_p.start + prompt_start
+        cut_p.duration = cur_prompt_duration
+
+        cut.prompt_cut = cut_p
+        new_cuts.append(cut)
+
+    return CutSet.from_cuts(new_cuts)
+
+
 def prepare_prompt(
     in_cuts: CutSet,
-    cuts_writer: SequentialJsonlWriter,
     prompt_duration: float,
-):
-    for speaker in tqdm(in_cuts.speakers):
-        # filter cuts for each speaker
-        cuts = in_cuts.filter(lambda s: s.supervisions[0].speaker == speaker)
+    executor: Optional[ProcessPoolExecutor] = None,
+) -> CutSet:
+    """
+    Args:
+        in_cuts: Input CutSet
+        prompt_duration: Duration in seconds as prompt.
+        executor: Used to parallelize the feature extraction process.
 
-        cuts = cuts.to_eager()
-        num_cuts = len(cuts)
-        if num_cuts < 2:
+    Returns:
+        A new CutSet with prompt_cut for each cut.
+    """
+    cuts_per_speaker = {}  # {speaker: List[cut]}
+    for cut in tqdm(in_cuts, desc="Grouping cuts by speakers"):
+        speaker = cut.supervisions[0].speaker
+        if speaker in cuts_per_speaker:
+            cuts_per_speaker[speaker].append(cut)
+        else:
+            cuts_per_speaker[speaker] = [cut]
+
+    for speaker in tqdm(in_cuts.speakers, desc="Filtering cuts groups"):
+        if len(cuts_per_speaker[speaker]) < 2:
+            cuts_per_speaker.pop(speaker, None)
             logging.info(
                 f"Skip for speaker {speaker} since the number of cuts is less than 2"
             )
-            continue
 
-        cuts_prompt = cuts.shuffle()
+    # List[CutSet]
+    cuts_per_speaker = [CutSet.from_cuts(cuts) for cuts in cuts_per_speaker.values()]
 
-        for cut, cut_p in zip(cuts, cuts_prompt):
-            if cut.id == cut_p.id:
-                while True:
-                    index = random.randint(0, num_cuts - 1)
-                    cut_p = cuts[index]
-                    if cut.id != cut_p.id:
-                        break
+    out_cuts = []
+    with tqdm(total=len(cuts_per_speaker), desc="Adding prompts for each speaker") as pbar:
+        if executor is None:
+            for cuts in cuts_per_speaker:
+                out_cuts.append(add_prompt(cuts, prompt_duration))
+                pbar.update(1)
+        else:
+            futures = [
+                executor.submit(add_prompt, cuts, prompt_duration)
+                for cuts in cuts_per_speaker
+            ]
+            for future in as_completed(futures):
+                out_cuts.append(future.result())
+                pbar.update(1)
 
-            cut = copy.deepcopy(cut)
-            cut_p = copy.deepcopy(cut_p)
-
-            cur_prompt_duration = min(prompt_duration, cut_p.duration)
-            # select a random start in prompt_cut
-            prompt_start = random.uniform(
-                0.0, cut_p.duration - cur_prompt_duration
-            )
-            cut_p.start = cut_p.start + prompt_start
-            cut_p.duration = cur_prompt_duration
-
-            cut.prompt_cut = cut_p
-            cuts_writer.write(cut, flush=False)
+    return combine(out_cuts)
 
 
 def main():
@@ -106,10 +154,13 @@ def main():
     subset = args.subset
     assert subset in ["small", "medium", "large", "dev", "test_clean", "test_other"], subset
 
+    prompt_duration = args.prompt_duration
     manifest_dir = args.manifest_dir
     suffix = ".jsonl.gz"
 
-    out_cuts_filename = manifest_dir / f"libriheavy_cuts_{args.subset}_with_prompt{suffix}"
+    out_cuts_filename = (
+        manifest_dir / f"libriheavy_cuts_{args.subset}_with_{prompt_duration}s_prompt{suffix}"
+    )
     if out_cuts_filename.is_file():
         logging.info(f"{out_cuts_filename} already exists - skipping.")
         return
@@ -117,11 +168,14 @@ def main():
     logging.info(f"Preparing prompt manifests for subset {subset}")
 
     in_cuts = load_manifest_lazy(manifest_dir / f"libriheavy_cuts_{subset}{suffix}")
-    cuts_writer = CutSet.open_writer(out_cuts_filename, overwrite=True)
 
-    prepare_prompt(in_cuts, cuts_writer, args.prompt_duration)
+    executor = None
+    if args.num_jobs > 1:
+        executor = ProcessPoolExecutor(max_workers=args.num_jobs)
 
-    cuts_writer.close()
+    out_cuts = prepare_prompt(in_cuts, args.prompt_duration, executor)
+
+    out_cuts.to_file(out_cuts_filename)
     logging.info(f"Cuts saved to {out_cuts_filename}")
 
 
