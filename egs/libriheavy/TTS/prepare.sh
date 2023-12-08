@@ -3,8 +3,8 @@
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
-export CUDA_VISIBLE_DEVICES="0"
-world_size=1
+export CUDA_VISIBLE_DEVICES="5,6"
+world_size=2
 
 set -eou pipefail
 
@@ -42,12 +42,29 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   log "Stage 3: Prepare acoutic prompts "
-  for subset in dev test_clean test_other small medium large; do
+  # for subset in dev test_clean test_other small medium large; do
+  for subset in dev; do
     ./transducer_discrete/prepare_prompt.py \
       --subset $subset \
       --manifest-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
       --prompt-duration $prompt_duration \
       --num-jobs 10
+  done
+fi
+
+if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
+  log "Stage 4: Extract speaker embeddings for prompt cuts"
+  # for subset in dev test_clean test_other small medium large; do
+  for subset in dev; do
+    ./transducer_discrete/extract_speaker_embedding.py \
+      --subset $subset \
+      --model-file data/titanet_large.pt \
+      --manifest-out-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
+      --prompt-duration $prompt_duration \
+      --world-size $world_size \
+      --num-workers 2 \
+      --max-duration 2000 \
+      --master-port 12345
   done
 fi
 

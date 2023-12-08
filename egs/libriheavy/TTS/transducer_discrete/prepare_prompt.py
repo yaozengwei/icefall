@@ -88,6 +88,7 @@ def add_prompt(cuts: CutSet, prompt_duration: float) -> CutSet:
         prompt_start = random.uniform(
             0.0, cut_p.duration - cur_prompt_duration
         )
+        cut_p.id = cut.id + "_prompt"
         cut_p.start = cut_p.start + prompt_start
         cut_p.duration = cur_prompt_duration
 
@@ -159,7 +160,7 @@ def main():
     suffix = ".jsonl.gz"
 
     out_cuts_filename = (
-        manifest_dir / f"libriheavy_cuts_{args.subset}_with_{prompt_duration}s_prompt{suffix}"
+        manifest_dir / f"libriheavy_cuts_{args.subset}_{prompt_duration}s_prompt{suffix}"
     )
     if out_cuts_filename.is_file():
         logging.info(f"{out_cuts_filename} already exists - skipping.")
