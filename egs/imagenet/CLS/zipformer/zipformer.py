@@ -96,12 +96,10 @@ class Zipformer2(nn.Module):
             downsampling_factor: Tuple[int] = (2, 2),
             encoder_dim: Union[int, Tuple[int]] = 384,
             num_encoder_layers: Union[int, Tuple[int]] = 4,
-            encoder_unmasked_dim: Union[int, Tuple[int]] = 256,
             query_head_dim: Union[int, Tuple[int]] = 32,
             value_head_dim: Union[int, Tuple[int]] = 12,
             num_heads: Union[int, Tuple[int]] = 8,
             feedforward_dim: Union[int, Tuple[int]] = 1536,
-            cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
             select_topk: Union[int, Tuple[int]] = 16,
             dropout: FloatLike = None,  # see code below for default
@@ -126,28 +124,23 @@ class Zipformer2(nn.Module):
 
         self.downsampling_factor = downsampling_factor # tuple
         self.encoder_dim = encoder_dim = _to_tuple(encoder_dim) # tuple
-        self.encoder_unmasked_dim = encoder_unmasked_dim = _to_tuple(encoder_unmasked_dim) # tuple
         num_encoder_layers = _to_tuple(num_encoder_layers)
         self.num_encoder_layers = num_encoder_layers
         self.query_head_dim = query_head_dim = _to_tuple(query_head_dim)
         self.value_head_dim = value_head_dim = _to_tuple(value_head_dim)
         self.num_heads = num_heads = _to_tuple(num_heads)
         feedforward_dim = _to_tuple(feedforward_dim)
-        self.cnn_module_kernel = cnn_module_kernel = _to_tuple(cnn_module_kernel)
-
-        for u,d in zip(encoder_unmasked_dim, encoder_dim):
-            assert u <= d
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=encoder_dim[0])
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
-
-        img_size = img_size // patch_size
+        cur_img_size = img_size // patch_size
+        last_embed_dim = encoder_dim[0]
         num_encoders = len(downsampling_factor)
         for i in range(num_encoders):
-            cur_img_size = img_size // downsampling_factor[i]
+            cur_img_size = cur_img_size // downsampling_factor[i]
             assert cur_img_size % block_size[i] == 0
             assert cur_img_size ** 2 - block_size[i] ** 2 >= select_topk[i]
 
@@ -158,7 +151,6 @@ class Zipformer2(nn.Module):
                 value_head_dim=value_head_dim[i],
                 feedforward_dim=feedforward_dim[i],
                 dropout=dropout,
-                cnn_module_kernel=cnn_module_kernel[i],
                 block_size=block_size[i],
                 select_topk=select_topk[i],
             )
@@ -180,11 +172,13 @@ class Zipformer2(nn.Module):
             if downsampling_factor[i] != 1:
                 encoder = DownsampledZipformer2Encoder(
                     encoder,
-                    dim=encoder_dim[i],
+                    in_channel=last_embed_dim,
+                    out_channel=encoder_dim[i],
                     downsample=downsampling_factor[i],
                     dropout=dropout,
                 )
 
+            last_embed_dim = encoder_dim[i]
             encoders.append(encoder)
 
         self.encoders = nn.ModuleList(encoders)
@@ -192,63 +186,6 @@ class Zipformer2(nn.Module):
         max_encoder_dim = max(encoder_dim)
         self.norm = BiasNorm(max_encoder_dim)
         self.head = nn.Linear(max_encoder_dim, num_classes)
-
-    def get_feature_masks(
-            self,
-            x: Tensor) -> Union[List[float], List[Tensor]]:
-        """
-        In eval mode, returns [1.0] * num_encoders; in training mode, returns a number of
-        randomized feature masks, one per encoder.
-        On e.g. 15% of frames, these masks will zero out all enocder dims larger than
-        some supplied number, e.g. >256, so in effect on those frames we are using
-        a smaller encoer dim.
-
-        We generate the random masks at this level because we want the 2 masks to 'agree'
-        all the way up the encoder stack. This will mean that the 1st mask will have
-        mask values repeated self.zipformer_subsampling_factor times.
-
-        Args:
-           x: the embeddings (needed for the shape and dtype and device), of shape
-             (batch_size, height, width, encoder_dims0)
-        """
-        num_encoders = len(self.encoder_dim)
-        if not self.training:
-            return [ 1.0 ] * num_encoders
-
-        (batch_size, height, width, _encoder_dims0) = x.shape
-
-        assert self.encoder_dim[0] == _encoder_dims0
-
-        feature_mask_dropout_prob = 0.125
-
-        # mask1 shape: (batch_size, 1, 1, 1)
-        mask1 = (torch.rand(batch_size, 1, 1, 1,
-                            device=x.device) >
-                 feature_mask_dropout_prob).to(x.dtype)
-
-        # mask2 has additional sequences masked, about twice the number.
-        mask2 = torch.logical_and(mask1,
-                                  (torch.rand(batch_size, 1, 1, 1,
-                                              device=x.device) >
-                                   feature_mask_dropout_prob).to(x.dtype))
-
-        # dim: (1, batch_size, 2)
-        mask = torch.cat((mask1, mask2), dim=-1)
-
-        feature_masks = []
-        for i in range(num_encoders):
-            channels = self.encoder_dim[i]
-            feature_mask = torch.ones(batch_size, 1, 1, channels,
-                                      dtype=x.dtype, device=x.device)
-            u1 = self.encoder_unmasked_dim[i]
-            u2 = u1 + (channels - u1) // 2
-
-            feature_mask[:, :, :, u1:u2] *= mask[..., 0:1]
-            feature_mask[:, :, :, u2:] *= mask[..., 1:2]
-
-            feature_masks.append(feature_mask)
-
-        return feature_masks
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -261,43 +198,13 @@ class Zipformer2(nn.Module):
         """
         x = self.patch_embed(x)  # (batch, height, width, channel)
 
-        outputs = []
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            feature_masks = [1.0] * len(self.encoder_dim)
-        else:
-            feature_masks = self.get_feature_masks(x)
-
         for i, module in enumerate(self.encoders):
-            x = convert_num_channels(x, self.encoder_dim[i])
-            x = module(x, feature_mask=feature_masks[i])
-            outputs.append(x)
-
-        # if the last output has the largest dimension, x will be unchanged,
-        # it will be the same as outputs[-1].  Otherwise it will be concatenated
-        # from different pieces of 'outputs', taking each dimension from the
-        # most recent output that has it present.
-        x = self._get_full_dim_output(outputs)
-        # now x: (batch, height, width, channel)
+            x = module(x)
 
         x = self.norm(x)
         x = self.head(x.mean(dim=(1, 2)))
 
         return x
-
-    def _get_full_dim_output(self, outputs: List[Tensor]):
-        num_encoders = len(self.encoder_dim)
-        assert len(outputs) == num_encoders
-        output_dim = max(self.encoder_dim)
-        output_pieces = [ outputs[-1] ]
-        cur_dim = self.encoder_dim[-1]
-        for i in range(num_encoders - 2, -1, -1):
-            d = self.encoder_dim[i]
-            if d > cur_dim:
-                this_output = outputs[i]
-                output_pieces.append(this_output[..., cur_dim:d])
-                cur_dim = d
-        assert cur_dim == output_dim
-        return torch.cat(output_pieces, dim=-1)
 
 
 def _whitening_schedule(x: float, ratio: float = 2.0) -> ScheduledFloat:
@@ -335,9 +242,7 @@ class Zipformer2EncoderLayer(nn.Module):
             block_size: int = 4,
             select_topk: int = 16,
             dropout: FloatLike = 0.1,
-            cnn_module_kernel: int = 3,
             attention_skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
-            conv_skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
             const_attention_rate: FloatLike = ScheduledFloat((0.0, 0.25), (4000.0, 0.025), default=0),
             ff2_skip_rate: FloatLike = ScheduledFloat((0.0, 0.1), (4000.0, 0.01), (50000.0, 0.0)),
             ff3_skip_rate: FloatLike = ScheduledFloat((0.0, 0.1), (4000.0, 0.01), (50000.0, 0.0)),
@@ -354,9 +259,6 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # skip probability for dynamic modules (meaning: anything but feedforward).
         self.attention_skip_rate = copy.deepcopy(attention_skip_rate)
-        # an additional skip probability that applies to ConvModule to stop it from
-        # contributing too much early on.
-        self.conv_skip_rate = copy.deepcopy(conv_skip_rate)
 
         # ff2_skip_rate is to prevent the ff2 module from having output that's too big
         # compared to its residual.
@@ -390,30 +292,12 @@ class Zipformer2EncoderLayer(nn.Module):
                                                (feedforward_dim * 5) // 4,
                                                dropout)
 
-        self.nonlin_attention = NonlinAttention(embed_dim,
-                                                hidden_channels=3 * embed_dim // 4,
-                                                block_size=block_size, select_topk=select_topk)
-
-        self.conv_module1 = ConvolutionModule(embed_dim,
-                                              cnn_module_kernel)
-
-        self.conv_module2 = ConvolutionModule(embed_dim,
-                                              cnn_module_kernel)
-
         self.norm = BiasNorm(embed_dim)
 
         self.balancer1 = Balancer(
             embed_dim, channel_dim=-1,
             min_positive=0.45, max_positive=0.55,
             min_abs=0.2, max_abs=4.0,
-        )
-
-        # balancer for output of NonlinAttentionModule
-        self.balancer_na = Balancer(
-            embed_dim, channel_dim=-1,
-            min_positive=0.3, max_positive=0.7,
-            min_abs=ScheduledFloat((0.0, 0.004), (4000.0, 0.02)),
-            prob=0.05,  # out of concern for memory usage
         )
 
         # balancer for output of feedforward2, prevent it from staying too
@@ -495,32 +379,9 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self_attn_dropout_mask = self.get_sample_dropout_mask(src, attention_skip_rate)
 
-        selected_attn_weights = attn_weights[0:1]
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            pass
-        elif not self.training and random.random() < float(self.const_attention_rate):
-            # Make attention weights constant.  The intention is to
-            # encourage these modules to do something similar to an
-            # averaging-over-time operation.
-            # only need the mask, can just use the 1st one and expand later
-            selected_attn_weights = selected_attn_weights[0:1]
-            selected_attn_weights = (selected_attn_weights > 0.0).to(selected_attn_weights.dtype)
-            selected_attn_weights = selected_attn_weights * (1.0 / selected_attn_weights.sum(dim=-1, keepdim=True))
-
-        na = self.balancer_na(self.nonlin_attention(
-            src, indexes=indexes, weights=weights, attn_weights=selected_attn_weights))
-
-        src = src + (na if self_attn_dropout_mask is None else na * self_attn_dropout_mask)
-
         self_attn = self.self_attn1(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
-
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            conv_skip_rate = 0.0
-        else:
-            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
-        src = src + self.sample_dropout(self.conv_module1(src), conv_skip_rate)
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             ff2_skip_rate = 0.0
@@ -535,12 +396,6 @@ class Zipformer2EncoderLayer(nn.Module):
         self_attn = self.self_attn2(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
-
-        if torch.jit.is_scripting() or torch.jit.is_tracing():
-            conv_skip_rate = 0.0
-        else:
-            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
-        src = src + self.sample_dropout(self.conv_module2(src), conv_skip_rate)
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             ff3_skip_rate = 0.0
@@ -621,11 +476,7 @@ class Zipformer2Encoder(nn.Module):
             self.linear_q = nn.Linear(self.embed_dim, select_dim)
             self.linear_k = nn.Linear(self.embed_dim, select_dim)
 
-    def forward(
-        self,
-        src: Tensor,
-        feature_mask: Union[Tensor, float] = 1.0,
-    ) -> Tensor:
+    def forward(self, src: Tensor) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
@@ -643,7 +494,7 @@ class Zipformer2Encoder(nn.Module):
         """
         batch, height, width, channel = src.size()
 
-        assert (height, width) == self.resolution
+        assert (height, width) == self.resolution, ((height, width), self.resolution)
 
         # apply absolute positional embedding
         src = src + self.pos_dropout(self.pos_embed)
@@ -663,14 +514,8 @@ class Zipformer2Encoder(nn.Module):
 
         output = src
 
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-            output = output * feature_mask
-
         for i, mod in enumerate(self.layers):
             output = mod(output, indexes=indexes, weights=weights)
-
-            if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-                output = output * feature_mask
 
         return output
 
@@ -752,7 +597,10 @@ class Zipformer2Encoder(nn.Module):
         weights = (sscores[..., :topk] * topk).sigmoid()
 
         if random.random() < 0.01 or __name__ == "__main__":
-            logging.info(f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
+            logging.info(
+                f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, "
+                f"mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}"
+            )
 
         # (batch, num_block_tot, topk)
         indexes = indexes[..., :topk]
@@ -823,21 +671,18 @@ class DownsampledZipformer2Encoder(nn.Module):
     """
     def __init__(self,
                  encoder: nn.Module,
-                 dim: int,
+                 in_channel: int,
+                 out_channel: int,
                  downsample: int,
                  dropout: FloatLike):
         super(DownsampledZipformer2Encoder, self).__init__()
         self.downsample_factor = downsample
-        self.downsample = SimpleDownsample(dim, downsample, dropout)
+        self.downsample = Downsample(in_channel, out_channel, downsample, dropout)
         self.num_layers = encoder.num_layers
         self.encoder = encoder
-        self.upsample = SimpleUpsample(dim, downsample)
-        self.out_combiner = BypassModule(dim, straight_through_rate=0)
 
     def forward(
-        self,
-        src: Tensor,
-        feature_mask: Union[Tensor, float] = 1.0,
+        self, src: Tensor,
     ) -> Tensor:
         r"""Downsample, go through encoder, upsample.
 
@@ -848,38 +693,37 @@ class DownsampledZipformer2Encoder(nn.Module):
 
         Returns: a Tensor with the same shape as src.
         """
-        src_orig = src
         src = self.downsample(src)
+        src = self.encoder(src)
 
-        src = self.encoder(src, feature_mask=feature_mask)
-        src = self.upsample(src)
-
-        return self.out_combiner(src_orig, src)
+        return src
 
 
-class SimpleDownsample(torch.nn.Module):
+class Downsample(torch.nn.Module):
     """
-    Does downsampling with attention, by weighted sum, and a projection..
+    Conv-based downsampling.
     """
     def __init__(self,
-                 channels: int,
+                 in_channel: int,
+                 out_channel: int,
                  downsample: int,
                  dropout: FloatLike):
-        super(SimpleDownsample, self).__init__()
-
-        self.bias = nn.Parameter(torch.zeros(downsample ** 2))
+        super(Downsample, self).__init__()
 
         self.name = None  # will be set from training code
-        self.dropout = copy.deepcopy(dropout)
 
         self.downsample = downsample
+
+        self.reduction = nn.Linear(
+            downsample ** 2 * in_channel, out_channel, bias=False
+        )
 
     def forward(self,
                 src: Tensor) -> Tensor:
         """
-        x: (batch, height, width, channel)
+        x: (batch, height, width, in_channel)
         Returns a tensor of shape
-           (batch, height // ds, width // ds, channel)
+           (batch, height // ds, width // ds, out_channel)
         """
         batch, height, width, channel = src.shape
         ds = self.downsample
@@ -887,17 +731,14 @@ class SimpleDownsample(torch.nn.Module):
         d_height = height // ds
         d_width = width // ds
 
-        src = src.reshape(batch, d_height, ds, d_width, ds, channel).permute(0, 1, 3, 2, 4, 5)
-        src = src.reshape(batch, d_height, d_width, ds * ds, channel)
+        src = src.reshape(
+            batch, d_height, ds, d_width, ds, channel
+        ).permute(0, 1, 3, 2, 4, 5)
 
-        weights = self.bias.softmax(dim=0)
-        # weights: (ds * ds , 1)
-        weights = weights.unsqueeze(-1)
+        src = src.reshape(batch, d_height, d_width, ds * ds * channel)
+        src = self.reduction(src)
 
-        # (batch, d_height, d_width, channel)
-        ans = (src * weights).sum(dim=3)
-
-        return ans
+        return src
 
 
 class SimpleUpsample(torch.nn.Module):
@@ -1603,15 +1444,17 @@ def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
-        encoder_dim=(64,128,256,512,256,128),
-        encoder_unmasked_dim=(64,128,192,256,192,128),
-        downsampling_factor=(1,2,4,8,4,2),
-        num_encoder_layers=(2,2,2,3,2,2),
-        feedforward_dim=(192,384,768,1536,768,384),
-        num_heads=(2,4,4,8,4,4),
-        cnn_module_kernel=(5,5,3,3,3,5),
-        block_size=(7,7,7,7,7,7),
-        select_topk=(25,25,25,0,25,25),
+        patch_size=7,
+        encoder_dim=(64,128,256,512),
+        downsampling_factor=(1,2,2,2),
+        num_encoder_layers=(3,3,3,3),
+        feedforward_dim=(192,384,768,1536),
+        num_heads=(2,4,8,16),
+        block_size=(4,4,4,4),
+        # select_topk=(16,16,16,0),
+        select_topk=(0,0,0,0),
+        query_head_dim=32,
+        value_head_dim=32,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")

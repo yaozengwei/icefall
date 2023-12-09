@@ -83,72 +83,56 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--patch-size",
         type=int,
-        default=4,
+        default=7,
         help="Patch size. Default: 4",
     )
 
     parser.add_argument(
         "--num-encoder-layers",
         type=str,
-        default="2,2,3,4,3,2",
+        default="3,3,3,3",
         help="Number of zipformer encoder layers per stack, comma separated.",
     )
 
     parser.add_argument(
         "--downsampling-factor",
         type=str,
-        default="1,2,4,8,4,2",
+        default="1,2,2,2",
         help="Downsampling factor for each stack of encoder layers.",
     )
 
     parser.add_argument(
         "--encoder-dim",
         type=str,
-        default="64,128,256,512,256,128",
+        default="64,128,256,512",
         help="Embedding dimension in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--encoder-unmasked-dim",
-        type=str,
-        default="64,128,192,256,192,128",
-        help="Unmasked dimensions in the encoders, relates to augmentation during training.  "
-        "A single int or comma-separated list.  Must be <= each corresponding encoder_dim.",
     )
 
     parser.add_argument(
         "--block-size",
         type=str,
-        default="7,7,7,7,7,7",
+        default="4,4,4,4",
         help="Block size in attention modules, per stack, comma separated.",
     )
 
     parser.add_argument(
         "--select-topk",
         type=str,
-        default="25,25,25,0,25,25",
+        default="16,16,16,0",
         help="Number of tokens outside block to be selected, per stack, comma separated.",
     )
 
     parser.add_argument(
         "--feedforward-dim",
         type=str,
-        default="192,384,768,1536,768,384",
+        default="192,384,768,1536",
         help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
-    )
-
-    parser.add_argument(
-        "--cnn-module-kernel",
-        type=str,
-        default="5,5,3,3,3,5",
-        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
-        "a single int or comma-separated list.",
     )
 
     parser.add_argument(
         "--num-heads",
         type=str,
-        default="2,4,4,8,4,4",
+        default="2,4,8,16",
         help="Number of attention heads in the zipformer encoder layers: a single int or comma-separated list.",
     )
 
@@ -162,7 +146,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--value-head-dim",
         type=str,
-        default="12",
+        default="32",
         help="Value dimension per head in encoder stacks: a single int or comma-separated list.",
     )
 
@@ -734,12 +718,10 @@ def get_model(params):
         downsampling_factor=_to_int_tuple(params.downsampling_factor),
         encoder_dim=_to_int_tuple(params.encoder_dim),
         num_encoder_layers=_to_int_tuple(params.num_encoder_layers),
-        encoder_unmasked_dim=_to_int_tuple(params.encoder_unmasked_dim),
         query_head_dim=_to_int_tuple(params.query_head_dim),
         value_head_dim=_to_int_tuple(params.value_head_dim),
         num_heads=_to_int_tuple(params.num_heads),
         feedforward_dim=_to_int_tuple(params.feedforward_dim),
-        cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
         select_topk=_to_int_tuple(params.select_topk),
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
