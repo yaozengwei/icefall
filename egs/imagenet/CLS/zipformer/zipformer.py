@@ -620,7 +620,6 @@ class Zipformer2Encoder(nn.Module):
         if select_topk > 0:
             self.linear_q = nn.Linear(self.embed_dim, select_dim)
             self.linear_k = nn.Linear(self.embed_dim, select_dim)
-            self.score_balancer = Balancer(1, channel_dim=-1, min_abs=1.0, max_abs=10.0)
 
     def forward(
         self,
@@ -708,7 +707,24 @@ class Zipformer2Encoder(nn.Module):
         # pair-wise inner product between block embeddings and all tokens
         scores = torch.matmul(block_emb, src)  # (batch, num_block_tot, height*width)
 
-        scores = self.score_balancer(scores.unsqueeze(-1)).squeeze(-1)
+        if self.training and random.random() < 0.1:
+            # This is a harder way of limiting the attention scores to not be
+            # too large.  It incurs a penalty if any of them has an absolute
+            # value greater than 50.0.  this should be outside the normal range
+            # of the attention scores.  We use this mechanism instead of, say,
+            # something added to the loss function involving the entropy,
+            # because once the entropy gets very small gradients through the
+            # softmax can become very small, and we'd get zero derivatives.  The
+            # choices of 1.0e-04 as the scale on the penalty makes this
+            # mechanism vulnerable to the absolute scale of the loss function,
+            # but we view this as a failsafe to avoid "implausible" parameter
+            # values rather than a regularization method that should be active
+            # under normal circumstances.
+            scores = penalize_abs_values_gt(scores,
+                                            limit=25.0,
+                                            penalty=1.0e-04,
+                                            name=self.name)
+
         if random.random() < 0.01 or __name__ == "__main__":
             logging.info(f"scores: abs-min={scores.abs().min()}, abs-max={scores.abs().max()}")
 
@@ -724,20 +740,18 @@ class Zipformer2Encoder(nn.Module):
         # Prevent selecting duplicate tokens (within that block)
         scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
 
+        # We use our own version of softmax, defined in scaling.py, which should
+        # save a little of the memory used in backprop by, if we are in
+        # automatic mixed precision mode (amp / autocast), by only storing the
+        # half-precision output for backprop purposes.
+        scores = softmax(scores, dim=-1)  # (batch, num_block_tot, height*width)
+
         # (batch, num_block_tot, height*width)
         sscores, indexes = scores.sort(dim=-1, descending=True)
-        assert height * width >= topk * 2, (height * width, topk * 2)
-        # (batch, num_block_tot, topk, topk*2)
-        diffs = sscores[..., :topk].unsqueeze(-1) - sscores[..., :topk * 2].unsqueeze(2)
 
-        # diffs_rms = (diffs ** 2).mean().sqrt()
-        # diffs = diffs * (alpha / (diffs_rms + eps))
-        # (batch, num_block_tot, topk)
-        weights = (diffs.sigmoid().sum(-1) - topk).tanh()
+        weights = (sscores[..., :topk] * topk).sigmoid()
 
         if random.random() < 0.01 or __name__ == "__main__":
-            # logging.info(f"{self.name}, diffs_rms: {diffs_rms.item()}")
-            logging.info(f"{self.name}, diffs: min-abs-diffs={diffs.abs().min()}, max-abs-diffs={diffs.abs().max()}")
             logging.info(f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}")
 
         # (batch, num_block_tot, topk)
