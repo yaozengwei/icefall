@@ -598,6 +598,11 @@ class Zipformer2Encoder(nn.Module):
 
         if random.random() < 0.01 or __name__ == "__main__":
             logging.info(
+                f"{self.name}, sscores: mean-top1-sscores={sscores[..., 0].mean()}, "
+                f"mean-topk-sscores={sscores[..., :topk].mean()}, "
+                f"ref-value={1.0 / (sscores.shape[-1] - block_size ** 2)}"
+            )
+            logging.info(
                 f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, "
                 f"mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}"
             )
