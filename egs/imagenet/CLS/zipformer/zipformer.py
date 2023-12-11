@@ -330,6 +330,8 @@ class Zipformer2EncoderLayer(nn.Module):
             min_abs=0.1, max_abs=4.0,
         )
 
+        self.pos_dropout = Dropout2(p=0.1)
+
     def get_sample_dropout_mask(self, x: Tensor, dropout_rate: float) -> Optional[Tensor]:
         if dropout_rate == 0.0 or not self.training or torch.jit.is_scripting() or torch.jit.is_tracing():
             return None
@@ -349,7 +351,10 @@ class Zipformer2EncoderLayer(nn.Module):
             return x * dropout_mask
 
     def forward(
-        self, src: Tensor, indexes: Optional[Tensor] = None, weights: Optional[Tensor] = None
+        self, src: Tensor,
+        indexes: Optional[Tensor] = None,
+        weights: Optional[Tensor] = None,
+        pos_emb: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
@@ -358,6 +363,7 @@ class Zipformer2EncoderLayer(nn.Module):
             weights: (batch, num_block_tot, select_topk)
             indexes: (batch, num_block_tot, select_topk)
               where num_block_tot = (height // block_size) * (width // block_size)
+            pos_emb: (1, height, weights, channel)
 
         Returns:
            A tensor which has the same shape as src
@@ -372,7 +378,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src, indexes=indexes, weights=weights,
+            src + self.pos_dropout(pos_emb), indexes=indexes, weights=weights,
         )
 
         src = src + self.feed_forward1(src)
@@ -497,7 +503,7 @@ class Zipformer2Encoder(nn.Module):
         assert (height, width) == self.resolution, ((height, width), self.resolution)
 
         # apply absolute positional embedding
-        src = src + self.pos_dropout(self.pos_embed)
+        # src = src + self.pos_dropout(self.pos_embed)
 
         block_size = self.block_size
         select_topk = self.select_topk
@@ -506,7 +512,9 @@ class Zipformer2Encoder(nn.Module):
             # weights: (batch, num_block_tot, topk)
             # indexes: (batch, num_block_tot, topk)
             indexes, weights = self.get_select_weight_index(
-                src, block_size=block_size, topk=select_topk
+                src + self.pos_dropout(self.pos_embed),
+                block_size=block_size,
+                topk=select_topk,
             )
         else:
             indexes = None
@@ -515,7 +523,7 @@ class Zipformer2Encoder(nn.Module):
         output = src
 
         for i, mod in enumerate(self.layers):
-            output = mod(output, indexes=indexes, weights=weights)
+            output = mod(output, indexes=indexes, weights=weights, pos_emb=self.pos_embed)
 
         return output
 
