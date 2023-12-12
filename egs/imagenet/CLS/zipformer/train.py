@@ -125,8 +125,16 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--feedforward-dim",
         type=str,
-        default="192,384,768,1536",
+        default="128,256,512,1024",
         help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
+    )
+
+    parser.add_argument(
+        "--cnn-module-kernel",
+        type=str,
+        default="3,3,3,3",
+        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
+        "a single int or comma-separated list.",
     )
 
     parser.add_argument(
@@ -722,6 +730,7 @@ def get_model(params):
         value_head_dim=_to_int_tuple(params.value_head_dim),
         num_heads=_to_int_tuple(params.num_heads),
         feedforward_dim=_to_int_tuple(params.feedforward_dim),
+        cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
         select_topk=_to_int_tuple(params.select_topk),
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),

@@ -100,6 +100,7 @@ class Zipformer2(nn.Module):
             value_head_dim: Union[int, Tuple[int]] = 12,
             num_heads: Union[int, Tuple[int]] = 8,
             feedforward_dim: Union[int, Tuple[int]] = 1536,
+            cnn_module_kernel: Union[int, Tuple[int]] = 3,
             block_size: Union[int, Tuple[int]] = 4,
             select_topk: Union[int, Tuple[int]] = 16,
             dropout: FloatLike = None,  # see code below for default
@@ -130,6 +131,7 @@ class Zipformer2(nn.Module):
         self.value_head_dim = value_head_dim = _to_tuple(value_head_dim)
         self.num_heads = num_heads = _to_tuple(num_heads)
         feedforward_dim = _to_tuple(feedforward_dim)
+        cnn_module_kernel = _to_tuple(cnn_module_kernel)
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=encoder_dim[0])
@@ -150,6 +152,7 @@ class Zipformer2(nn.Module):
                 query_head_dim=query_head_dim[i],
                 value_head_dim=value_head_dim[i],
                 feedforward_dim=feedforward_dim[i],
+                cnn_module_kernel=cnn_module_kernel[i],
                 dropout=dropout,
                 block_size=block_size[i],
                 select_topk=select_topk[i],
@@ -242,7 +245,9 @@ class Zipformer2EncoderLayer(nn.Module):
             block_size: int = 4,
             select_topk: int = 16,
             dropout: FloatLike = 0.1,
+            cnn_module_kernel: int = 3,
             attention_skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
+            conv_skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
             const_attention_rate: FloatLike = ScheduledFloat((0.0, 0.25), (4000.0, 0.025), default=0),
             ff2_skip_rate: FloatLike = ScheduledFloat((0.0, 0.1), (4000.0, 0.01), (50000.0, 0.0)),
             ff3_skip_rate: FloatLike = ScheduledFloat((0.0, 0.1), (4000.0, 0.01), (50000.0, 0.0)),
@@ -260,6 +265,9 @@ class Zipformer2EncoderLayer(nn.Module):
         # skip probability for dynamic modules (meaning: anything but feedforward).
         self.attention_skip_rate = copy.deepcopy(attention_skip_rate)
 
+        # an additional skip probability that applies to ConvModule to stop it from
+        # contributing too much early on.
+        self.conv_skip_rate = copy.deepcopy(conv_skip_rate)
         # ff2_skip_rate is to prevent the ff2 module from having output that's too big
         # compared to its residual.
         self.ff2_skip_rate = copy.deepcopy(ff2_skip_rate)
@@ -291,6 +299,12 @@ class Zipformer2EncoderLayer(nn.Module):
         self.feed_forward3 = FeedforwardModule(embed_dim,
                                                (feedforward_dim * 5) // 4,
                                                dropout)
+
+        self.conv_module1 = ConvolutionModule(embed_dim,
+                                              cnn_module_kernel)
+
+        self.conv_module2 = ConvolutionModule(embed_dim,
+                                              cnn_module_kernel)
 
         self.norm = BiasNorm(embed_dim)
 
@@ -390,6 +404,12 @@ class Zipformer2EncoderLayer(nn.Module):
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
+            conv_skip_rate = 0.0
+        else:
+            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
+        src = src + self.sample_dropout(self.conv_module1(src), conv_skip_rate)
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
             ff2_skip_rate = 0.0
         else:
             ff2_skip_rate = float(self.ff2_skip_rate) if self.training else 0.0
@@ -402,6 +422,12 @@ class Zipformer2EncoderLayer(nn.Module):
         self_attn = self.self_attn2(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
+
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            conv_skip_rate = 0.0
+        else:
+            conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
+        src = src + self.sample_dropout(self.conv_module2(src), conv_skip_rate)
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             ff3_skip_rate = 0.0
@@ -1462,12 +1488,14 @@ def _test_zipformer_main():
         downsampling_factor=(1,2,2,2),
         num_encoder_layers=(3,3,3,3),
         feedforward_dim=(192,384,768,1536),
+        # feedforward_dim=(128,256,512,1024),
+        cnn_module_kernel=(3,3,3,3),
         num_heads=(2,4,8,16),
         block_size=(4,4,4,4),
         # select_topk=(16,16,16,0),
-        select_topk=(0,0,0,0),
+        select_topk=(0,16,16,0),
         query_head_dim=32,
-        value_head_dim=32,
+        value_head_dim=16,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
