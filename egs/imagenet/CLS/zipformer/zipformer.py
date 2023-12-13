@@ -300,6 +300,10 @@ class Zipformer2EncoderLayer(nn.Module):
                                                (feedforward_dim * 5) // 4,
                                                dropout)
 
+        self.nonlin_attention = NonlinAttention(embed_dim,
+                                                hidden_channels=3 * embed_dim // 4,
+                                                block_size=block_size, select_topk=select_topk)
+
         self.conv_module1 = ConvolutionModule(embed_dim,
                                               cnn_module_kernel)
 
@@ -312,6 +316,14 @@ class Zipformer2EncoderLayer(nn.Module):
             embed_dim, channel_dim=-1,
             min_positive=0.45, max_positive=0.55,
             min_abs=0.2, max_abs=4.0,
+        )
+
+        # balancer for output of NonlinAttentionModule
+        self.balancer_na = Balancer(
+            embed_dim, channel_dim=-1,
+            min_positive=0.3, max_positive=0.7,
+            min_abs=ScheduledFloat((0.0, 0.004), (4000.0, 0.02)),
+            prob=0.05,  # out of concern for memory usage
         )
 
         # balancer for output of feedforward2, prevent it from staying too
@@ -398,6 +410,23 @@ class Zipformer2EncoderLayer(nn.Module):
         src = src + self.feed_forward1(src)
 
         self_attn_dropout_mask = self.get_sample_dropout_mask(src, attention_skip_rate)
+
+        selected_attn_weights = attn_weights[0:1]
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            pass
+        elif not self.training and random.random() < float(self.const_attention_rate):
+            # Make attention weights constant.  The intention is to
+            # encourage these modules to do something similar to an
+            # averaging-over-time operation.
+            # only need the mask, can just use the 1st one and expand later
+            selected_attn_weights = selected_attn_weights[0:1]
+            selected_attn_weights = (selected_attn_weights > 0.0).to(selected_attn_weights.dtype)
+            selected_attn_weights = selected_attn_weights * (1.0 / selected_attn_weights.sum(dim=-1, keepdim=True))
+
+        na = self.balancer_na(self.nonlin_attention(
+            src, attn_weights=selected_attn_weights, indexes=indexes, weights=weights))
+
+        src = src + (na if self_attn_dropout_mask is None else na * self_attn_dropout_mask)
 
         self_attn = self.self_attn1(src, indexes=indexes, weights=weights, attn_weights=attn_weights)
 
@@ -1495,7 +1524,7 @@ def _test_zipformer_main():
         # select_topk=(16,16,16,0),
         select_topk=(0,16,16,0),
         query_head_dim=32,
-        value_head_dim=16,
+        value_head_dim=32,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
