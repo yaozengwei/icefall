@@ -22,7 +22,6 @@ from typing import List, Optional, Tuple, Union
 import logging
 import torch
 import random
-from encoder_interface import EncoderInterface
 from scaling import (
     Balancer,
     BiasNorm,
@@ -43,7 +42,7 @@ from scaling import (
 from torch import Tensor, nn
 
 
-class Subformer(EncoderInterface):
+class Subformer(nn.Module):
     """
     Args:
 
@@ -97,6 +96,7 @@ class Subformer(EncoderInterface):
             num_heads: Tuple[int, ...] = (8,),
             feedforward_dim: Tuple[int, ...] = (1536,),
             memory_dim: int = -1,
+            prompt_spk_emb_dim: int = -1,
             pos_dim: int = 4,
             dropout: Optional[FloatLike] = None,  # see code below for default
             warmup_batches: float = 4000.0,
@@ -172,6 +172,7 @@ class Subformer(EncoderInterface):
                     encoder_layer,
                     num_encoder_layers[i],
                     embed_dim=cur_max_dim,
+                    prompt_spk_emb_dim=prompt_spk_emb_dim,
                     dropout=dropout,
                     chunk_sizes=encoder_chunk_sizes[i],
                     warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
@@ -214,6 +215,7 @@ class Subformer(EncoderInterface):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        prompt_spk_emb: Optional[Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -258,7 +260,8 @@ class Subformer(EncoderInterface):
                             pos_embs[-1],
                             attn_offset=attn_offsets[-1],
                             memory=memory,
-                            memory_key_padding_mask=memory_key_padding_mask)
+                            memory_key_padding_mask=memory_key_padding_mask,
+                            prompt_spk_emb=prompt_spk_emb)
                 # x will have the maximum dimension up till now, even if
                 # `encoder` uses lower dim in its layers.
             elif s == '(':
@@ -332,6 +335,7 @@ class Subformer(EncoderInterface):
             ans.masked_fill_(attn_mask, float('-inf'))
 
         if src_key_padding_mask is not None:
+            ans = ans.expand(batch_size, -1, -1)
             ans.masked_fill_(src_key_padding_mask.unsqueeze(1), float('-inf'))
             # now ans: (batch_size, seq_len, seq_len).
 
@@ -633,6 +637,7 @@ class SubformerEncoder(nn.Module):
             dropout: float,
             warmup_begin: float,
             warmup_end: float,
+            prompt_spk_emb_dim: int = -1,
             chunk_sizes: Tuple[int, ...] = (128, 2048),
             initial_layerdrop_rate: float = 0.5,
             final_layerdrop_rate: float = 0.05,
@@ -647,6 +652,9 @@ class SubformerEncoder(nn.Module):
         self.num_layers = num_layers
 
         self.bypass = BypassModule(embed_dim)
+
+        if prompt_spk_emb_dim > 0:
+            self.linear_prompt = nn.Linear(prompt_spk_emb_dim, encoder_layer.embed_dim)
 
         assert 0 <= warmup_begin <= warmup_end
 
@@ -669,6 +677,7 @@ class SubformerEncoder(nn.Module):
         attn_offset: Optional[Tensor] = None,
         memory: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        prompt_spk_emb: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -695,6 +704,10 @@ class SubformerEncoder(nn.Module):
 
         pos_embs = [ self._pos_emb_to_chunk_size(pos_emb, c) for c in chunk_sizes ]
         attn_offsets = [ self._attn_offset_to_chunk_size(attn_offset, b, c) for c in chunk_sizes ]
+
+        if prompt_spk_emb is not None:
+            prompt_spk_emb = self.linear_prompt(prompt_spk_emb)
+            # TODO:
         # TODO: support this for memory also; would require duplicating it maybe;
         # or could modify the interior code to just assume chunking
         # when doing cross-attention.
@@ -702,8 +715,13 @@ class SubformerEncoder(nn.Module):
             ci = chunk_indexes[i]
             c = chunk_sizes[ci]
             output = self._to_chunk_size(output, c)
+            if prompt_spk_emb is not None:
+                num_chunk = output.shape[1] // b
+                cur_prompt_spk_emb = prompt_spk_emb.unsqueeze(0).unsqueeze(2)
+                cur_prompt_spk_emb = cur_prompt_spk_emb.expand(
+                    -1, -1, num_chunk, -1).reshape(1, b * num_chunk, output.shape[-1])
             output = mod(
-                output,
+                output + cur_prompt_spk_emb if prompt_spk_emb is not None else output,
                 pos_embs[ci],
                 attn_offset=attn_offsets[ci],
                 memory=memory,
@@ -1842,12 +1860,15 @@ def _test_zipformer_main(causal: bool = False):
     # Just make sure the forward pass runs.
     memory_dim = 100
 
+    prompt_spk_emb_dim = 64
+
     c = Subformer(
         structure = "S(S)S" if causal else "S(S(S",
         encoder_dim=(64, 96, 64),
         num_heads=(4, 4, 8),
         causal=causal,
         memory_dim=memory_dim,
+        prompt_spk_emb_dim=prompt_spk_emb_dim,
     )
     batch_size = 5
     seq_len = 128
@@ -1856,6 +1877,7 @@ def _test_zipformer_main(causal: bool = False):
         torch.randn(seq_len, batch_size, 64),
         torch.full((batch_size,), seq_len, dtype=torch.int64),
         memory=torch.randn(101, batch_size, memory_dim),
+        prompt_spk_emb=torch.randn(batch_size, prompt_spk_emb_dim),
     )
     f[0].sum().backward()
     c.eval()

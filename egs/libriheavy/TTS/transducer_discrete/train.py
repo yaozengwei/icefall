@@ -55,34 +55,30 @@ import argparse
 import copy
 import logging
 import random
-import warnings
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import k2
 import optim
-import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from tts_datamodule import LibriHeavyTtsDataModule
 from decoder import Decoder
-from embedding import DecoderEmbedding, PromptEmbedding, TextEmbedding
+from embedding import DecoderEmbedding, TextEmbedding
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import TtsModel
 from optim import Eden, ScaledAdam
+from piper_phonemize import get_max_phonemes
 from scaling import ScheduledFloat
 from subformer import Subformer
-from tokenizer import Tokenizer
 from torch import Tensor
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from zipformer import Zipformer2
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -127,86 +123,6 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
-    # for prompt-encoder
-    parser.add_argument(
-        "--prompt-num-encoder-layers",
-        type=str,
-        default="2,2,3,4,3,2",
-        help="Number of zipformer encoder layers per stack, comma separated.",
-    )
-
-    parser.add_argument(
-        "--prompt-downsampling-factor",
-        type=str,
-        default="1,2,4,8,4,2",
-        help="Downsampling factor for each stack of encoder layers.",
-    )
-
-    parser.add_argument(
-        "--prompt-feedforward-dim",
-        type=str,
-        default="512,768,1024,1536,1024,768",
-        help="Feedforward dimension of the zipformer encoder layers, per stack, comma separated.",
-    )
-
-    parser.add_argument(
-        "--prompt-num-heads",
-        type=str,
-        default="4,4,4,8,4,4",
-        help="Number of attention heads in the zipformer encoder layers: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--prompt-encoder-dim",
-        type=str,
-        default="192,256,384,512,384,256",
-        help="Embedding dimension in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--prompt-query-head-dim",
-        type=str,
-        default="32",
-        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--prompt-value-head-dim",
-        type=str,
-        default="12",
-        help="Value dimension per head in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--prompt-pos-head-dim",
-        type=str,
-        default="4",
-        help="Positional-encoding dimension per head in encoder stacks: a single int or comma-separated list.",
-    )
-
-    parser.add_argument(
-        "--prompt-pos-dim",
-        type=int,
-        default="48",
-        help="Positional-encoding embedding dimension",
-    )
-
-    parser.add_argument(
-        "--prompt-encoder-unmasked-dim",
-        type=str,
-        default="192,192,256,256,256,192",
-        help="Unmasked dimensions in the encoders, relates to augmentation during training.  "
-        "A single int or comma-separated list.  Must be <= each corresponding encoder_dim.",
-    )
-
-    parser.add_argument(
-        "--prompt-cnn-module-kernel",
-        type=str,
-        default="31,31,15,15,15,31",
-        help="Sizes of convolutional kernels in convolution modules in each encoder stack: "
-        "a single int or comma-separated list.",
-    )
-
     # for text-encoder
     parser.add_argument(
         "--text-num-encoder-layers",
@@ -419,7 +335,7 @@ def get_parser():
     parser.add_argument(
         "--prune-range",
         type=int,
-        default=5,
+        default=20,
         help="The prune range for rnnt loss, it means how many symbols(context)"
         "we are using to compute the loss",
     )
@@ -581,9 +497,11 @@ def get_params() -> AttributeDict:
             "log_interval": 50,
             "reset_interval": 200,
             "valid_interval": 3000,  # For the 100h subset, use 800
-            # parameters for zipformer
-            "feature_dim": 80,
-            "subsampling_factor": 4,  # not passed in, this is fixed.
+            "prompt_spk_emb_dim": 192,  # Dimension of prompt speaker embedding
+            "text_vocab_size": get_max_phonemes(),  # including pad=0, bos=1, eos=2
+            "text_blank_id": 0,  # blank_id for text tokens padding
+            "audio_blank_id": 1024,  # blank_id of predicted blank
+            "audio_vocab_size": 1025,  # including codebook_indexes in [0,1024) and blank_id 1024
             "warm_step": 2000,
             "env_info": get_env_info(),
         }
@@ -596,20 +514,9 @@ def _to_int_tuple(s: str):
     return tuple(map(int, s.split(",")))
 
 
-def get_prompt_embed(params: AttributeDict) -> nn.Module:
-    prompt_embed = PromptEmbedding(
-        vocab_size=params.vocab_size,
-        blank_id=params.blank_id,
-        num_codebooks=params.num_codebooks,
-        embed_dim=_to_int_tuple(params.prompt_encoder_dim)[0],
-    )
-    return prompt_embed
-
-
 def get_text_embed(params: AttributeDict) -> nn.Module:
     text_embed = TextEmbedding(
-        vocab_size=params.vocab_size,
-        blank_id=params.blank_id,
+        vocab_size=params.text_vocab_size,
         embed_dim=_to_int_tuple(params.text_encoder_dim)[0],
     )
     return text_embed
@@ -617,33 +524,11 @@ def get_text_embed(params: AttributeDict) -> nn.Module:
 
 def get_decoder_embed(params: AttributeDict) -> nn.Module:
     decoder_embed = DecoderEmbedding(
-        vocab_size=params.vocab_size,
-        blank_id=params.blank_id,
+        vocab_size=params.audio_vocab_size,
         num_codebooks=params.num_codebooks,
         embed_dim=params.decoder_dim,
     )
     return decoder_embed
-
-
-def get_prompt_encoder(params: AttributeDict) -> nn.Module:
-    prompt_encoder = Zipformer2(
-        output_downsampling_factor=2,
-        downsampling_factor=_to_int_tuple(params.prompt_downsampling_factor),
-        num_encoder_layers=_to_int_tuple(params.prompt_num_encoder_layers),
-        encoder_dim=_to_int_tuple(params.prompt_encoder_dim),
-        encoder_unmasked_dim=_to_int_tuple(params.prompt_encoder_unmasked_dim),
-        query_head_dim=_to_int_tuple(params.prompt_query_head_dim),
-        pos_head_dim=_to_int_tuple(params.prompt_pos_head_dim),
-        value_head_dim=_to_int_tuple(params.prompt_value_head_dim),
-        pos_dim=params.prompt_pos_dim,
-        num_heads=_to_int_tuple(params.prompt_num_heads),
-        feedforward_dim=_to_int_tuple(params.prompt_feedforward_dim),
-        cnn_module_kernel=_to_int_tuple(params.prompt_cnn_module_kernel),
-        dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-        warmup_batches=4000.0,
-        causal=False,
-    )
-    return prompt_encoder
 
 
 def get_text_encoder(params: AttributeDict) -> nn.Module:
@@ -657,6 +542,7 @@ def get_text_encoder(params: AttributeDict) -> nn.Module:
         value_head_dim=_to_int_tuple(params.text_value_head_dim),
         num_heads=_to_int_tuple(params.text_num_heads),
         feedforward_dim=_to_int_tuple(params.text_feedforward_dim),
+        prompt_spk_emb_dim=params.prompt_spk_emb_dim,
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
         warmup_batches=4000.0,
         causal=params.causal,
@@ -676,18 +562,15 @@ def get_decoder(params: AttributeDict) -> nn.Module:
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
     joiner = Joiner(
-        encoder_dim=max(_to_int_tuple(params.encoder_dim)),
+        encoder_dim=max(_to_int_tuple(params.text_encoder_dim)),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
-        vocab_size=params.vocab_size,
+        vocab_size=params.audio_vocab_size,
     )
     return joiner
 
 
 def get_model(params: AttributeDict) -> nn.Module:
-    prompt_embed = get_prompt_embed(params)
-    prompt_encoder = get_prompt_encoder(params)
-
     text_embed = get_text_embed(params)
     text_encoder = get_text_encoder(params)
 
@@ -699,16 +582,14 @@ def get_model(params: AttributeDict) -> nn.Module:
     model = TtsModel(
         text_embed=text_embed,
         text_encoder=text_encoder,
-        prompt_embed=prompt_embed,
-        prompt_encoder=prompt_encoder,
         decoder_embed=decoder_embed,
         decoder=decoder,
         joiner=joiner,
         encoder_dim=max(_to_int_tuple(params.text_encoder_dim)),
         decoder_dim=params.decoder_dim,
-        vocab_size=params.vocab_size,
+        vocab_size=params.audio_vocab_size,
         num_codebooks=params.num_codebooks,
-        blank_id=params.blank_id,
+        blank_id=params.audio_blank_id,
     )
     return model
 
@@ -829,7 +710,7 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def prepare_input(batch: dict, tokenizer: Tokenizer, device: torch.device):
+def prepare_input(batch: dict, device: torch.device):
     """Prepare batch data"""
 
     # for target audio tokens
@@ -839,27 +720,17 @@ def prepare_input(batch: dict, tokenizer: Tokenizer, device: torch.device):
     audio_tokens_lens = batch["audio_tokens_lens"].to(device)
 
     # for prompt
-    # (B, T_prompt, num_codebooks)
-    prompt_tokens = batch["prompt_tokens"].to(device)
-    # (B,)
-    prompt_tokens_lens = batch["prompt_tokens_lens"].to(device)
+    # (B,  prompt_spk_emb_dim)
+    prompt_spk_emb = batch["prompt_speaker_embedding"].to(device)
 
     # for input text tokens
-    text_tokens = batch["text_tokens"]
-    text_tokens = tokenizer.tokens_to_token_ids(text_tokens)
-
-    text_tokens = k2.RaggedTensor(text_tokens).to(device)
-    # a tensor of shape (B, T_text)
-    text_tokens = text_tokens.pad(mode="constant", padding_value=tokenizer.blank_id)
-    row_splits = text_tokens.shape.row_splits(1)
-    # (B,)
-    text_tokens_lens = (row_splits[1:] - row_splits[:-1]).to(device)
+    text_tokens = batch["text_tokens"].to(device)
+    text_tokens_lens = batch["text_tokens_lens"].to(device)
 
     return (
         audio_tokens,
         audio_tokens_lens,
-        prompt_tokens,
-        prompt_tokens_lens,
+        prompt_spk_emb,
         text_tokens,
         text_tokens_lens,
     )
@@ -868,7 +739,6 @@ def prepare_input(batch: dict, tokenizer: Tokenizer, device: torch.device):
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    tokenizer: Tokenizer,
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker, int]:
@@ -880,8 +750,6 @@ def compute_loss(
         Parameters for training. See :func:`get_params`.
       model:
         The model for training. It is an instance of Zipformer in our case.
-      tokenizer:
-        Used to convert text to phonemes.
       batch:
         A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
         for the content in it.
@@ -895,11 +763,10 @@ def compute_loss(
     (
         audio_tokens,
         audio_tokens_lens,
-        prompt_tokens,
-        prompt_tokens_lens,
+        prompt_spk_emb,
         text_tokens,
         text_tokens_lens,
-    ) = prepare_input(batch, tokenizer, device)
+    ) = prepare_input(batch, device)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
@@ -912,8 +779,7 @@ def compute_loss(
             x_lens=text_tokens_lens,
             ys=audio_tokens,
             y_lens=audio_tokens_lens,
-            prompt=prompt_tokens,
-            prompt_lens=prompt_tokens_lens,
+            prompt_spk_emb=prompt_spk_emb,
             codebook_index=codebook_index,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
@@ -950,7 +816,6 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    tokenizer: Tokenizer,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> List[MetricsTracker]:
@@ -964,11 +829,10 @@ def compute_validation_loss(
         (
             audio_tokens,
             audio_tokens_lens,
-            prompt_tokens,
-            prompt_tokens_lens,
+            prompt_spk_emb,
             text_tokens,
             text_tokens_lens,
-        ) = prepare_input(batch, tokenizer, device)
+        ) = prepare_input(batch, device)
 
         # Compute loss scales
         batch_idx_train = params.batch_idx_train
@@ -994,8 +858,7 @@ def compute_validation_loss(
                     x_lens=text_tokens_lens,
                     ys=audio_tokens,
                     y_lens=audio_tokens_lens,
-                    prompt=prompt_tokens,
-                    prompt_lens=prompt_tokens_lens,
+                    prompt_spk_emb=prompt_spk_emb,
                     codebook_index=codebook_index,
                     prune_range=params.prune_range,
                     am_scale=params.am_scale,
@@ -1104,14 +967,13 @@ def train_one_epoch(
             set_batch_count(model, get_adjusted_batch_count(params))
 
         params.batch_idx_train += 1
-        batch_size = len(batch["supervisions"]["text"])
+        batch_size = len(batch["text_tokens"])
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, loss_info, codebook_index = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
                     batch=batch,
                     is_training=True,
                 )
@@ -1130,7 +992,7 @@ def train_one_epoch(
             optimizer.zero_grad()
         except:  # noqa
             save_bad_model()
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params)
             raise
 
         if params.print_diagnostics and batch_idx == 5:
@@ -1227,7 +1089,7 @@ def train_one_epoch(
             model.train()
             logging.info(
                 f"Epoch {params.cur_epoch}, "
-                f"validation: [{valid_info[i] for i range(params.num_codebooks)}]"
+                f"validation: {[valid_info[i] for i in range(params.num_codebooks)]}"
             )
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
@@ -1280,16 +1142,6 @@ def run(rank, world_size, args):
     if torch.cuda.is_available():
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
-
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
-
-    # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.vocab_size = sp.get_piece_size()
-
-    if not params.use_transducer:
-        params.ctc_loss_scale = 1.0
 
     logging.info(params)
 
@@ -1344,13 +1196,6 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    train_cuts = librispeech.train_clean_100_cuts()
-    if params.full_libri:
-        train_cuts += librispeech.train_clean_360_cuts()
-        train_cuts += librispeech.train_other_500_cuts()
-
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
         #
@@ -1360,33 +1205,21 @@ def run(rank, world_size, args):
         # You should use ../local/display_manifest_statistics.py to get
         # an utterance duration distribution for your dataset to select
         # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
+        if c.duration < 2.0 or c.duration > 30.0:
             # logging.warning(
             #     f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
             # )
             return False
 
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
-
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
-
         return True
+
+    libriheavy = LibriHeavyTtsDataModule(params)
+
+    train_cuts = libriheavy.train_small_cuts()
+    if params.subset == "M" or params.subset == "L":
+        train_cuts += libriheavy.train_medium_cuts()
+    if params.subset == "L":
+        train_cuts += libriheavy.train_large_cuts()
 
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
@@ -1397,20 +1230,18 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = librispeech.train_dataloaders(
+    train_dl = libriheavy.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
 
-    valid_cuts = librispeech.dev_clean_cuts()
-    valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    valid_cuts = libriheavy.dev_cuts()
+    valid_dl = libriheavy.test_dataloaders(valid_cuts)
 
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
             optimizer=optimizer,
-            sp=sp,
             params=params,
         )
 
@@ -1435,7 +1266,6 @@ def run(rank, world_size, args):
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sp=sp,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1467,9 +1297,7 @@ def run(rank, world_size, args):
 
 
 def display_and_save_batch(
-    batch: dict,
-    params: AttributeDict,
-    sp: spm.SentencePieceProcessor,
+    batch: dict, params: AttributeDict
 ) -> None:
     """Display the batch statistics and save the batch into disk.
 
@@ -1479,8 +1307,6 @@ def display_and_save_batch(
         for the content in it.
       params:
         Parameters for training. See :func:`get_params`.
-      sp:
-        The BPE model.
     """
     from lhotse.utils import uuid4
 
@@ -1488,21 +1314,17 @@ def display_and_save_batch(
     logging.info(f"Saving batch to {filename}")
     torch.save(batch, filename)
 
-    supervisions = batch["supervisions"]
-    features = batch["inputs"]
+    audio_tokens_lens = batch["audio_tokens_lens"]
+    text_tokens_lens = batch["text_tokens_lens"]
 
-    logging.info(f"features shape: {features.shape}")
-
-    y = sp.encode(supervisions["text"], out_type=int)
-    num_tokens = sum(len(i) for i in y)
-    logging.info(f"num tokens: {num_tokens}")
+    logging.info(f"audio_tokens_lens: {audio_tokens_lens}")
+    logging.info(f"text_tokens_lens: {text_tokens_lens}")
 
 
 def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    sp: spm.SentencePieceProcessor,
     params: AttributeDict,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1515,10 +1337,9 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, _ = compute_loss(
+                loss, _, _ = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
                     batch=batch,
                     is_training=True,
                 )
@@ -1533,7 +1354,7 @@ def scan_pessimistic_batches_for_oom(
                     f"Failing criterion: {criterion} "
                     f"(={crit_values[criterion]}) ..."
                 )
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params)
             raise
         logging.info(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
@@ -1542,7 +1363,7 @@ def scan_pessimistic_batches_for_oom(
 
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    LibriHeavyTtsDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 

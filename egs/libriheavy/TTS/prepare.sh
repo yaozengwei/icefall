@@ -9,7 +9,7 @@ world_size=2
 set -eou pipefail
 
 stage=1
-stop_stage=4
+stop_stage=100
 
 # Path to save the manifests
 output_dir=$PWD/data/cases_and_punc
@@ -42,8 +42,7 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   log "Stage 3: Prepare acoutic prompts "
-  # for subset in dev test_clean test_other small medium large; do
-  for subset in dev; do
+  for subset in dev test_clean test_other small medium; do
     ./transducer_discrete/prepare_prompt.py \
       --subset $subset \
       --manifest-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
@@ -55,16 +54,26 @@ fi
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
   log "Stage 4: Extract speaker embeddings for prompt cuts"
   # for subset in dev test_clean test_other small medium large; do
-  for subset in dev; do
+  for subset in medium; do
     ./transducer_discrete/extract_speaker_embedding.py \
       --subset $subset \
-      --model-file data/titanet_large.pt \
       --manifest-out-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
       --prompt-duration $prompt_duration \
       --world-size $world_size \
-      --num-workers 2 \
-      --max-duration 2000 \
+      --num-workers 24 \
+      --max-duration 1500 \
       --master-port 12345
+  done
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+  log "Stage 5: Convert text to phonemes."
+  # for subset in dev test_clean test_other small medium large; do
+  for subset in small; do
+    ./transducer_discrete/prepare_phonemes.py \
+      --subset $subset \
+      --manifest-out-dir $output_dir/manifests_with_${num_codebooks}_codebooks \
+      --prompt-duration $prompt_duration
   done
 fi
 

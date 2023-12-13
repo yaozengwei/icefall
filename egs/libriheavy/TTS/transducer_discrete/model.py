@@ -31,8 +31,6 @@ class TtsModel(nn.Module):
         self,
         text_embed: nn.Module,
         text_encoder: nn.Module,
-        prompt_embed: nn.Module,
-        prompt_encoder: nn.Module,
         decoder_embed: nn.Module,
         decoder: nn.Module,
         joiner: nn.Module,
@@ -40,7 +38,7 @@ class TtsModel(nn.Module):
         decoder_dim: int = 512,
         vocab_size: int = 1025,
         num_codebooks: int = 4,
-        blank_id: int = 0,
+        blank_id: int = 1024,
     ):
         """Transducer model for TTS.
 
@@ -72,9 +70,6 @@ class TtsModel(nn.Module):
         self.text_embed = text_embed
         self.text_encoder = text_encoder
 
-        self.prompt_embed = prompt_embed
-        self.prompt_encoder = prompt_encoder
-
         self.decoder_embed = decoder_embed
         self.decoder = decoder
 
@@ -90,8 +85,7 @@ class TtsModel(nn.Module):
         x_lens: torch.Tensor,
         ys: torch.Tensor,
         y_lens: torch.Tensor,
-        prompt: torch.Tensor,
-        prompt_lens: torch.Tensor,
+        prompt_spk_emb: torch.Tensor,
         codebook_index: int,
         prune_range: int = 5,
         am_scale: float = 0.0,
@@ -110,11 +104,8 @@ class TtsModel(nn.Module):
           y_lens:
             A 1-D tensor of shape (N,). It contains the number of tokens in `ys`
             before padding.
-          prompt:
-            Audio tokens as speaker prompt, of shape (N, T_prompt, num_codebooks)
-          prompt_lens:
-            A 1-D tensor of shape (N,). It contains the number of tokens in `prompt`
-            before padding.
+          prompt_spk_emb:
+            Speaker embedding as speaker prompt, of shape (N, speaker_embed_dim).
           codebook_index:
             Codebook index we want to predict, in range of [0, num_codebooks - 1].
           prune_range:
@@ -140,44 +131,33 @@ class TtsModel(nn.Module):
         assert x_lens.ndim == 1, x_lens.shape
         assert ys.ndim == 3, ys.shape
         assert y_lens.ndim == 1, y_lens.shape
-        assert prompt.ndim == 3, prompt.shape
-        assert prompt_lens.ndim == 1, prompt_lens.shape
+        assert prompt_spk_emb.ndim == 2, prompt_spk_emb.shape
 
         assert (
             x.size(0)
             == x_lens.size(0)
             == ys.size(0)
             == y_lens.size(0)
-            == prompt.size(0)
-            == prompt_lens.size(0)
+            == prompt_spk_emb.size(0)
         ), (
             x.shape,
             x_lens.shape,
             ys.shape,
             y_lens.shape,
-            prompt.shape,
-            prompt_lens.shape,
+            prompt_spk_emb.shape,
         )
 
         if self.cached is None:
-            # forward prompt-encoder
-            prompt = self.prompt_embed(prompt)
-            prompt_out, prompt_out_lens = self.prompt_encoder(
-                x=prompt,
-                x_lens=prompt_lens,
-                src_key_padding_mask=make_pad_mask(prompt_lens),
-            )
-            prompt_out = prompt_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
-
             # forward text-encoder with audio prompt output
             x_out = self.text_embed(x)
-            x_out = x_out.transpose(0, 1),  # (N, T, D) -> (T, N, D)
+            x_out = x_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
+            # import pdb
+            # pdb.set_trace()
             encoder_out, encoder_out_lens = self.text_encoder(
                 x=x_out,
                 x_lens=x_lens,
                 src_key_padding_mask=make_pad_mask(x_lens),
-                memory=prompt_out,
-                memory_key_padding_mask=make_pad_mask(prompt_out_lens),
+                prompt_spk_emb=prompt_spk_emb,
             )
             encoder_out = encoder_out.transpose(0, 1)  # (T, N, D) -> (N, T, D)
 
@@ -206,7 +186,7 @@ class TtsModel(nn.Module):
         # (N, 1 + T_audio, decoder_dim)
         decoder_in = self.decoder_embed(sos_cur_y, codebook_index, pre_ys_eos)
         # (N, 1 + T_audio, decoder_dim)
-        decoder_out = self.decoder(decoder_in)
+        decoder_out, _ = self.decoder(decoder_in)
 
         boundary = torch.zeros(
             (encoder_out.size(0), 4),

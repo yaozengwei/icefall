@@ -27,27 +27,22 @@ class TextEmbedding(nn.Module):
     def __init__(
         self,
         vocab_size: int = 1025,
-        blank_id: int = 0,
         embed_dim: int = 512,
     ):
         """
         Args:
           vocab_size:
             Number of tokens of the modeling unit including blank.
-          blank_id:
-            The ID of the blank symbol.
           embed_dim:
             Dimension of the input embedding.
         """
         super().__init__()
 
-        self.blank_id = blank_id
         self.vocab_size = vocab_size
 
         self.embedding = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=embed_dim,
-            padding_idx=blank_id,
         )
         self.balancer = Balancer(
             embed_dim,
@@ -68,7 +63,7 @@ class TextEmbedding(nn.Module):
           Embedding tensor, of shape (N, T, embed_dim).
         """
         # (N, T, D)
-        embedding_out = self.embeddings(x)
+        embedding_out = self.embedding(x)
         embedding_out = self.balancer(embedding_out)
 
         return embedding_out
@@ -150,7 +145,6 @@ class DecoderEmbedding(nn.Module):
     def __init__(
         self,
         vocab_size: int = 1025,
-        blank_id: int = 0,
         num_codebooks: int = 4,
         embed_dim: int = 512,
     ):
@@ -158,8 +152,6 @@ class DecoderEmbedding(nn.Module):
         Args:
           vocab_size:
             Number of tokens of the modeling unit including blank.
-          blank_id:
-            The ID of the blank symbol.
           num_codebooks:
             Number of codebooks used to encode audio.
           embed_dim:
@@ -167,14 +159,12 @@ class DecoderEmbedding(nn.Module):
         """
         super().__init__()
 
-        self.blank_id = blank_id
         self.vocab_size = vocab_size
         self.num_codebooks = num_codebooks
 
         embedding = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=embed_dim,
-            padding_idx=blank_id,
         )
         balancer = Balancer(
             embed_dim,

@@ -27,15 +27,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Union
 
-from speaker_embedding import SpeakerEncoder
 from speech_enc_datamodule import SpeechEncDataModule
 from icefall.dist import cleanup_dist, setup_dist
-from icefall.utils import AttributeDict, setup_logger
+from icefall.utils import setup_logger
 from lhotse import CutSet, load_manifest_lazy
 from lhotse.cut import Cut, MonoCut
 from lhotse.features.io import NumpyHdf5Writer
 from lhotse.serialization import SequentialJsonlWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+import nemo.collections.asr as nemo_asr
 
 
 def get_parser():
@@ -70,12 +71,6 @@ def get_parser():
         type=Path,
         default=Path("data/upper_no_punc/manifests_with_4_codebooks"),
         help="Path to directory to save the cuts with encoded codebooks.",
-    )
-
-    parser.add_argument(
-        "--model-file",
-        type=str,
-        help="Path to the exported speaker encoder model with `jit.script()`",
     )
 
     parser.add_argument(
@@ -139,8 +134,12 @@ def encode_dataset(
             prompt_audio_lens = batch["prompt_audio_lens"].to(device)
             cuts = batch["cut"]
 
-            embeddings = model.extract_embedding(prompt_audio, prompt_audio_lens)
-            assert embeddings.shape == (prompt_audio.shape[0], model.embed_dim)
+            _, embeddings = model(
+                input_signal=prompt_audio, input_signal_length=prompt_audio_lens
+            )
+            assert embeddings.shape == (
+                prompt_audio.shape[0], model.cfg.decoder.emb_sizes
+            ), embeddings.shape
 
             embeddings = embeddings.cpu().numpy()
             futures.append(executor.submit(_save_worker, cuts, embeddings))
@@ -177,9 +176,14 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"device: {device}")
 
-    model = SpeakerEncoder(args.model_file, device)
-    assert args.prompt_sampling_rate == model.sample_rate, (
-        args.prompt_sampling_rate, model.sample_rate
+    model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
+        model_name='titanet_large'
+    )
+    model.to(device)
+    model.eval()
+
+    assert args.prompt_sampling_rate == model.cfg.train_ds.sample_rate, (
+        args.prompt_sampling_rate, model.cfg.train_ds.sample_rate
     )
 
     if world_size > 1:
