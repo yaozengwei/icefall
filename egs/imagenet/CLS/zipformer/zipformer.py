@@ -537,7 +537,7 @@ class Zipformer2Encoder(nn.Module):
             self.linear_q = nn.Linear(self.embed_dim, select_dim)
             self.linear_k = nn.Linear(self.embed_dim, select_dim)
 
-            self.balancer = Balancer(num_channels=1, channel_dim=-1, min_abs=0.2, max_abs=100.0)
+            self.balancer = Balancer(num_channels=1, channel_dim=-1, min_abs=0.2, max_abs=20.0)
 
     def forward(self, src: Tensor) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
@@ -1128,7 +1128,7 @@ class SelfAttention(nn.Module):
             select_x = torch.gather(select_x, dim=2, index=indexes_expanded)
             # now select_x: (batch, num_block_tot, select_topk, channel)
             # multiply selected key tokens by weights
-            select_x = select_x * weights.unsqueeze(-1)
+            # select_x = select_x * weights.unsqueeze(-1)
 
             select_x = select_x.reshape(
                 batch_size, num_block_tot, select_topk, num_heads, value_head_dim)
@@ -1314,7 +1314,7 @@ class NonlinAttention(nn.Module):
             select_x = torch.gather(select_x, dim=2, index=indexes_expanded)
             # now select_x: (batch, num_block_tot, select_topk, channel)
             # multiply selected key tokens by weights
-            select_x = select_x * weights.unsqueeze(-1)
+            # select_x = select_x * weights.unsqueeze(-1)
 
             select_x = select_x.reshape(
                 batch_size, num_block_tot, select_topk, num_heads, head_dim)
@@ -1516,18 +1516,17 @@ def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
-        patch_size=4,
+        patch_size=7,
         encoder_dim=(64,128,256,512),
         downsampling_factor=(1,2,2,2),
         num_encoder_layers=(3,3,3,3),
-        # feedforward_dim=(192,384,768,1536),
-        feedforward_dim=(128,256,512,1024),
+        feedforward_dim=(192,384,768,1536),
+        # feedforward_dim=(128,256,512,1024),
         cnn_module_kernel=(3,3,3,3),
         num_heads=(2,4,8,16),
-        block_size=(7,7,7,7),
-        # block_size=(4,4,4,4),
+        block_size=(4,4,4,4),
         # select_topk=(16,16,16,0),
-        select_topk=(16,16,16,0),
+        select_topk=(0,16,16,0),
         query_head_dim=32,
         value_head_dim=32,
     )
