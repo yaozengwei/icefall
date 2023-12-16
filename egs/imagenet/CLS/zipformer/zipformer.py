@@ -537,6 +537,8 @@ class Zipformer2Encoder(nn.Module):
             self.linear_q = nn.Linear(self.embed_dim, select_dim)
             self.linear_k = nn.Linear(self.embed_dim, select_dim)
 
+            self.balancer = Balancer(num_channels=1, channel_dim=-1, min_abs=0.2, max_abs=100.0)
+
     def forward(self, src: Tensor) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -615,26 +617,28 @@ class Zipformer2Encoder(nn.Module):
         # pair-wise inner product between block embeddings and all tokens
         scores = torch.matmul(block_emb, src)  # (batch, num_block_tot, height*width)
 
-        if self.training and random.random() < 0.1:
-            # This is a harder way of limiting the attention scores to not be
-            # too large.  It incurs a penalty if any of them has an absolute
-            # value greater than 50.0.  this should be outside the normal range
-            # of the attention scores.  We use this mechanism instead of, say,
-            # something added to the loss function involving the entropy,
-            # because once the entropy gets very small gradients through the
-            # softmax can become very small, and we'd get zero derivatives.  The
-            # choices of 1.0e-04 as the scale on the penalty makes this
-            # mechanism vulnerable to the absolute scale of the loss function,
-            # but we view this as a failsafe to avoid "implausible" parameter
-            # values rather than a regularization method that should be active
-            # under normal circumstances.
-            scores = penalize_abs_values_gt(scores,
-                                            limit=25.0,
-                                            penalty=1.0e-04,
-                                            name=self.name)
+        scores = self.balancer(scores.unsqueeze(dim=-1)).squeeze(dim=-1)
+
+        # if self.training and random.random() < 0.1:
+        #     # This is a harder way of limiting the attention scores to not be
+        #     # too large.  It incurs a penalty if any of them has an absolute
+        #     # value greater than 50.0.  this should be outside the normal range
+        #     # of the attention scores.  We use this mechanism instead of, say,
+        #     # something added to the loss function involving the entropy,
+        #     # because once the entropy gets very small gradients through the
+        #     # softmax can become very small, and we'd get zero derivatives.  The
+        #     # choices of 1.0e-04 as the scale on the penalty makes this
+        #     # mechanism vulnerable to the absolute scale of the loss function,
+        #     # but we view this as a failsafe to avoid "implausible" parameter
+        #     # values rather than a regularization method that should be active
+        #     # under normal circumstances.
+        #     scores = penalize_abs_values_gt(scores,
+        #                                     limit=25.0,
+        #                                     penalty=1.0e-04,
+        #                                     name=self.name)
 
         if random.random() < 0.01 or __name__ == "__main__":
-            logging.info(f"scores: abs-min={scores.abs().min()}, abs-max={scores.abs().max()}")
+            logging.info(f"Token selection, {self.name}, scores: abs-min={scores.abs().min()}, abs-max={scores.abs().max()}")
 
         # Generate a mask of shape (num_block_tot, height * width).
         # mask[i, j] == True if j-th token is in i-th block
@@ -661,12 +665,12 @@ class Zipformer2Encoder(nn.Module):
 
         if random.random() < 0.01 or __name__ == "__main__":
             logging.info(
-                f"{self.name}, sscores: mean-top1-sscores={sscores[..., 0].mean()}, "
+                f"Token selection, {self.name}, sscores: mean-top1-sscores={sscores[..., 0].mean()}, "
                 f"mean-topk-sscores={sscores[..., :topk].mean()}, "
                 f"ref-value={1.0 / (sscores.shape[-1] - block_size ** 2)}"
             )
             logging.info(
-                f"{self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, "
+                f"Token selection, {self.name}, weights: mean-top1-weights={weights[..., 0].mean()}, "
                 f"mean-weights={weights.mean()}, mean-abs-weights={weights.abs().mean()}"
             )
 
@@ -1512,17 +1516,18 @@ def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
-        patch_size=7,
+        patch_size=4,
         encoder_dim=(64,128,256,512),
         downsampling_factor=(1,2,2,2),
         num_encoder_layers=(3,3,3,3),
-        feedforward_dim=(192,384,768,1536),
-        # feedforward_dim=(128,256,512,1024),
+        # feedforward_dim=(192,384,768,1536),
+        feedforward_dim=(128,256,512,1024),
         cnn_module_kernel=(3,3,3,3),
         num_heads=(2,4,8,16),
-        block_size=(4,4,4,4),
+        block_size=(7,7,7,7),
+        # block_size=(4,4,4,4),
         # select_topk=(16,16,16,0),
-        select_topk=(0,16,16,0),
+        select_topk=(16,16,16,0),
         query_head_dim=32,
         value_head_dim=32,
     )
