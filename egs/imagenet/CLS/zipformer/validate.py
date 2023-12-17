@@ -128,13 +128,12 @@ def main():
     params = get_params()
     params.update(vars(args))
 
-    params.res_dir = params.exp_dir / params.decoding_method
     params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
 
     if params.use_averaged_model:
         params.suffix += "-use-averaged-model"
 
-    setup_logger(f"{params.res_dir}/log-decode-{params.suffix}")
+    setup_logger(f"{params.exp_dir}/log-decode-{params.suffix}")
     logging.info("Validation started")
 
     device = torch.device("cpu")
