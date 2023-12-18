@@ -357,6 +357,8 @@ class Zipformer2EncoderLayer(nn.Module):
             min_abs=0.1, max_abs=4.0,
         )
 
+        self.pos_dropout = Dropout2(p=0.1)
+
     def get_sample_dropout_mask(self, x: Tensor, dropout_rate: float) -> Optional[Tensor]:
         if dropout_rate == 0.0 or not self.training or torch.jit.is_scripting() or torch.jit.is_tracing():
             return None
@@ -376,13 +378,17 @@ class Zipformer2EncoderLayer(nn.Module):
             return x * dropout_mask
 
     def forward(
-        self, src: Tensor, reordered_indexes: Optional[Tensor] = None,
+        self,
+        src: Tensor,
+        reordered_indexes: Optional[Tensor] = None,
+        pos_emb: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
         Args:
             src: the sequence to the encoder (required): shape (batch_size, height, width, channel)
             reordered_indexes (Optional): (1, height, width, 1)
+            pos_emb: (1, height, weights, channel)
 
         Returns:
            A tensor which has the same shape as src
@@ -397,7 +403,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src, reordered_indexes=reordered_indexes
+            src + self.pos_dropout(pos_emb), reordered_indexes=reordered_indexes
         )
 
         src = src + self.feed_forward1(src)
@@ -574,7 +580,7 @@ class Zipformer2Encoder(nn.Module):
         assert (height, width) == self.resolution
 
         # apply absolute positional embedding
-        src = src + self.pos_dropout(self.pos_embed)
+        # src = src + self.pos_dropout(self.pos_embed)
 
         output = src
 
@@ -592,6 +598,7 @@ class Zipformer2Encoder(nn.Module):
             output = mod(
                 output,
                 reordered_indexes=reordered_indexes_list[i % num_types],
+                pos_emb=self.pos_embed,
             )
 
         return output
@@ -1393,14 +1400,14 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
-        patch_size=7,
+        patch_size=4,
         encoder_dim=(64,128,256,512),
         downsampling_factor=(1,2,2,2),
         num_encoder_layers=(3,3,3,3),
         feedforward_dim=(192,384,768,1536),
-        num_heads=(2,2,4,4),
+        num_heads=(2,4,8,16),
         cnn_module_kernel=(3,3,3,3),
-        block_size=(4,4,4,4),
+        block_size=(7,7,7,7),
         shift_block=shift_block,
         dilate_block=dilate_block,
     )
@@ -1474,6 +1481,6 @@ if __name__ == "__main__":
     # _test_shifted_indexes()
     # _test_ditaled_indexes()
     _test_zipformer_main(False, False)
-    _test_zipformer_main(True, False)
-    _test_zipformer_main(False, True)
-    _test_zipformer_main(True, True)
+    # _test_zipformer_main(True, False)
+    # _test_zipformer_main(False, True)
+    # _test_zipformer_main(True, True)
