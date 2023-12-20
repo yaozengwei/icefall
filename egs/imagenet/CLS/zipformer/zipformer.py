@@ -381,14 +381,12 @@ class Zipformer2EncoderLayer(nn.Module):
         self,
         src: Tensor,
         reordered_indexes: Optional[Tensor] = None,
-        pos_emb: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
         Args:
             src: the sequence to the encoder (required): shape (batch_size, height, width, channel)
             reordered_indexes (Optional): (1, height, width, 1)
-            pos_emb: (1, height, weights, channel)
 
         Returns:
            A tensor which has the same shape as src
@@ -403,7 +401,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src + self.pos_dropout(pos_emb), reordered_indexes=reordered_indexes
+            src, reordered_indexes=reordered_indexes
         )
 
         src = src + self.feed_forward1(src)
@@ -527,9 +525,6 @@ class Zipformer2Encoder(nn.Module):
                                                              default=0.0)
             cur_begin = cur_end
 
-        self.pos_embed = nn.Parameter(torch.randn(1, *resolution, self.embed_dim) * .02)
-        self.pos_dropout = Dropout2(p=0.1)
-
         if shift_block:
             shifted_indexes = self.generate_shifted_indexes()
         else:
@@ -579,9 +574,6 @@ class Zipformer2Encoder(nn.Module):
 
         assert (height, width) == self.resolution
 
-        # apply absolute positional embedding
-        # src = src + self.pos_dropout(self.pos_embed)
-
         output = src
 
         reordered_indexes_list = [None]
@@ -598,7 +590,6 @@ class Zipformer2Encoder(nn.Module):
             output = mod(
                 output,
                 reordered_indexes=reordered_indexes_list[i % num_types],
-                pos_emb=self.pos_embed,
             )
 
         return output
@@ -796,6 +787,8 @@ class MultiheadAttentionWeights(nn.Module):
             block_size: int,
             select_topk: int,
             dropout: float = 0.0,
+            pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
+                                                          (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -806,6 +799,7 @@ class MultiheadAttentionWeights(nn.Module):
         self.select_topk = select_topk
 
         self.dropout = dropout
+        self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
         self.name = None  # will be overwritten in training code; for diagnostics.
 
         key_head_dim = query_head_dim
@@ -843,6 +837,23 @@ class MultiheadAttentionWeights(nn.Module):
         # the following are for diagnosics only, see --print-diagnostics option
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
+
+        # define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.rand((2 * block_size - 1) * (2 * block_size - 1), num_heads) * .02)  # 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(block_size)
+        coords_w = torch.arange(block_size)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += block_size - 1  # shift to start from 0
+        relative_coords[:, :, 1] += block_size - 1
+        relative_coords[:, :, 0] *= 2 * block_size - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
 
     def forward(
         self,
@@ -899,6 +910,14 @@ class MultiheadAttentionWeights(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2)
         attn_scores = torch.matmul(query, key)
+
+        if random.random() >= float(self.pos_emb_skip_rate):
+            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(block_size ** 2, block_size ** 2, num_heads)  # (block_size**2,block_size**2,num_heads)
+            # (num_heads, block_size**2, block_size**2)
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+            # (num_heads, 1, 1, block_size**2, block_size**2)
+            relative_position_bias = relative_position_bias.unsqueeze(1).unsqueeze(2)
+            attn_scores = attn_scores + relative_position_bias
 
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             pass
@@ -1403,10 +1422,10 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
         patch_size=4,
         encoder_dim=(64,128,256,512),
         downsampling_factor=(1,2,2,2),
-        num_encoder_layers=(3,3,3,3),
+        num_encoder_layers=(2,5,4,2),
         feedforward_dim=(192,384,768,1536),
         num_heads=(2,4,8,16),
-        cnn_module_kernel=(3,3,3,3),
+        cnn_module_kernel=(7,7,5,3),
         block_size=(7,7,7,7),
         shift_block=shift_block,
         dilate_block=dilate_block,
