@@ -911,7 +911,7 @@ class MultiheadAttentionWeights(nn.Module):
         # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2)
         attn_scores = torch.matmul(query, key)
 
-        if random.random() >= float(self.pos_emb_skip_rate):
+        if not self.training or random.random() >= float(self.pos_emb_skip_rate):
             relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(block_size ** 2, block_size ** 2, num_heads)  # (block_size**2,block_size**2,num_heads)
             # (num_heads, block_size**2, block_size**2)
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
