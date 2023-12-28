@@ -116,17 +116,10 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--shift-block",
-        type=str2bool,
-        default=False,
-        help="Whether to shift the block between sucessive layers",
-    )
-
-    parser.add_argument(
-        "--dilate-block",
-        type=str2bool,
-        default=False,
-        help="Whether to dilate the block between sucessive layers",
+        "--global-attn",
+        type=str,
+        default="0,1,1,0",
+        help="Whether to use global attention, per stack, comma separated.",
     )
 
     parser.add_argument(
@@ -724,6 +717,10 @@ def _to_int_tuple(s: str):
     return tuple(map(int, s.split(",")))
 
 
+def _to_bool_tuple(s: str):
+    return tuple(map(str2bool, s.split(",")))
+
+
 def get_model(params):
     model = Zipformer2(
         img_size=params.img_size,
@@ -739,8 +736,7 @@ def get_model(params):
         feedforward_dim=_to_int_tuple(params.feedforward_dim),
         cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
-        shift_block=params.shift_block,
-        dilate_block=params.dilate_block,
+        global_attn=_to_bool_tuple(params.global_attn),
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
         warmup_batches=4000.0,
     )

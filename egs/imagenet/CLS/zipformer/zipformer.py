@@ -102,8 +102,7 @@ class Zipformer2(nn.Module):
             feedforward_dim: Union[int, Tuple[int]] = 1536,
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
-            shift_block: bool = False,
-            dilate_block: bool = False,
+            global_attn: Tuple[bool] = (False, False, False, False),
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
     ) -> None:
@@ -145,28 +144,20 @@ class Zipformer2(nn.Module):
         for i in range(num_encoders):
             cur_img_size = cur_img_size // downsampling_factor[i]
             assert cur_img_size % block_size[i] == 0
-            # assert block_size[i] % 2 == 0, block_size[i]
 
-            encoder_layer = Zipformer2EncoderLayer(
+            # For the segment of the warmup period, we let the Conv2dSubsampling
+            # layer learn something.  Then we start to warm up the other encoders.
+            encoder = Zipformer2Encoder(
+                num_layers=num_encoder_layers[i],
                 embed_dim=encoder_dim[i],
                 num_heads=num_heads[i],
                 query_head_dim=query_head_dim[i],
                 value_head_dim=value_head_dim[i],
                 feedforward_dim=feedforward_dim[i],
-                dropout=dropout,
                 cnn_module_kernel=cnn_module_kernel[i],
-                block_size=block_size[i],
-            )
-
-            # For the segment of the warmup period, we let the Conv2dSubsampling
-            # layer learn something.  Then we start to warm up the other encoders.
-            encoder = Zipformer2Encoder(
                 resolution=(cur_img_size, cur_img_size),
-                encoder_layer=encoder_layer,
-                num_layers=num_encoder_layers[i],
                 block_size=block_size[i],
-                shift_block=shift_block if cur_img_size > block_size[i] else False,
-                dilate_block=dilate_block if cur_img_size > block_size[i] else False,
+                global_attn=global_attn[i],
                 dropout=dropout,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
                 warmup_end=warmup_batches * (i + 2) / (num_encoders + 1),
@@ -243,8 +234,9 @@ class Zipformer2EncoderLayer(nn.Module):
             query_head_dim: int,
             value_head_dim: int,
             feedforward_dim: int,
+            resolution: Tuple[int, int],
             block_size: int = 4,
-            select_topk: int = 16,
+            global_attn: bool = False,
             dropout: FloatLike = 0.1,
             cnn_module_kernel: int = 3,
             attention_skip_rate: FloatLike = ScheduledFloat((0.0, 0.2), (4000.0, 0.05), (16000, 0.0), default=0),
@@ -279,15 +271,21 @@ class Zipformer2EncoderLayer(nn.Module):
         self.self_attn_weights = MultiheadAttentionWeights(
             embed_dim, num_heads=num_heads,
             query_head_dim=query_head_dim,
-            block_size=block_size, select_topk=select_topk,
+            resolution=resolution,
+            block_size=block_size,
+            global_attn=global_attn,
             dropout=0.0,
         )
 
         self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim,
-                                        block_size=block_size, select_topk=select_topk)
+                                        resolution=resolution,
+                                        block_size=block_size,
+                                        global_attn=global_attn)
 
         self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim,
-                                        block_size=block_size, select_topk=select_topk)
+                                        resolution=resolution,
+                                        block_size=block_size,
+                                        global_attn=global_attn)
 
         self.feed_forward1 = FeedforwardModule(embed_dim,
                                                (feedforward_dim * 3) // 4,
@@ -303,7 +301,9 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.nonlin_attention = NonlinAttention(embed_dim,
                                                 hidden_channels=3 * embed_dim // 4,
-                                                block_size=block_size, select_topk=select_topk)
+                                                resolution=resolution,
+                                                block_size=block_size,
+                                                global_attn=global_attn)
 
         self.conv_module1 = ConvolutionModule(embed_dim,
                                               cnn_module_kernel)
@@ -380,13 +380,11 @@ class Zipformer2EncoderLayer(nn.Module):
     def forward(
         self,
         src: Tensor,
-        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
         Args:
             src: the sequence to the encoder (required): shape (batch_size, height, width, channel)
-            reordered_indexes (Optional): (1, height, width, 1)
 
         Returns:
            A tensor which has the same shape as src
@@ -401,8 +399,9 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src, reordered_indexes=reordered_indexes
+            src,
         )
+        # print(attn_weights.shape)
 
         src = src + self.feed_forward1(src)
 
@@ -421,11 +420,11 @@ class Zipformer2EncoderLayer(nn.Module):
             selected_attn_weights = selected_attn_weights * (1.0 / selected_attn_weights.sum(dim=-1, keepdim=True))
 
         na = self.balancer_na(self.nonlin_attention(
-            src, reordered_indexes=reordered_indexes, attn_weights=selected_attn_weights))
+            src, attn_weights=selected_attn_weights))
 
         src = src + (na if self_attn_dropout_mask is None else na * self_attn_dropout_mask)
 
-        self_attn = self.self_attn1(src, reordered_indexes=reordered_indexes, attn_weights=attn_weights)
+        self_attn = self.self_attn1(src, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
 
@@ -445,7 +444,7 @@ class Zipformer2EncoderLayer(nn.Module):
         # bypass in the middle of the layer.
         src = self.bypass_mid(src_orig, src)
 
-        self_attn = self.self_attn2(src, reordered_indexes=reordered_indexes, attn_weights=attn_weights)
+        self_attn = self.self_attn2(src, attn_weights=attn_weights)
 
         src = src + (self_attn if self_attn_dropout_mask is None else self_attn * self_attn_dropout_mask)
 
@@ -489,15 +488,19 @@ class Zipformer2Encoder(nn.Module):
     """
     def __init__(
             self,
-            resolution: Tuple[int, int],
-            encoder_layer: nn.Module,
             num_layers: int,
-            dropout: float,
+            embed_dim: int,
+            num_heads: int,
+            query_head_dim: int,
+            value_head_dim: int,
+            feedforward_dim: int,
+            cnn_module_kernel: int,
+            resolution: Tuple[int, int],
+            block_size: int,
+            global_attn: bool,
+            dropout: FloatLike,
             warmup_begin: float,
             warmup_end: float,
-            block_size: int = 4,
-            shift_block: bool = True,
-            dilate_block: bool = False,
             initial_layerdrop_rate: float = 0.5,
             final_layerdrop_rate: float = 0.05,
     ) -> None:
@@ -507,11 +510,25 @@ class Zipformer2Encoder(nn.Module):
 
         self.resolution = resolution
         self.block_size = block_size
+        self.global_attn = global_attn
 
-        self.layers = nn.ModuleList(
-            [copy.deepcopy(encoder_layer) for i in range(num_layers)]
-        )
-        self.embed_dim = encoder_layer.embed_dim
+        self.layers = nn.ModuleList([])
+        for i in range(num_layers):
+            encoder_layer = Zipformer2EncoderLayer(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                query_head_dim=query_head_dim,
+                value_head_dim=value_head_dim,
+                feedforward_dim=feedforward_dim,
+                dropout=dropout,
+                cnn_module_kernel=cnn_module_kernel,
+                resolution=resolution,
+                block_size=block_size,
+                global_attn=(i % 2 != 0 and global_attn),
+            )
+            self.layers.append(encoder_layer)
+
+        self.embed_dim = embed_dim
         self.num_layers = num_layers
 
         assert 0 <= warmup_begin <= warmup_end
@@ -524,41 +541,6 @@ class Zipformer2Encoder(nn.Module):
                                                              (cur_end, final_layerdrop_rate),
                                                              default=0.0)
             cur_begin = cur_end
-
-        if shift_block:
-            shifted_indexes = self.generate_shifted_indexes()
-        else:
-            shifted_indexes = None
-        self.register_buffer("shifted_indexes", shifted_indexes)
-
-        if dilate_block:
-            dilated_indexes = self.generate_dilated_indexes()
-        else:
-            dilated_indexes = None
-        self.register_buffer("dilated_indexes", dilated_indexes)
-
-    def generate_shifted_indexes(self):
-        # (height, width)
-        resolution = self.resolution
-        indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
-        shift = self.block_size // 2
-        # (1, height * width, 1)
-        shifted_indexes = indexes.roll(shifts=(shift, shift), dims=(0, 1))
-        shifted_indexes = shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
-        return shifted_indexes
-
-    def generate_dilated_indexes(self):
-        # (height, width)
-        resolution = self.resolution
-        indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
-        indexes = torch.stack([
-            indexes[::2, ::2], indexes[::2, 1::2], indexes[1::2, ::2], indexes[1::2, 1::2]
-        ], dim=0)
-        indexes = indexes.view(2, 2, resolution[0] // 2, resolution[1] // 2).permute(0, 2, 1, 3)
-        # now indexes: (2, resolution[0] // 1, 2, resolution[1])
-        # (1, height * width, 1)
-        dilated_indexes = indexes.flatten().unsqueeze(0).unsqueeze(-1)
-        return dilated_indexes
 
     def forward(
         self,
@@ -576,20 +558,11 @@ class Zipformer2Encoder(nn.Module):
 
         output = src
 
-        reordered_indexes_list = [None]
-        # reordered_indexes = self.shifted_indexes if self.shifted_indexes is not None else self.dilated_indexes
-        if self.shifted_indexes is not None:
-            reordered_indexes_list.append(self.shifted_indexes)
-        if self.dilated_indexes is not None:
-            reordered_indexes_list.append(self.dilated_indexes)
-
-        num_types = len(reordered_indexes_list)
         # assert self.num_layers >= num_types
         for i, mod in enumerate(self.layers):
             # shift blocks between successive layers
             output = mod(
                 output,
-                reordered_indexes=reordered_indexes_list[i % num_types],
             )
 
         return output
@@ -784,19 +757,17 @@ class MultiheadAttentionWeights(nn.Module):
             embed_dim: int,
             num_heads: int,
             query_head_dim: int,
+            resolution: Tuple[int, int],
             block_size: int,
-            select_topk: int,
+            global_attn: bool = False,
             dropout: float = 0.0,
             pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
-                                                          (4000.0, 0.0)),
+                                                          (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.query_head_dim = query_head_dim
-
-        self.block_size = block_size
-        self.select_topk = select_topk
 
         self.dropout = dropout
         self.pos_emb_skip_rate = copy.deepcopy(pos_emb_skip_rate)
@@ -838,51 +809,54 @@ class MultiheadAttentionWeights(nn.Module):
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
 
+        self.resolution = resolution
+        assert resolution[0] % block_size == 0 and resolution[1] % block_size == 0, (
+            resolution, block_size)
+
+        self.block_size = block_size
+        self.num_block_h = resolution[0] // block_size
+        self.num_block_w = resolution[1] // block_size
+
+        self.global_attn = global_attn
+        if not global_attn:
+            context_h, context_w = block_size, block_size
+        else:
+            assert resolution[0] > block_size and resolution[1] > block_size, resolution
+            context_h, context_w = self.num_block_h, self.num_block_w
+
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
-            torch.rand((2 * block_size - 1) * (2 * block_size - 1), num_heads) * .02)  # 2*Wh-1 * 2*Ww-1, nH
+            torch.rand((2 * context_h - 1) * (2 * context_w - 1), num_heads) * .02)  # 2*Wh-1 * 2*Ww-1, nH
 
         # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(block_size)
-        coords_w = torch.arange(block_size)
+        coords_h = torch.arange(context_h)
+        coords_w = torch.arange(context_w)
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += block_size - 1  # shift to start from 0
-        relative_coords[:, :, 1] += block_size - 1
-        relative_coords[:, :, 0] *= 2 * block_size - 1
+        relative_coords[:, :, 0] += context_h - 1  # shift to start from 0
+        relative_coords[:, :, 1] += context_w - 1
+        relative_coords[:, :, 0] *= 2 * context_w - 1
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-    def forward(
-        self,
-        x: Tensor,
-        reordered_indexes: Optional[Tensor] = None,
-    ) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         r"""
         Args:
             x: input of shape (batch_size, height, width, channel)
-            reordered_indexes (Optional): (1, height, width, 1)
         Returns:
            a tensor of attention weights, of shape
-           (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+           (num_heads, batch_size, num_block_h * num_block_w, block_size ** 2, block_size ** 2)
+           or (num_heads, batch_size, block_size ** 2, num_block_h * num_block_w, num_block_h * num_block_w)
         """
         batch_size, height, width, channel = x.shape
         block_size = self.block_size
-        assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
-
-        num_tokens = height * width  # total number of tokens
-        num_block_h = height // block_size
-        num_block_w = width // block_size
+        num_block_h = self.num_block_h
+        num_block_w = self.num_block_w
+        assert (height, width) == self.resolution, (height, width, self.resolution)
+        global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
-
-        if reordered_indexes is not None:
-            x = x.reshape(batch_size, num_tokens, channel)
-            assert reordered_indexes.shape == (1, num_tokens, 1)
-            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
-            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
-            x = reordered_x.view(batch_size, height, width, channel)
 
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
@@ -898,24 +872,32 @@ class MultiheadAttentionWeights(nn.Module):
 
         query = query.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, query_head_dim)
-        query = query.permute(5, 0, 1, 3, 2, 4, 6)
-        # now query: (head, batch, num_block_h, num_block_w, block_size, block_size, query_head_dim)
-        query = query.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, query_head_dim)
-
         key = key.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, query_head_dim)
-        key = key.permute(5, 0, 1, 3, 6, 2, 4)
-        # now key: (head, batch, num_block_h, num_block_w, query_head_dim, block_size, block_size)
-        key = key.reshape(num_heads, batch_size, num_block_tot, query_head_dim, block_size ** 2)
+        if not global_attn:
+            query = query.permute(5, 0, 1, 3, 2, 4, 6)
+            query = query.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, query_head_dim)
+
+            key = key.permute(5, 0, 1, 3, 6, 2, 4)
+            key = key.reshape(num_heads, batch_size, num_block_tot, query_head_dim, block_size ** 2)
+        else:
+            query = query.permute(5, 0, 2, 4, 1, 3, 6)
+            query = query.reshape(num_heads, batch_size, block_size ** 2, num_block_tot, query_head_dim)
+
+            key = key.permute(5, 0, 2, 4, 6, 1, 3)
+            key = key.reshape(num_heads, batch_size, block_size ** 2, query_head_dim, num_block_tot)
 
         # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2)
+        # or (num_heads, batch_size, block_size**2, num_block_tot, num_block_tot)
         attn_scores = torch.matmul(query, key)
 
         if not self.training or random.random() >= float(self.pos_emb_skip_rate):
-            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(block_size ** 2, block_size ** 2, num_heads)  # (block_size**2,block_size**2,num_heads)
+            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+            relative_position_bias = relative_position_bias.view(attn_scores.shape[3], attn_scores.shape[4], num_heads)  # (block_size**2,block_size**2,num_heads)
             # (num_heads, block_size**2, block_size**2)
+            # or (num_heads, num_block_tot, num_block_tot)
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-            # (num_heads, 1, 1, block_size**2, block_size**2)
+            # (num_heads, 1, 1, num_block_tot, num_block_tot)
             relative_position_bias = relative_position_bias.unsqueeze(1).unsqueeze(2)
             attn_scores = attn_scores + relative_position_bias
 
@@ -939,8 +921,12 @@ class MultiheadAttentionWeights(nn.Module):
                                                  penalty=1.0e-04,
                                                  name=self.name)
 
-        assert attn_scores.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        if not global_attn:
+            assert attn_scores.shape == (
+                num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        else:
+            assert attn_scores.shape == (
+                num_heads, batch_size, block_size ** 2, num_block_tot, num_block_tot)
 
         # We use our own version of softmax, defined in scaling.py, which should
         # save a little of the memory used in backprop by, if we are in
@@ -960,8 +946,8 @@ class MultiheadAttentionWeights(nn.Module):
         return attn_weights
 
     def _print_attn_entropy(self, attn_weights: Tensor):
-        # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2+select_topk)
-
+        # (num_heads, batch_size, num_block_tot, block_size**2, block_size**2)
+        # or (num_heads, batch_size, block_size**2, num_block_tot, num_block_tot)
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=False):
                 attn_weights = attn_weights.to(torch.float32)
@@ -985,16 +971,24 @@ class SelfAttention(nn.Module):
             embed_dim: int,
             num_heads: int,
             value_head_dim: int,
+            resolution: Tuple[int, int],
             block_size: int,
-            select_topk: int,
+            global_attn: bool = False,
             window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
                                                                  (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.value_head_dim = value_head_dim
+
+        self.resolution = resolution
+        assert resolution[0] % block_size == 0 and resolution[1] % block_size == 0, (
+            resolution, block_size)
+
         self.block_size = block_size
-        self.select_topk = select_topk
+        self.num_block_h = resolution[0] // block_size
+        self.num_block_w = resolution[1] // block_size
+        self.global_attn = global_attn
 
         self.in_proj = nn.Linear(embed_dim,
                                  num_heads * value_head_dim,
@@ -1009,22 +1003,26 @@ class SelfAttention(nn.Module):
                              prob=(0.025, 0.25),
                              grad_scale=0.01)
 
+        if not global_attn:
+            context_h, context_w = block_size, block_size
+        else:
+            assert resolution[0] > block_size and resolution[1] > block_size, resolution
+            context_h, context_w = self.num_block_h, self.num_block_w
         self.window_weights_skip_rate = copy.deepcopy(window_weights_skip_rate)
         self.window_weights = nn.Parameter(
-            torch.rand(num_heads, block_size ** 2, block_size ** 2) * .02)  # 2*Wh-1 * 2*Ww-1, nH
+            torch.rand(num_heads, context_h * context_w, context_h * context_w) * .02)  # 2*Wh-1 * 2*Ww-1, nH
 
     def forward(
         self,
         x: Tensor,
         attn_weights: Tensor,
-        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args:
             x: input tensor, of shape (batch_size, height, width, channel)
-            reordered_indexes (Optional): (1, height, width, 1)
             attn_weights: a tensor of shape
               (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+              or (num_heads, batch_size, block_size ** 2, num_block_h * num_block_w, num_block_h * num_block_w)
               Expect attn_weights.sum(dim=-1) == 1.
         Returns:
            a tensor with the same shape as x.
@@ -1036,53 +1034,53 @@ class SelfAttention(nn.Module):
         value_dim = num_heads * value_head_dim
 
         block_size = self.block_size
-        assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
-
-        num_tokens = height * width  # total number of tokens
-        num_block_h = height // block_size
-        num_block_w = width // block_size
+        num_block_h = self.num_block_h
+        num_block_w = self.num_block_w
+        assert (height, width) == self.resolution, (height, width, self.resolution)
+        global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
 
-        assert attn_weights.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        if not global_attn:
+            assert attn_weights.shape == (
+                num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        else:
+            assert attn_weights.shape == (
+                num_heads, batch_size, block_size ** 2, num_block_tot, num_block_tot)
 
         if not self.training or random.random() >= float(self.window_weights_skip_rate):
             attn_weights = attn_weights + self.window_weights.unsqueeze(1).unsqueeze(2)
-
-        if reordered_indexes is not None:
-            x = x.reshape(batch_size, num_tokens, -1)
-            assert reordered_indexes.shape == (1, height * width, 1)
-            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
-            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
-            x = reordered_x.view(batch_size, height, width, channel)
 
         x = self.in_proj(x)  # (batch_size, height, width, num_heads * value_head_dim)
 
         x = x.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, value_head_dim)
-        x = x.permute(5, 0, 1, 3, 2, 4, 6)
-        # now x: (head, batch, num_block_h, num_block_w, block_size, block_size, value_head_dim)
-        x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, value_head_dim)
+
+        if not global_attn:
+            x = x.permute(5, 0, 1, 3, 2, 4, 6)
+            x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, value_head_dim)
+        else:
+            x = x.permute(5, 0, 2, 4, 1, 3, 6)
+            x = x.reshape(num_heads, batch_size, block_size ** 2, num_block_tot, value_head_dim)
 
         # (head, batch, num_block_tot, block_size**2, value_head_dim)
+        # or (head, batch, block_size**2, num_block_tot, value_head_dim)
         x = torch.matmul(attn_weights, x)
 
-        x = x.reshape(
-            num_heads, batch_size, num_block_h, num_block_w, block_size, block_size, value_head_dim)
-        x = x.permute(1, 2, 4, 3, 5, 0, 6)
+        if not global_attn:
+            x = x.reshape(
+                num_heads, batch_size, num_block_h, num_block_w, block_size, block_size, value_head_dim)
+            x = x.permute(1, 2, 4, 3, 5, 0, 6)
+        else:
+            x = x.reshape(
+                num_heads, batch_size, block_size, block_size, num_block_h, num_block_w, value_head_dim)
+            x = x.permute(1, 4, 2, 5, 3, 0, 6)
         # now: (batch, num_block_h, block_size, num_block_w, block_size, head, value_head_dim)
+
         x = x.reshape(batch_size, height, width, value_dim)
 
         # returned value is of shape (batch, height, width, channel), like the input.
         x = self.out_proj(x)
         x = self.whiten(x)
-
-        if reordered_indexes is not None:
-            # recover to original order
-            x = x.reshape(batch_size, height * width, channel)
-            new_x = torch.zeros_like(x)
-            new_x.scatter_(dim=1, index=reordered_indexes, src=x)
-            x = new_x.reshape(batch_size, height, width, channel)
 
         return x
 
@@ -1138,15 +1136,23 @@ class NonlinAttention(nn.Module):
             self,
             channels: int,
             hidden_channels: int,
+            resolution: Tuple[int, int],
             block_size: int,
-            select_topk: int,
+            global_attn: bool = False,
             window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
                                                                  (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.hidden_channels = hidden_channels
+
+        self.resolution = resolution
+        assert resolution[0] % block_size == 0 and resolution[1] % block_size == 0, (
+            resolution, block_size)
+
         self.block_size = block_size
-        self.select_topk = select_topk
+        self.num_block_h = resolution[0] // block_size
+        self.num_block_w = resolution[1] // block_size
+        self.global_attn = global_attn
 
         self.in_proj = nn.Linear(channels, hidden_channels * 3, bias=True)
 
@@ -1181,40 +1187,38 @@ class NonlinAttention(nn.Module):
                               prob=(0.025, 0.25),
                               grad_scale=0.01)
 
+        if not global_attn:
+            context_h, context_w = block_size, block_size
+        else:
+            assert resolution[0] > block_size and resolution[1] > block_size, resolution
+            context_h, context_w = self.num_block_h, self.num_block_w
+
         self.window_weights_skip_rate = copy.deepcopy(window_weights_skip_rate)
         self.window_weights = nn.Parameter(
-            torch.rand(1, block_size ** 2, block_size ** 2) * .02)  # 2*Wh-1 * 2*Ww-1, nH
+            torch.rand(1, context_h * context_w, context_h * context_w) * .02)  # 2*Wh-1 * 2*Ww-1, nH
 
     def forward(
         self,
         x: Tensor,
         attn_weights: Tensor,
-        reordered_indexes: Optional[Tensor] = None,
     ) -> Tensor:
         """.
         Args:
             x: a Tensor of shape (seq_len, batch_size, num_channels)
-            reordered_indexes (Optional): (1, height, width, 1)
             attn_weights: a tensor of shape
               (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
+              or (num_heads, batch_size, block_size ** 2, num_block_h * num_block_w, num_block_h * num_block_w)
               Expect attn_weights.sum(dim=-1) == 1.
         Returns:
            a Tensor with the same shape as x
         """
         (batch_size, height, width, channel) = x.shape
         block_size = self.block_size
-        num_tokens = height * width  # total number of tokens
-        num_block_h = height // block_size
-        num_block_w = width // block_size
+        num_block_h = self.num_block_h
+        num_block_w = self.num_block_w
+        assert (height, width) == self.resolution, (height, width, self.resolution)
+        global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
-        assert height % block_size == 0 and width % block_size == 0, (height, width, block_size)
-
-        if reordered_indexes is not None:
-            x = x.reshape(batch_size, num_tokens, -1)
-            assert reordered_indexes.shape == (1, height * width, 1)
-            reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
-            reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
-            x = reordered_x.view(batch_size, height, width, -1)
 
         x = self.in_proj(x)
 
@@ -1231,8 +1235,12 @@ class NonlinAttention(nn.Module):
         # now x: (batch, height, width, channel)
 
         num_heads = attn_weights.shape[0]
-        assert attn_weights.shape == (
-            num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        if not global_attn:
+            assert attn_weights.shape == (
+                num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+        else:
+            assert attn_weights.shape == (
+                num_heads, batch_size, block_size ** 2, num_block_tot, num_block_tot)
 
         if not self.training or random.random() >= float(self.window_weights_skip_rate):
             attn_weights = attn_weights + self.window_weights.unsqueeze(1).unsqueeze(2)
@@ -1242,17 +1250,28 @@ class NonlinAttention(nn.Module):
 
         x = x.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, head_dim)
-        x = x.permute(5, 0, 1, 3, 2, 4, 6)
-        # now x: (head, batch, num_block_h, num_block_w, block_size, block_size, head_dim)
-        x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, head_dim)
+
+        if not global_attn:
+            x = x.permute(5, 0, 1, 3, 2, 4, 6)
+            x = x.reshape(num_heads, batch_size, num_block_tot, block_size ** 2, head_dim)
+        else:
+            x = x.permute(5, 0, 2, 4, 1, 3, 6)
+            x = x.reshape(num_heads, batch_size, block_size ** 2, num_block_tot, head_dim)
 
         # (head, batch, num_block_tot, block_size**2, head_dim)
+        # or (head, batch, block_size**2, num_block_tot, value_head_dim)
         x = torch.matmul(attn_weights, x)
 
-        x = x.reshape(
-            num_heads, batch_size, num_block_h, num_block_w, block_size, block_size, head_dim)
-        x = x.permute(1, 2, 4, 3, 5, 0, 6)
+        if not global_attn:
+            x = x.reshape(
+                num_heads, batch_size, num_block_h, num_block_w, block_size, block_size, head_dim)
+            x = x.permute(1, 2, 4, 3, 5, 0, 6)
+        else:
+            x = x.reshape(
+                num_heads, batch_size, block_size, block_size, num_block_h, num_block_w, head_dim)
+            x = x.permute(1, 4, 2, 5, 3, 0, 6)
         # now: (batch, num_block_h, block_size, num_block_w, block_size, head, head_dim)
+
         x = x.reshape(batch_size, height, width, hidden_dim)
 
         y = self.identity2(y)
@@ -1261,13 +1280,6 @@ class NonlinAttention(nn.Module):
 
         x = self.out_proj(x)
         x = self.whiten2(x)
-
-        if reordered_indexes is not None:
-            # recover to original order
-            x = x.reshape(batch_size, height * width, channel)
-            new_x = torch.zeros_like(x)
-            new_x.scatter_(dim=1, index=reordered_indexes, src=x)
-            x = new_x.reshape(batch_size, height, width, channel)
 
         return x
 
@@ -1433,7 +1445,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
-def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
+def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
     c = Zipformer2(
@@ -1445,10 +1457,9 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
         num_heads=(2,4,8,16),
         cnn_module_kernel=(3,3,3,3),
         block_size=(7,7,7,7),
-        shift_block=shift_block,
-        dilate_block=dilate_block,
+        global_attn=(False, True, True, False),
         query_head_dim=32,
-        value_head_dim=32,
+        value_head_dim=16,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -1462,64 +1473,8 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
     f  # to remove flake8 warnings
 
 
-def _test_shifted_indexes():
-    # shifted indxes
-    resolution = (8, 8)
-    indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
-    shift = 2
-    # (1, height * width, 1)
-    shifted_indexes = indexes.roll(shifts=(shift, shift), dims=(0, 1))
-    shifted_indexes = shifted_indexes.flatten().unsqueeze(0).unsqueeze(-1)
-
-    batch_size = 2
-    num_tokens = resolution[0] * resolution[1]
-    channel = 32
-    x = torch.randn(batch_size, num_tokens, channel)
-
-    reordered_indexes = shifted_indexes
-    reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
-    reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
-
-    new_x = torch.zeros_like(x)
-    new_x.scatter_(dim=1, index=reordered_indexes, src=reordered_x)
-
-    assert torch.allclose(new_x, x)
-
-
-def _test_ditaled_indexes():
-    # dilated indxes
-    resolution = (8, 8)
-    indexes = torch.arange(resolution[0] * resolution[1]).reshape(*resolution)
-    indexes = torch.stack([
-        indexes[::2, ::2], indexes[::2, 1::2], indexes[1::2, ::2], indexes[1::2, 1::2]
-    ], dim=0)
-    indexes = indexes.view(2, 2, resolution[0] // 2, resolution[1] // 2).permute(0, 2, 1, 3)
-    # now indexes: (2, resolution[0] // 1, 2, resolution[1])
-    # (1, height * width, 1)
-    dilated_indexes = indexes.flatten().unsqueeze(0).unsqueeze(-1)
-
-    batch_size = 2
-    num_tokens = resolution[0] * resolution[1]
-    channel = 32
-    x = torch.randn(batch_size, num_tokens, channel)
-
-    reordered_indexes = dilated_indexes
-    reordered_indexes = reordered_indexes.expand(batch_size, num_tokens, channel)
-    reordered_x = torch.gather(x, dim=1, index=reordered_indexes)
-
-    new_x = torch.zeros_like(x)
-    new_x.scatter_(dim=1, index=reordered_indexes, src=reordered_x)
-
-    assert torch.allclose(new_x, x)
-
-
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    # _test_shifted_indexes()
-    # _test_ditaled_indexes()
-    _test_zipformer_main(False, False)
-    # _test_zipformer_main(True, False)
-    # _test_zipformer_main(False, True)
-    # _test_zipformer_main(True, True)
+    _test_zipformer_main()
