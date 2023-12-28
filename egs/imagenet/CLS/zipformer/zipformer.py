@@ -788,7 +788,7 @@ class MultiheadAttentionWeights(nn.Module):
             select_topk: int,
             dropout: float = 0.0,
             pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
-                                                          (4000.0, 0.0))
+                                                          (4000.0, 0.0)),
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -987,6 +987,8 @@ class SelfAttention(nn.Module):
             value_head_dim: int,
             block_size: int,
             select_topk: int,
+            window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
+                                                                 (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -1006,6 +1008,10 @@ class SelfAttention(nn.Module):
                              whitening_limit=_whitening_schedule(7.5, ratio=3.0),
                              prob=(0.025, 0.25),
                              grad_scale=0.01)
+
+        self.window_weights_skip_rate = copy.deepcopy(window_weights_skip_rate)
+        self.window_weights = nn.Parameter(
+            torch.rand(num_heads, block_size ** 2, block_size ** 2) * .02)  # 2*Wh-1 * 2*Ww-1, nH
 
     def forward(
         self,
@@ -1039,6 +1045,9 @@ class SelfAttention(nn.Module):
 
         assert attn_weights.shape == (
             num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+
+        if not self.training or random.random() >= float(self.window_weights_skip_rate):
+            attn_weights = attn_weights + self.window_weights.unsqueeze(1).unsqueeze(2)
 
         if reordered_indexes is not None:
             x = x.reshape(batch_size, num_tokens, -1)
@@ -1131,6 +1140,8 @@ class NonlinAttention(nn.Module):
             hidden_channels: int,
             block_size: int,
             select_topk: int,
+            window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
+                                                                 (4000.0, 0.0))
     ) -> None:
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -1169,6 +1180,10 @@ class NonlinAttention(nn.Module):
                               whitening_limit=_whitening_schedule(5.0, ratio=3.0),
                               prob=(0.025, 0.25),
                               grad_scale=0.01)
+
+        self.window_weights_skip_rate = copy.deepcopy(window_weights_skip_rate)
+        self.window_weights = nn.Parameter(
+            torch.rand(1, block_size ** 2, block_size ** 2) * .02)  # 2*Wh-1 * 2*Ww-1, nH
 
     def forward(
         self,
@@ -1218,6 +1233,9 @@ class NonlinAttention(nn.Module):
         num_heads = attn_weights.shape[0]
         assert attn_weights.shape == (
             num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2)
+
+        if not self.training or random.random() >= float(self.window_weights_skip_rate):
+            attn_weights = attn_weights + self.window_weights.unsqueeze(1).unsqueeze(2)
 
         hidden_dim = self.hidden_channels
         head_dim = hidden_dim // num_heads
@@ -1422,13 +1440,15 @@ def _test_zipformer_main(shift_block: bool = True, dilate_block: bool = False):
         patch_size=4,
         encoder_dim=(64,128,256,512),
         downsampling_factor=(1,2,2,2),
-        num_encoder_layers=(2,5,4,2),
+        num_encoder_layers=(3,3,3,3),
         feedforward_dim=(192,384,768,1536),
         num_heads=(2,4,8,16),
-        cnn_module_kernel=(7,7,5,3),
+        cnn_module_kernel=(3,3,3,3),
         block_size=(7,7,7,7),
         shift_block=shift_block,
         dilate_block=dilate_block,
+        query_head_dim=32,
+        value_head_dim=32,
     )
     num_param = sum([p.numel() for p in c.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
