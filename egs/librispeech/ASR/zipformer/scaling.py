@@ -1060,6 +1060,56 @@ class Whiten(nn.Module):
             return WhiteningPenaltyFunction.apply(x, self)
 
 
+def attn_weights_entropy(attn_weights: Tensor, mean_dims: Union[int, Tuple[int, ...]]) -> Tensor:
+    # (num_heads,)
+    attn_weights_entropy = -((attn_weights + 1.0e-20).log() * attn_weights).sum(
+        dim=-1).mean(dim=mean_dims)
+    return attn_weights_entropy
+
+
+class AttnEntropyPenaltyFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,
+                x: Tensor,
+                module: nn.Module) -> Tensor:
+        ctx.save_for_backward(x)
+        ctx.module = module
+        return x
+
+    @staticmethod
+    def backward(ctx,
+                 x_grad: Tensor):
+        x_orig, = ctx.saved_tensors
+        w = ctx.module
+
+        with torch.enable_grad():
+            with torch.cuda.amp.autocast(enabled=False):
+                x_detached = x_orig.to(torch.float32).detach()
+                x_detached.requires_grad = True
+
+                metric = attn_weights_entropy(x_detached, w.mean_dims)
+
+                if random.random() < 0.005 or __name__ == "__main__":
+                    logging.info(
+                        f"AttnEntropyPenalty: name={w.name}, "
+                        f"num_heads={w.num_heads}, "
+                        f"entropy={metric.item():.2f} vs. upper={w.upper_attn_entropy}")
+
+                if metric < float(w._limit):
+                    w.prob = w.min_prob
+                    return x_grad, None
+                else:
+                    w.prob = w.max_prob
+                    metric.backward()
+                    penalty_grad = x_detached.grad
+                    scale = w.grad_scale * (x_grad.to(torch.float32).norm() /
+                                            (penalty_grad.norm() + 1.0e-20))
+                    penalty_grad = penalty_grad * scale
+                    return x_grad + penalty_grad.to(x_grad.dtype), None
+
+        return x_grad, None
+
+
 class WithLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, y: Tensor, name: str):
