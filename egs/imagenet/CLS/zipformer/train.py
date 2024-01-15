@@ -123,6 +123,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--shift-attn",
+        type=str,
+        default="0,1,1,0",
+        help="Whether to use shifted attention, per stack, comma separated.",
+    )
+
+    parser.add_argument(
         "--feedforward-dim",
         type=str,
         default="192,384,768,1536",
@@ -736,6 +743,7 @@ def get_model(params):
         feedforward_dim=_to_int_tuple(params.feedforward_dim),
         cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
         block_size=_to_int_tuple(params.block_size),
+        shift_attn=_to_bool_tuple(params.shift_attn),
         global_attn=_to_bool_tuple(params.global_attn),
         dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
         warmup_batches=4000.0,

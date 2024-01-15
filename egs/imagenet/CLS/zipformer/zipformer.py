@@ -102,6 +102,7 @@ class Zipformer2(nn.Module):
             feedforward_dim: Union[int, Tuple[int]] = 1536,
             cnn_module_kernel: Union[int, Tuple[int]] = 5,
             block_size: Union[int, Tuple[int]] = 4,
+            shift_attn: Tuple[bool] = (False, False, False, False),
             global_attn: Tuple[bool] = (False, False, False, False),
             dropout: FloatLike = None,  # see code below for default
             warmup_batches: float = 4000.0,
@@ -157,6 +158,7 @@ class Zipformer2(nn.Module):
                 cnn_module_kernel=cnn_module_kernel[i],
                 resolution=(cur_img_size, cur_img_size),
                 block_size=block_size[i],
+                shift_attn=shift_attn[i],
                 global_attn=global_attn[i],
                 dropout=dropout,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
@@ -236,6 +238,7 @@ class Zipformer2EncoderLayer(nn.Module):
             feedforward_dim: int,
             resolution: Tuple[int, int],
             block_size: int = 4,
+            shift_attn: bool = False,
             global_attn: bool = False,
             dropout: FloatLike = 0.1,
             cnn_module_kernel: int = 3,
@@ -248,6 +251,8 @@ class Zipformer2EncoderLayer(nn.Module):
     ) -> None:
         super(Zipformer2EncoderLayer, self).__init__()
         self.embed_dim = embed_dim
+        self.shift_attn = shift_attn
+        self.global_attn = global_attn
 
         # self.bypass implements layer skipping as well as bypass; see its default values.
         self.bypass = BypassModule(embed_dim, skip_rate=bypass_skip_rate,
@@ -273,6 +278,7 @@ class Zipformer2EncoderLayer(nn.Module):
             query_head_dim=query_head_dim,
             resolution=resolution,
             block_size=block_size,
+            shift_attn=shift_attn,
             global_attn=global_attn,
             dropout=0.0,
         )
@@ -280,11 +286,13 @@ class Zipformer2EncoderLayer(nn.Module):
         self.self_attn1 = SelfAttention(embed_dim, num_heads, value_head_dim,
                                         resolution=resolution,
                                         block_size=block_size,
+                                        shift_attn=shift_attn,
                                         global_attn=global_attn)
 
         self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim,
                                         resolution=resolution,
                                         block_size=block_size,
+                                        shift_attn=shift_attn,
                                         global_attn=global_attn)
 
         self.feed_forward1 = FeedforwardModule(embed_dim,
@@ -303,6 +311,7 @@ class Zipformer2EncoderLayer(nn.Module):
                                                 hidden_channels=3 * embed_dim // 4,
                                                 resolution=resolution,
                                                 block_size=block_size,
+                                                shift_attn=shift_attn,
                                                 global_attn=global_attn)
 
         self.conv_module1 = ConvolutionModule(embed_dim,
@@ -378,8 +387,7 @@ class Zipformer2EncoderLayer(nn.Module):
             return x * dropout_mask
 
     def forward(
-        self,
-        src: Tensor,
+        self, src: Tensor, attn_mask: Optional[Tensor] = None
     ) -> Tensor:
         """
         Pass the input through the encoder layer.
@@ -399,7 +407,7 @@ class Zipformer2EncoderLayer(nn.Module):
 
         # (num_heads, batch_size, num_block_tot, block_size ** 2, block_size ** 2 + select_topk)
         attn_weights = self.self_attn_weights(
-            src,
+            src, attn_mask=attn_mask
         )
         # print(attn_weights.shape)
 
@@ -497,6 +505,7 @@ class Zipformer2Encoder(nn.Module):
             cnn_module_kernel: int,
             resolution: Tuple[int, int],
             block_size: int,
+            shift_attn: bool,
             global_attn: bool,
             dropout: FloatLike,
             warmup_begin: float,
@@ -510,8 +519,12 @@ class Zipformer2Encoder(nn.Module):
 
         self.resolution = resolution
         self.block_size = block_size
+        self.shift_attn = shift_attn
         self.global_attn = global_attn
 
+        num_types = 1 + shift_attn + global_attn
+        # global_idx = 1 if not shift_attn else 2
+        shift_idx = 1 if not global_attn else 2
         self.layers = nn.ModuleList([])
         for i in range(num_layers):
             encoder_layer = Zipformer2EncoderLayer(
@@ -524,12 +537,39 @@ class Zipformer2Encoder(nn.Module):
                 cnn_module_kernel=cnn_module_kernel,
                 resolution=resolution,
                 block_size=block_size,
-                global_attn=(i % 2 != 0 and global_attn),
+                global_attn=(i % num_types == 1 and global_attn),
+                shift_attn=(i % num_types == shift_idx and shift_attn),
             )
             self.layers.append(encoder_layer)
 
         self.embed_dim = embed_dim
         self.num_layers = num_layers
+
+        if shift_attn:
+            # calculate attention mask for SW-MSA
+            shift_size = block_size // 2
+            H, W = resolution
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            h_slices = (slice(0, -block_size),
+                        slice(-block_size, -shift_size),
+                        slice(-shift_size, None))
+            w_slices = (slice(0, -block_size),
+                        slice(-block_size, -shift_size),
+                        slice(-shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, block_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, block_size * block_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-200.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
 
         assert 0 <= warmup_begin <= warmup_end
 
@@ -562,7 +602,7 @@ class Zipformer2Encoder(nn.Module):
         for i, mod in enumerate(self.layers):
             # shift blocks between successive layers
             output = mod(
-                output,
+                output, attn_mask=None if not mod.shift_attn else self.attn_mask
             )
 
         return output
@@ -759,6 +799,7 @@ class MultiheadAttentionWeights(nn.Module):
             query_head_dim: int,
             resolution: Tuple[int, int],
             block_size: int,
+            shift_attn: bool = False,
             global_attn: bool = False,
             dropout: float = 0.0,
             pos_emb_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
@@ -817,6 +858,10 @@ class MultiheadAttentionWeights(nn.Module):
         self.num_block_h = resolution[0] // block_size
         self.num_block_w = resolution[1] // block_size
 
+        self.shift_attn = shift_attn
+        if shift_attn:
+            self.shift_size = block_size // 2
+
         self.global_attn = global_attn
         if not global_attn:
             context_h, context_w = block_size, block_size
@@ -841,7 +886,7 @@ class MultiheadAttentionWeights(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
         r"""
         Args:
             x: input of shape (batch_size, height, width, channel)
@@ -855,6 +900,7 @@ class MultiheadAttentionWeights(nn.Module):
         num_block_h = self.num_block_h
         num_block_w = self.num_block_w
         assert (height, width) == self.resolution, (height, width, self.resolution)
+        shift_attn = self.shift_attn
         global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
 
@@ -862,6 +908,9 @@ class MultiheadAttentionWeights(nn.Module):
         query_head_dim = self.query_head_dim
         num_heads = self.num_heads
         query_dim = query_head_dim * num_heads
+
+        if shift_attn:
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
         # self-attention
         query = x[...,0:query_dim]
@@ -928,6 +977,11 @@ class MultiheadAttentionWeights(nn.Module):
             assert attn_scores.shape == (
                 num_heads, batch_size, block_size ** 2, num_block_tot, num_block_tot)
 
+        if shift_attn:
+            assert attn_mask is not None
+            assert attn_mask.shape == (num_block_tot, block_size ** 2, block_size ** 2)
+            attn_scores = attn_scores + attn_mask.unsqueeze(0).unsqueeze(1)
+
         # We use our own version of softmax, defined in scaling.py, which should
         # save a little of the memory used in backprop by, if we are in
         # automatic mixed precision mode (amp / autocast), by only storing the
@@ -973,6 +1027,7 @@ class SelfAttention(nn.Module):
             value_head_dim: int,
             resolution: Tuple[int, int],
             block_size: int,
+            shift_attn: bool = False,
             global_attn: bool = False,
             window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
                                                                  (4000.0, 0.0))
@@ -988,6 +1043,7 @@ class SelfAttention(nn.Module):
         self.block_size = block_size
         self.num_block_h = resolution[0] // block_size
         self.num_block_w = resolution[1] // block_size
+        self.shift_attn = shift_attn
         self.global_attn = global_attn
 
         self.in_proj = nn.Linear(embed_dim,
@@ -1002,6 +1058,9 @@ class SelfAttention(nn.Module):
                              whitening_limit=_whitening_schedule(7.5, ratio=3.0),
                              prob=(0.025, 0.25),
                              grad_scale=0.01)
+
+        if shift_attn:
+            self.shift_size = block_size // 2
 
         if not global_attn:
             context_h, context_w = block_size, block_size
@@ -1037,6 +1096,7 @@ class SelfAttention(nn.Module):
         num_block_h = self.num_block_h
         num_block_w = self.num_block_w
         assert (height, width) == self.resolution, (height, width, self.resolution)
+        shift_attn = self.shift_attn
         global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
 
@@ -1051,6 +1111,9 @@ class SelfAttention(nn.Module):
             attn_weights = attn_weights + self.window_weights.unsqueeze(1).unsqueeze(2)
 
         x = self.in_proj(x)  # (batch_size, height, width, num_heads * value_head_dim)
+
+        if shift_attn:
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
         x = x.reshape(
             batch_size, num_block_h, block_size, num_block_w, block_size, num_heads, value_head_dim)
@@ -1077,6 +1140,9 @@ class SelfAttention(nn.Module):
         # now: (batch, num_block_h, block_size, num_block_w, block_size, head, value_head_dim)
 
         x = x.reshape(batch_size, height, width, value_dim)
+
+        if shift_attn:
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         # returned value is of shape (batch, height, width, channel), like the input.
         x = self.out_proj(x)
@@ -1138,6 +1204,7 @@ class NonlinAttention(nn.Module):
             hidden_channels: int,
             resolution: Tuple[int, int],
             block_size: int,
+            shift_attn: bool = False,
             global_attn: bool = False,
             window_weights_skip_rate: FloatLike = ScheduledFloat((0.0, 0.5),
                                                                  (4000.0, 0.0))
@@ -1152,6 +1219,7 @@ class NonlinAttention(nn.Module):
         self.block_size = block_size
         self.num_block_h = resolution[0] // block_size
         self.num_block_w = resolution[1] // block_size
+        self.shift_attn = shift_attn
         self.global_attn = global_attn
 
         self.in_proj = nn.Linear(channels, hidden_channels * 3, bias=True)
@@ -1187,6 +1255,9 @@ class NonlinAttention(nn.Module):
                               prob=(0.025, 0.25),
                               grad_scale=0.01)
 
+        if shift_attn:
+            self.shift_size = block_size // 2
+
         if not global_attn:
             context_h, context_w = block_size, block_size
         else:
@@ -1217,6 +1288,7 @@ class NonlinAttention(nn.Module):
         num_block_h = self.num_block_h
         num_block_w = self.num_block_w
         assert (height, width) == self.resolution, (height, width, self.resolution)
+        shift_attn = self.shift_attn
         global_attn = self.global_attn
         num_block_tot = num_block_h * num_block_w
 
@@ -1233,6 +1305,9 @@ class NonlinAttention(nn.Module):
         x = x * s
         x = self.identity1(x)  # diagnostics only, it's the identity.
         # now x: (batch, height, width, channel)
+
+        if shift_attn:
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
         num_heads = attn_weights.shape[0]
         if not global_attn:
@@ -1273,6 +1348,9 @@ class NonlinAttention(nn.Module):
         # now: (batch, num_block_h, block_size, num_block_w, block_size, head, head_dim)
 
         x = x.reshape(batch_size, height, width, hidden_dim)
+
+        if shift_attn:
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         y = self.identity2(y)
         x = x * y
@@ -1445,6 +1523,21 @@ class PatchEmbed(nn.Module):
         return x
 
 
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
 def _test_zipformer_main():
     # Just make sure the forward pass runs.
 
@@ -1457,7 +1550,8 @@ def _test_zipformer_main():
         num_heads=(2,4,8,16),
         cnn_module_kernel=(3,3,3,3),
         block_size=(7,7,7,7),
-        global_attn=(False, True, True, False),
+        global_attn=(True, True, True, False),
+        shift_attn=(True, True, True, False),
         query_head_dim=32,
         value_head_dim=16,
     )
