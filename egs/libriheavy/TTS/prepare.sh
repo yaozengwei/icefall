@@ -69,7 +69,7 @@ fi
 if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
   log "Stage 5: Convert text to phonemes."
   # for subset in dev test_clean test_other small medium large; do
-  for subset in small; do
+  for subset in dev small; do
     ./transducer_discrete/prepare_phonemes.py \
       --subset $subset \
       --manifest-out-dir $output_dir/manifests_with_${num_codebooks}_codebooks \

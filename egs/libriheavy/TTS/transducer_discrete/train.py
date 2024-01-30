@@ -64,6 +64,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from tts_datamodule import LibriHeavyTtsDataModule
+from conformer import Conformer
 from decoder import Decoder
 from embedding import DecoderEmbedding, TextEmbedding
 from joiner import Joiner
@@ -74,7 +75,6 @@ from model import TtsModel
 from optim import Eden, ScaledAdam
 from piper_phonemize import get_max_phonemes
 from scaling import ScheduledFloat
-from subformer import Subformer
 from torch import Tensor
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -123,70 +123,39 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
-    # for text-encoder
     parser.add_argument(
-        "--text-num-encoder-layers",
-        type=str,
-        default="2,4,4,8,4,4,2",
-        help="Number of subformer encoder layers per stack, comma separated.",
+        "--encoder-dim",
+        type=int,
+        default=512,
+        help="Embedding dimension in encoder."
     )
 
     parser.add_argument(
-        "--text-feedforward-dim",
-        type=str,
-        default="1024,1536,2048,3072,2048,1536,1024",
+        "--encoder-num-layers",
+        type=int,
+        default=12,
+        help="Number of conformer encoder layers.",
+    )
+
+    parser.add_argument(
+        "--encoder-feedforward-dim",
+        type=int,
+        default=2048,
         help="Feedforward dimension of the subformer encoder layers, per stack, comma separated.",
     )
 
     parser.add_argument(
-        "--text-num-heads",
-        type=str,
-        default="4,4,8,16,8,4,4",
-        help="Number of attention heads in the subformer encoder layers: a single int or comma-separated list.",
+        "--encoder-num-heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in the conformer encoder layers",
     )
 
     parser.add_argument(
-        "--text-encoder-dim",
-        type=str,
-        default="256,384,512,768,512,384,256",
-        help="Embedding dimension in encoder stacks: a single int or comma-separated list."
-    )
-
-    parser.add_argument(
-        "--text-encoder-chunk-sizes",
-        type=str,
-        default="128,1024",
-        help="Base chunk size for attention in encoder stacks; alternate layers will use this value or "
-        "double this value."
-    )
-
-    parser.add_argument(
-        "--text-encoder-structure",
-        type=str,
-        default="S(S(S(S)S)S)S",
-        help="Structure of encoder, determines order of encoder stacks and (downsampling/upsampling) "
-        "operations."
-    )
-
-    parser.add_argument(
-        "--text-query-head-dim",
-        type=str,
-        default="32",
-        help="Query/key dimension per head in encoder stacks: a single int or comma-separated list."
-    )
-
-    parser.add_argument(
-        "--text-value-head-dim",
-        type=str,
-        default="16",
-        help="Value dimension per head in encoder stacks: a single int or comma-separated list."
-    )
-
-    parser.add_argument(
-        "--text-pos-dim",
-        type=str,
-        default="4",
-        help="Positional-encoding dimension in encoder stacks: a single int or comma-separated list."
+        "--encoder-cnn-kernel",
+        type=int,
+        default=5,
+        help="Convolution kernel size of the conformer encoder layers.",
     )
 
     parser.add_argument(
@@ -218,13 +187,6 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         Outputs from the encoder and decoder model are projected
         to this dimension before adding.
         """,
-    )
-
-    parser.add_argument(
-        "--causal",
-        type=str2bool,
-        default=False,
-        help="If True, use causal version of model.",
     )
 
     parser.add_argument(
@@ -335,7 +297,7 @@ def get_parser():
     parser.add_argument(
         "--prune-range",
         type=int,
-        default=20,
+        default=10,
         help="The prune range for rnnt loss, it means how many symbols(context)"
         "we are using to compute the loss",
     )
@@ -517,7 +479,7 @@ def _to_int_tuple(s: str):
 def get_text_embed(params: AttributeDict) -> nn.Module:
     text_embed = TextEmbedding(
         vocab_size=params.text_vocab_size,
-        embed_dim=_to_int_tuple(params.text_encoder_dim)[0],
+        embed_dim=params.encoder_dim,
     )
     return text_embed
 
@@ -532,20 +494,13 @@ def get_decoder_embed(params: AttributeDict) -> nn.Module:
 
 
 def get_text_encoder(params: AttributeDict) -> nn.Module:
-    text_encoder = Subformer(
-        structure=params.text_encoder_structure,
-        num_encoder_layers=_to_int_tuple(params.text_num_encoder_layers),
-        encoder_dim=_to_int_tuple(params.text_encoder_dim),
-        encoder_chunk_sizes=(_to_int_tuple(params.text_encoder_chunk_sizes),),
-        query_head_dim=_to_int_tuple(params.text_query_head_dim),
-        pos_dim=int(params.text_pos_dim),
-        value_head_dim=_to_int_tuple(params.text_value_head_dim),
-        num_heads=_to_int_tuple(params.text_num_heads),
-        feedforward_dim=_to_int_tuple(params.text_feedforward_dim),
+    text_encoder = Conformer(
+        d_model=params.encoder_dim,
+        num_heads=params.encoder_num_heads,
+        dim_feedforward=params.encoder_feedforward_dim,
+        cnn_module_kernel=params.encoder_cnn_kernel,
+        num_layers=params.encoder_num_layers,
         prompt_spk_emb_dim=params.prompt_spk_emb_dim,
-        dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-        warmup_batches=4000.0,
-        causal=params.causal,
     )
     return text_encoder
 
@@ -562,7 +517,7 @@ def get_decoder(params: AttributeDict) -> nn.Module:
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
     joiner = Joiner(
-        encoder_dim=max(_to_int_tuple(params.text_encoder_dim)),
+        encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.audio_vocab_size,
@@ -585,11 +540,11 @@ def get_model(params: AttributeDict) -> nn.Module:
         decoder_embed=decoder_embed,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=max(_to_int_tuple(params.text_encoder_dim)),
+        encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         vocab_size=params.audio_vocab_size,
         num_codebooks=params.num_codebooks,
-        blank_id=params.audio_blank_id,
+        audio_blank_id=params.audio_blank_id,
     )
     return model
 
@@ -771,7 +726,8 @@ def compute_loss(
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    codebook_index = random.randint(0, params.num_codebooks - 1)
+    # codebook_index = random.randint(0, params.num_codebooks - 1)
+    codebook_index = 0
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = model(
@@ -851,7 +807,8 @@ def compute_validation_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        for codebook_index in range(params.num_codebooks):
+        # for codebook_index in range(params.num_codebooks):
+        for codebook_index in range(1):
             with torch.set_grad_enabled(False):
                 simple_loss, pruned_loss = model(
                     x=text_tokens,
@@ -863,7 +820,7 @@ def compute_validation_loss(
                     prune_range=params.prune_range,
                     am_scale=params.am_scale,
                     lm_scale=params.lm_scale,
-                    cache_encoder_out=(codebook_index == 0),
+                    # cache_encoder_out=(codebook_index == 0),
                 )
                 if codebook_index == params.num_codebooks - 1:
                     # Clear encoder output cache at last codebook
@@ -887,7 +844,8 @@ def compute_validation_loss(
             tot_losses[i].reduce(loss.device)
 
     loss_sum = 0.0
-    for i in range(params.num_codebooks):
+    # for i in range(params.num_codebooks):
+    for i in range(1):
         loss_value = tot_losses[i]["loss"] / tot_losses[i]["frames"]
         loss_sum += loss_value
 
@@ -1087,9 +1045,12 @@ def train_one_epoch(
                 world_size=world_size,
             )
             model.train()
+            s = ""
+            for i in range(params.num_codebooks):
+                s += f"codebook_index {i}, loss[{valid_info[i]}], "
             logging.info(
-                f"Epoch {params.cur_epoch}, "
-                f"validation: {[valid_info[i] for i in range(params.num_codebooks)]}"
+                f"Epoch {params.cur_epoch}, " + s
+                # f"validation: [{valid_info[i] for i in range(params.num_codebooks)}]"
             )
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"

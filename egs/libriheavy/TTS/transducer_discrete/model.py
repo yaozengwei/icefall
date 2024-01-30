@@ -38,7 +38,7 @@ class TtsModel(nn.Module):
         decoder_dim: int = 512,
         vocab_size: int = 1025,
         num_codebooks: int = 4,
-        blank_id: int = 1024,
+        audio_blank_id: int = 1024,
     ):
         """Transducer model for TTS.
 
@@ -64,7 +64,7 @@ class TtsModel(nn.Module):
         """
         super().__init__()
 
-        self.blank_id = blank_id
+        self.audio_blank_id = audio_blank_id
         self.num_codebooks = num_codebooks
 
         self.text_embed = text_embed
@@ -148,18 +148,16 @@ class TtsModel(nn.Module):
         )
 
         if self.cached is None:
-            # forward text-encoder with audio prompt output
+            # forward text-encoder with spespk_aker embedding as prompt
             x_out = self.text_embed(x)
-            x_out = x_out.transpose(0, 1)  # (N, T, D) -> (T, N, D)
             # import pdb
             # pdb.set_trace()
-            encoder_out, encoder_out_lens = self.text_encoder(
+            encoder_out = self.text_encoder(
                 x=x_out,
-                x_lens=x_lens,
-                src_key_padding_mask=make_pad_mask(x_lens),
+                key_padding_mask=make_pad_mask(x_lens),
                 prompt_spk_emb=prompt_spk_emb,
             )
-            encoder_out = encoder_out.transpose(0, 1)  # (T, N, D) -> (N, T, D)
+            encoder_out_lens = x_lens
 
             if cache_encoder_out:
                 self.cached = (encoder_out, encoder_out_lens)
@@ -172,13 +170,13 @@ class TtsModel(nn.Module):
         assert ys.shape[-1] == num_codebooks, (ys.shape, num_codebooks)
 
         cur_y = ys[:, :, codebook_index]  # (N, T_audio)
-        blank_id = self.blank_id
+        blank_id = self.audio_blank_id
         # (N, 1 + T_audio), start with SOS
         sos_cur_y = nn.functional.pad(cur_y, (1, 0), value=blank_id)
 
         if codebook_index > 0:
             pre_ys = ys[:, :, :codebook_index]  # (N, T_audio, codebook_index)
-            # (N, T_audio + 1, codebook_index), start with SOS
+            # (N, T_audio + 1, codebook_index), end with EOS
             pre_ys_eos = nn.functional.pad(pre_ys, (0, 0, 0, 1), value=blank_id)
         else:
             pre_ys_eos = None

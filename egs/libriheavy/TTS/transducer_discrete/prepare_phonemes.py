@@ -77,7 +77,11 @@ def prepare_phonemes(manifest_out_dir: Path, subset: str):
         # 0 = pad
         # 1 = bos
         # 2 = eos
-        cut.text_tokens = phoneme_ids_espeak(phonemize_espeak(text, "en-us")[0])
+        tokens_list = phonemize_espeak(text, "en-us")
+        tokens = []
+        for t in tokens_list:
+            tokens.extend(t)
+        cut.text_tokens = phoneme_ids_espeak(tokens)
         new_cuts.append(cut)
 
     new_cut_set = CutSet.from_cuts(new_cuts)

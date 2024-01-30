@@ -15,11 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Text encoder module in VITS.
-
+"""
 This code is based on
-  - https://github.com/jaywalnut310/vits
-  - https://github.com/espnet/espnet/blob/master/espnet2/gan_tts/vits/text_encoder.py
   - https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/transducer_stateless/conformer.py
 """
 
@@ -30,95 +27,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from icefall.utils import is_jit_tracing, make_pad_mask
+from icefall.utils import is_jit_tracing
 
 
-class TextEncoder(torch.nn.Module):
-    """Text encoder module in VITS.
-
-    This is a module of text encoder described in `Conditional Variational Autoencoder
-    with Adversarial Learning for End-to-End Text-to-Speech`.
-    """
-
-    def __init__(
-        self,
-        vocabs: int,
-        d_model: int = 192,
-        num_heads: int = 2,
-        dim_feedforward: int = 768,
-        cnn_module_kernel: int = 5,
-        num_layers: int = 6,
-        dropout: float = 0.1,
-    ):
-        """Initialize TextEncoder module.
-
-        Args:
-            vocabs (int): Vocabulary size.
-            d_model (int): attention dimension
-            num_heads (int): number of attention heads
-            dim_feedforward (int): feedforward dimention
-            cnn_module_kernel (int): convolution kernel size
-            num_layers (int): number of encoder layers
-            dropout (float): dropout rate
-        """
-        super().__init__()
-        self.d_model = d_model
-
-        # define modules
-        self.emb = torch.nn.Embedding(vocabs, d_model)
-        torch.nn.init.normal_(self.emb.weight, 0.0, d_model**-0.5)
-
-        # We use conformer as text encoder
-        self.encoder = Transformer(
-            d_model=d_model,
-            num_heads=num_heads,
-            dim_feedforward=dim_feedforward,
-            cnn_module_kernel=cnn_module_kernel,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
-
-        self.proj = torch.nn.Conv1d(d_model, d_model * 2, 1)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        x_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Calculate forward propagation.
-
-        Args:
-            x (Tensor): Input index tensor (B, T_text).
-            x_lengths (Tensor): Length tensor (B,).
-
-        Returns:
-            Tensor: Encoded hidden representation (B, attention_dim, T_text).
-            Tensor: Projected mean tensor (B, attention_dim, T_text).
-            Tensor: Projected scale tensor (B, attention_dim, T_text).
-            Tensor: Mask tensor for input tensor (B, 1, T_text).
-
-        """
-        # (B, T_text, embed_dim)
-        x = self.emb(x) * math.sqrt(self.d_model)
-
-        assert x.size(1) == x_lengths.max().item()
-
-        # (B, T_text)
-        pad_mask = make_pad_mask(x_lengths)
-
-        # encoder assume the channel last (B, T_text, embed_dim)
-        x = self.encoder(x, key_padding_mask=pad_mask)
-
-        # convert the channel first (B, embed_dim, T_text)
-        x = x.transpose(1, 2)
-        non_pad_mask = (~pad_mask).unsqueeze(1)
-        stats = self.proj(x) * non_pad_mask
-        m, logs = stats.split(stats.size(1) // 2, dim=1)
-
-        return x, m, logs, non_pad_mask
-
-
-class Transformer(nn.Module):
+class Conformer(nn.Module):
     """
     Args:
         d_model (int): attention dimension
@@ -136,27 +48,35 @@ class Transformer(nn.Module):
         dim_feedforward: int = 768,
         cnn_module_kernel: int = 5,
         num_layers: int = 6,
+        prompt_spk_emb_dim: int = -1,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
 
         self.num_layers = num_layers
         self.d_model = d_model
+        self.prompt_spk_emb_dim = prompt_spk_emb_dim
+
+        if prompt_spk_emb_dim > 0:
+            self.linear_prompt = nn.Linear(prompt_spk_emb_dim, d_model)
 
         self.encoder_pos = RelPositionalEncoding(d_model, dropout)
 
-        encoder_layer = TransformerEncoderLayer(
+        encoder_layer = ConformerEncoderLayer(
             d_model=d_model,
             num_heads=num_heads,
             dim_feedforward=dim_feedforward,
             cnn_module_kernel=cnn_module_kernel,
             dropout=dropout,
         )
-        self.encoder = TransformerEncoder(encoder_layer, num_layers)
+        self.encoder = ConformerEncoder(encoder_layer, num_layers)
         self.after_norm = nn.LayerNorm(d_model)
 
     def forward(
-        self, x: Tensor, key_padding_mask: Tensor
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor,
+        prompt_spk_emb: Optional[Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -165,12 +85,19 @@ class Transformer(nn.Module):
           lengths:
             A tensor of shape (batch_size,) containing the number of frames in
             `x` before padding.
+          prompt_spk_emb:
+            Speaker embedding as prompt, of shape (batch_size, prompt_spk_emb_dim).
         """
         x, pos_emb = self.encoder_pos(x)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
+        if prompt_spk_emb is not None:
+            prompt_spk_emb = self.linear_prompt(prompt_spk_emb).unsqueeze(0)
+
         x = self.encoder(
-            x, pos_emb, key_padding_mask=key_padding_mask
+            src=x if prompt_spk_emb is None else x + prompt_spk_emb,
+            pos_emb=pos_emb,
+            key_padding_mask=key_padding_mask,
         )  # (T, N, C)
 
         x = self.after_norm(x)
@@ -179,9 +106,9 @@ class Transformer(nn.Module):
         return x
 
 
-class TransformerEncoderLayer(nn.Module):
+class ConformerEncoderLayer(nn.Module):
     """
-    TransformerEncoderLayer is made up of self-attn and feedforward.
+    ConformerEncoderLayer is made up of feedforward, self-attn, convolution, feedforward.
 
     Args:
         d_model: the number of expected features in the input.
@@ -198,7 +125,7 @@ class TransformerEncoderLayer(nn.Module):
         cnn_module_kernel: int,
         dropout: float = 0.1,
     ) -> None:
-        super(TransformerEncoderLayer, self).__init__()
+        super(ConformerEncoderLayer, self).__init__()
 
         self.feed_forward_macaron = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
@@ -263,11 +190,11 @@ class TransformerEncoderLayer(nn.Module):
         return src
 
 
-class TransformerEncoder(nn.Module):
-    r"""TransformerEncoder is a stack of N encoder layers
+class ConformerEncoder(nn.Module):
+    r"""ConformerEncoder is a stack of N encoder layers
 
     Args:
-        encoder_layer: an instance of the TransformerEncoderLayer class.
+        encoder_layer: an instance of the ConformerEncoderLayer class.
         num_layers: the number of sub-encoder-layers in the encoder.
     """
 
@@ -644,19 +571,20 @@ class Swish(nn.Module):
         return x * torch.sigmoid(x)
 
 
-def _test_text_encoder():
-    vocabs = 500
+def _test_conformer():
     d_model = 192
     batch_size = 5
     seq_len = 100
+    prompt_spk_emb_dim = 64
 
-    m = TextEncoder(vocabs=vocabs, d_model=d_model)
-    x, m, logs, mask = m(
-        x=torch.randint(low=0, high=vocabs, size=(batch_size, seq_len)),
-        x_lengths=torch.full((batch_size,), seq_len),
-    )
-    print(x.shape, m.shape, logs.shape, mask.shape)
+    m = Conformer(d_model=d_model, prompt_spk_emb_dim=prompt_spk_emb_dim)
+    x = torch.randn(batch_size, seq_len, d_model)
+    padding_mask = torch.full((batch_size, seq_len), False)
+    prompt = torch.randn(batch_size, prompt_spk_emb_dim)
+    y = m(x, padding_mask, prompt)
+
+    assert y.shape == (batch_size, seq_len, d_model), y.shape
 
 
 if __name__ == "__main__":
-    _test_text_encoder()
+    _test_conformer()
