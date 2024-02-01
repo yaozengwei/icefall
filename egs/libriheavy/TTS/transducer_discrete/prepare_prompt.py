@@ -45,14 +45,14 @@ def get_parser():
     parser.add_argument(
         "--manifest-dir",
         type=Path,
-        default=Path("data/upper_no_punc/manifests"),
+        default=Path("data/upper_no_punc/manifests_codebooks"),
         help="Path to directory that saves cuts with encoded codebooks.",
     )
 
     parser.add_argument(
         "--prompt-duration",
         type=float,
-        default=10.0,
+        default=3.0,
         help="Duration in seconds of acoustic prompt.",
     )
 
@@ -85,9 +85,7 @@ def add_prompt(cuts: CutSet, prompt_duration: float) -> CutSet:
 
         cur_prompt_duration = min(prompt_duration, cut_p.duration)
         # select a random start in prompt_cut
-        prompt_start = random.uniform(
-            0.0, cut_p.duration - cur_prompt_duration
-        )
+        prompt_start = random.uniform(0.0, cut_p.duration - cur_prompt_duration)
         cut_p.id = cut.id + "_prompt"
         cut_p.start = cut_p.start + prompt_start
         cut_p.duration = cur_prompt_duration
@@ -123,9 +121,7 @@ def prepare_prompt(
     for speaker in tqdm(in_cuts.speakers, desc="Filtering cuts groups"):
         if len(cuts_per_speaker[speaker]) < 2:
             cuts_per_speaker.pop(speaker, None)
-            logging.info(
-                f"Skip for speaker {speaker} since the number of cuts is less than 2"
-            )
+            logging.info(f"Skip for speaker {speaker} since the number of cuts is less than 2")
 
     # List[CutSet]
     cuts_per_speaker = [CutSet.from_cuts(cuts) for cuts in cuts_per_speaker.values()]
@@ -138,8 +134,7 @@ def prepare_prompt(
                 pbar.update(1)
         else:
             futures = [
-                executor.submit(add_prompt, cuts, prompt_duration)
-                for cuts in cuts_per_speaker
+                executor.submit(add_prompt, cuts, prompt_duration) for cuts in cuts_per_speaker
             ]
             for future in as_completed(futures):
                 out_cuts.append(future.result())
@@ -159,9 +154,7 @@ def main():
     manifest_dir = args.manifest_dir
     suffix = ".jsonl.gz"
 
-    out_cuts_filename = (
-        manifest_dir / f"libriheavy_cuts_{args.subset}_{prompt_duration}s_prompt{suffix}"
-    )
+    out_cuts_filename = manifest_dir / f"libriheavy_cuts_{args.subset}_prompt_{prompt_duration}s{suffix}"
     if out_cuts_filename.is_file():
         logging.info(f"{out_cuts_filename} already exists - skipping.")
         return

@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Union
 
-from encodec import EncodecModel
+from funcodec.tasks.gan_speech_codec import GANSpeechCodecTask
 from speech_enc_datamodule import SpeechEncDataModule
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.utils import AttributeDict, setup_logger
@@ -75,39 +75,25 @@ def get_parser():
     parser.add_argument(
         "--manifest-out-dir",
         type=Path,
-        default=Path("data/upper_no_punc/manifests_with_codebooks"),
+        default=Path("data/upper_no_punc/manifests_codebooks"),
         help="Path to directory to save the cuts with encoded codebooks.",
     )
 
     parser.add_argument(
-        "--num-codebooks",
-        type=int,
-        default=8,
-        help="Number of codebooks. Possible values are 2, 4, 8, 16, 32.",
+        "--encodec-model-dir",
+        type=Path,
+        default=Path("data/encodec_model/"),
+        help="Path to the encodec model directory that contains 'config.yaml' and 'model.pth'.",
     )
 
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("log/"),
+        default=Path("log"),
         help="Path to directory to save logs.",
     )
 
     return parser
-
-
-def get_params() -> AttributeDict:
-    """Return a dict containing speech encoding parameters."""
-    params = AttributeDict(
-        {
-            "codebook_frame_shift": 320,  # The hop_length in EnCodec is 320 samples
-            # Supported bandwidths are 1.5kbps (n_q = 2), 3 kbps (n_q = 4),
-            # 6 kbps (n_q = 8) and 12 kbps (n_q = 16) and 24kbps (n_q = 32).
-            "num_codebooks_to_bandwidths": {2: 1.5, 4: 3.0, 8: 6.0, 16: 12.0, 32: 24.0}
-        }
-    )
-
-    return params
 
 
 def encode_dataset(
@@ -132,12 +118,7 @@ def encode_dataset(
         Whiter to save the encoded codebooks numpy arrays.
     """
     #  Background worker to save codebooks and cuts to disk.
-    def _save_worker(
-        cuts: List[Cut],
-        codebooks: np.ndarray,
-        num_frames: np.ndarray,
-        frame_shift_in_second: float,
-    ):
+    def _save_worker(cuts: List[Cut], codebooks: np.ndarray, num_frames: np.ndarray):
         assert len(cuts) == codebooks.shape[0], (len(cuts), codebooks.shape[0])
         for idx in range(len(cuts)):
             cut_data = cuts[idx].to_dict()
@@ -148,36 +129,32 @@ def encode_dataset(
             new_cut.codebooks = codebooks_writer.store_array(
                 key=new_cut.id,
                 value=codebooks[idx][: num_frames[idx]],
-                frame_shift=frame_shift_in_second,
+                frame_shift=params.encoder_hop_length / params.sampling_rate,
                 temporal_dim=0,
                 start=new_cut.start,
             )
             cuts_writer.write(new_cut, flush=True)
 
     num_cuts = 0
-    log_interval = 10
+    log_interval = 100
     futures = []
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     with ThreadPoolExecutor(max_workers=1) as executor:
         # We only want one background worker so that serialization is deterministic.
         for batch_idx, batch in enumerate(dl):
             audio = batch["audio"].unsqueeze(1).to(device)  # (B, 1, T)
-            audio_lens = batch["audio_lens"].numpy()
+            audio_lens = batch["audio_lens"]
             cuts = batch["cut"]
-            num_frames = audio_lens // params.codebook_frame_shift
+            num_frames = torch.ceil(audio_lens / params.encoder_hop_length).int().numpy()
 
-            encoded_frames = model.encode(audio)
-            assert len(encoded_frames) == 1, len(encoded_frames)
-            codebooks = encoded_frames[0][0].transpose(1, 2).cpu().numpy()  # (B, T', n_q)
+            # 1 * n_q x B x T
+            codebooks = model.inference_encoding(audio, need_recon=False)["code_indices"]
+            assert len(codebooks) == 1, len(codebooks)
+            codebooks = codebooks[0].permute(1, 2, 0).cpu().numpy()  # (B, T, n_q)
             assert np.min(codebooks) >= 0, np.min(codebooks)
-            assert np.max(codebooks) < 1024, np.max(codebooks)
+            assert np.max(codebooks) < params.codebook_size, np.max(codebooks)
 
-            frame_shift_in_second = params.codebook_frame_shift / params.sampling_rate
-            futures.append(
-                executor.submit(
-                    _save_worker, cuts, codebooks, num_frames, frame_shift_in_second
-                )
-            )
+            futures.append(executor.submit(_save_worker, cuts, codebooks, num_frames))
 
             num_cuts += len(cuts)
             if batch_idx % log_interval == 0:
@@ -198,43 +175,37 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
-    params = get_params()
+    params = AttributeDict()
     params.update(vars(args))
 
     if world_size > 1:
         setup_dist(rank, world_size, params.master_port)
 
-    setup_logger(f"{params.log_dir}/log-encode-{params.num_codebooks}-codebooks")
+    setup_logger(f"{params.log_dir}/log-encode")
     logging.info("Encoding started")
-
-    assert params.num_codebooks in params.num_codebooks_to_bandwidths, (
-        f"Supported codebook numbers are {params.num_codebooks_to_bandwidths.keys()}"
-    )
     logging.info(f"{params}")
 
-    model = EncodecModel.encodec_model_24khz()
-    model.set_target_bandwidth(params.num_codebooks_to_bandwidths[params.num_codebooks])
-    assert params.sampling_rate == model.sample_rate, (params.sampling_rate, model.sample_rate)
-
-    device = torch.device("cpu")
+    device = "cpu"
     if torch.cuda.is_available():
-        device = torch.device("cuda", rank)
+        device = f"cuda:{rank}"
     logging.info(f"device: {device}")
 
-    model.to(device)
+    model, model_args = GANSpeechCodecTask.build_model_from_file(
+        config_file=params.encodec_model_dir / "config.yaml",
+        model_file=params.encodec_model_dir / "model.pth",
+        device=device,
+    )
     model.eval()
 
+    assert model_args.sampling_rate == params.sampling_rate, model_args.sampling_rate
+    params.encoder_hop_length = model_args.quantizer_conf["encoder_hop_length"]
+    params.codebook_size = model_args.quantizer_conf["codebook_size"]
+
     if world_size > 1:
-        out_cuts_filename = params.manifest_out_dir / (
-            f"{params.cuts_filename}_job_{rank}" + params.suffix
-        )
-        codebooks_filename = params.manifest_out_dir / (
-            f"{params.codebooks_filename}_job_{rank}"
-        )
+        out_cuts_filename = params.manifest_out_dir / (f"{params.cuts_filename}_job_{rank}" + params.suffix)
+        codebooks_filename = params.manifest_out_dir / f"{params.codebooks_filename}_job_{rank}"
     else:
-        out_cuts_filename = params.manifest_out_dir / (
-            f"{params.cuts_filename}" + params.suffix
-        )
+        out_cuts_filename = params.manifest_out_dir / (f"{params.cuts_filename}" + params.suffix)
         codebooks_filename = params.manifest_out_dir / f"{params.codebooks_filename}"
 
     # we will store new cuts with encoded codebooks.

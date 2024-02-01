@@ -1,5 +1,3 @@
-# Copyright      2021  Piotr Żelasko
-# Copyright      2022  Xiaomi Corporation     (Author: Mingshuang Luo)
 # Copyright      2023  Xiaomi Corporation     (Author: Zengwei Yao)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
@@ -52,30 +50,23 @@ class SpeechEncodingDataset(torch.utils.data.Dataset):
         return_cuts: bool = True,
         return_audio: bool = True,
         return_prompt_audio: bool = False,
-        sampling_rate: int = 24000,
-        prompt_sampling_rate: int = 16000,
     ):
         super().__init__()
         self.return_cuts = return_cuts
         self.return_audio = return_audio
         self.return_prompt_audio = return_prompt_audio
-        self.sampling_rate = sampling_rate
-        self.prompt_sampling_rate = prompt_sampling_rate
 
     def __getitem__(self, cuts: CutSet) -> Dict[str, Union[torch.Tensor, List[Cut]]]:
         """
         Return a new batch, with the batch size automatically determined using the constraints
         of max_frames and max_cuts.
         """
-        # self.hdf5_fix.update()
-
         # Sort the cuts by duration so that the first one determines the batch time dimensions.
         # cuts = cuts.sort_by_duration(ascending=False)
 
         batch = {}
 
         if self.return_audio:
-            cuts = cuts.resample(self.sampling_rate)
             audio, audio_lens = collate_audio(cuts)
             batch["audio"] = audio
             batch["audio_lens"] = audio_lens
@@ -85,7 +76,6 @@ class SpeechEncodingDataset(torch.utils.data.Dataset):
 
         if self.return_prompt_audio:
             prompt_cuts = CutSet.from_cuts([MonoCut.from_dict(cut.prompt_cut) for cut in cuts])
-            prompt_cuts = prompt_cuts.resample(self.prompt_sampling_rate)
             prompt_audio, prompt_audio_lens = collate_audio(prompt_cuts)
             batch["prompt_audio"] = prompt_audio
             batch["prompt_audio_lens"] = prompt_audio_lens
@@ -167,14 +157,8 @@ class SpeechEncDataModule:
         group.add_argument(
             "--sampling-rate",
             type=int,
-            default=24000,
-            help="Target sampling rate.",
-        )
-        group.add_argument(
-            "--prompt-sampling-rate",
-            type=int,
             default=16000,
-            help="Sampling rate for prompt audio used to extract speaker embedding.",
+            help="The sampling rate.",
         )
 
     def dataloader(self, cuts: CutSet) -> DataLoader:
@@ -183,8 +167,6 @@ class SpeechEncDataModule:
             return_cuts=self.args.return_cuts,
             return_audio=self.args.return_audio,
             return_prompt_audio=self.args.return_prompt_audio,
-            sampling_rate=self.args.sampling_rate,
-            prompt_sampling_rate=self.args.prompt_sampling_rate,
         )
 
         if self.args.bucketing_sampler:
