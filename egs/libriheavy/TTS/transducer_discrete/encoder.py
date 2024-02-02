@@ -16,9 +16,7 @@
 # limitations under the License.
 
 import copy
-import logging
 import math
-import random
 from typing import Optional, Tuple
 
 import torch
@@ -31,6 +29,8 @@ from scaling import penalize_abs_values_gt
 class Conformer(nn.Module):
     """
     Args:
+        vocab_size: Number of tokens as modeling units including blank token.
+        blank_id: ID of the blank symbol.
         embed_dim: total dimension of the model.
         attention_dim: dimension in the attention module.
         num_heads: number of parallel attention heads.
@@ -43,6 +43,8 @@ class Conformer(nn.Module):
 
     def __init__(
         self,
+        vocab_size: int,
+        blank_id: int,
         embed_dim: int = 512,
         attention_dim: int = 512,
         num_heads: int = 8,
@@ -53,8 +55,12 @@ class Conformer(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        self.vocab_size = vocab_size
+        self.blank_id = blank_id
 
-        self.encoder_pos = RelPositionalEncoding(embed_dim, dropout)
+        self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
+
+        self.pos = RelPositionalEncoding(embed_dim, dropout)
 
         encoder_layer = ConformerEncoderLayer(
             embed_dim=embed_dim,
@@ -78,11 +84,9 @@ class Conformer(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-          x:
-            Input tensor of shape (batch, tgt_len, embed_dim).
-          x_lens:
-            A tensor of shape (batch,) containing the number of frames in
-            `x` before padding.
+          x: Input tensor of shape (batch, tgt_len).
+          x_lens: A tensor of shape (batch,) containing the number of tokens in `x`
+            before padding.
           memory:
             Memory sequence of shape (batch, src_len, memory_dim).
           memory_lens:
@@ -92,8 +96,12 @@ class Conformer(nn.Module):
         Outputs:
             Output tensor of shape (batch, tgt_len, embed_dim).
         """
-        padding_mask = make_pad_mask(x_lens)  # (batch, tgt_len)
+        x = self.embed(x)  # (batch, tgt_len, embed_dim)
+        pos_emb = self.pos(x)  # (1, 2*tgt_len, embed_dim)
 
+        x = x.permute(1, 0, 2)  # (tgt_len, batch, embed_dim)
+
+        padding_mask = make_pad_mask(x_lens)  # (batch, tgt_len)
         if memory is not None:
             memory_padding_mask = make_pad_mask(memory_lens)
             memory_attn_mask = torch.logical_or(
@@ -103,9 +111,6 @@ class Conformer(nn.Module):
             memory = memory.permute(1, 0, 2)  # (src_len, batch, memory_dim)
         else:
             memory_attn_mask = None
-
-        pos_emb = self.encoder_pos(x)
-        x = x.permute(1, 0, 2)  # (tgt_len, batch, embed_dim)
 
         x = self.encoder(
             x,
@@ -163,7 +168,7 @@ class ConformerEncoderLayer(nn.Module):
         if memory_dim is not None:
             self.cross_attn = MultiHeadAttention(
                 embed_dim, attention_dim, num_heads,
-                memory_dim=memory_dim, dropout=dropout)
+                memory_dim=memory_dim, dropout=0)
             self.norm_cross_attn_q = nn.LayerNorm(embed_dim)
             self.norm_cross_attn_kv = nn.LayerNorm(memory_dim)
 
@@ -392,7 +397,6 @@ class RelPositionMultiHeadAttention(nn.Module):
             self.head_dim, num_heads, attention_dim
         )
         self.dropout = dropout
-        self.name = None  # will be overwritten in training code; for diagnostics.
 
         self.in_proj = nn.Linear(embed_dim, 3 * attention_dim, bias=True)
         self.out_proj = nn.Linear(attention_dim, embed_dim, bias=True)
@@ -514,10 +518,6 @@ class RelPositionMultiHeadAttention(nn.Module):
         attn_weights = attn_weights.view(batch * num_heads, seq_len, seq_len)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        if random.random() < 0.001:
-            print_attn_entropy(attn_weights, self.name)
-
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )
@@ -563,7 +563,6 @@ class MultiHeadAttention(nn.Module):
             self.head_dim, num_heads, attention_dim
         )
         self.dropout = dropout
-        self.name = None  # will be overwritten in training code; for diagnostics.
 
         self.linear_q = nn.Linear(embed_dim, attention_dim, bias=True)
         self.linear_k = nn.Linear(
@@ -634,10 +633,6 @@ class MultiHeadAttention(nn.Module):
         attn_weights = attn_weights.view(batch * num_heads, tgt_len, src_len)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        if random.random() < 0.001:
-            print_attn_entropy(attn_weights, self.name)
-
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )
@@ -743,29 +738,13 @@ class ConvolutionModule(nn.Module):
         return x.permute(2, 0, 1)
 
 
-def print_attn_entropy(attn_weights: Tensor, module_name: str):
-    # attn_weights: (num_heads, batch, tgt_len, src_len)
-    (num_heads, batch, tgt_len, src_len) = attn_weights.shape
-
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=False):
-            attn_weights = attn_weights.to(torch.float32)
-            attn_weights_entropy = (
-                -((attn_weights + 1.0e-20).log() * attn_weights)
-                .sum(dim=-1)
-                .mean(dim=(1, 2))
-            )
-            logging.info(
-                f"name={module_name}, attn_weights_entropy = {attn_weights_entropy}"
-            )
-
-
 def _test_conformer(use_memory: bool = False):
     embed_dim = 512
     batch_size = 5
     seq_len = 100
+    vocab_size = 1025
 
-    x = torch.randn(batch_size, seq_len, embed_dim)
+    x = torch.randint(vocab_size, (batch_size, seq_len))
     x_lens = torch.full((batch_size,), seq_len)
 
     if use_memory:
@@ -777,7 +756,8 @@ def _test_conformer(use_memory: bool = False):
         memory = None
         memory_lens = None
 
-    m = Conformer(embed_dim=embed_dim, memory_dim=memory_dim)
+    m = Conformer(
+        vocab_size=vocab_size, blank_id=0, embed_dim=embed_dim, memory_dim=memory_dim)
     y = m(x, x_lens, memory, memory_lens)
 
     assert y.shape == (batch_size, seq_len, embed_dim), y.shape
