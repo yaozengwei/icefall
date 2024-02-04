@@ -44,30 +44,25 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--manifest-out-dir",
+        "--manifest-dir",
         type=Path,
-        default=Path("data/cases_and_punc/manifests_with_4_codebooks"),
+        default=Path("data/cases_and_punc/manifests_codebooks"),
         help="Path to directory that saves cuts with encoded codebooks.",
     )
 
     parser.add_argument(
         "--prompt-duration",
         type=float,
-        default=10.0,
+        default=3.0,
         help="Duration in seconds of acoustic prompt.",
     )
 
     return parser
 
 
-def prepare_phonemes(manifest_out_dir: Path, subset: str):
-    # manifests_with_4_codebooks/libriheavy_cuts_dev_10.0s_prompt_spk_emb.jsonl.gz
-    suffix = "10.0s_prompt_spk_emb"
-
-    cut_set = load_manifest(manifest_out_dir / f"libriheavy_cuts_{subset}_{suffix}.jsonl.gz")
-
+def prepare_phonemes(in_cuts: CutSet):
     new_cuts = []
-    for cut in tqdm(cut_set):
+    for cut in tqdm(in_cuts):
         # Each cut only contains one supervision
         assert len(cut.supervisions) == 1, len(cut.supervisions)
         text = cut.supervisions[0].text
@@ -84,10 +79,7 @@ def prepare_phonemes(manifest_out_dir: Path, subset: str):
         cut.text_tokens = phoneme_ids_espeak(tokens)
         new_cuts.append(cut)
 
-    new_cut_set = CutSet.from_cuts(new_cuts)
-    out_cuts_filename = manifest_out_dir / f"libriheavy_cuts_{subset}_{suffix}_phone.jsonl.gz"
-    new_cut_set.to_file(out_cuts_filename)
-    logging.info(f"Cuts saved to {out_cuts_filename}")
+    return CutSet.from_cuts(new_cuts)
 
 
 def main():
@@ -97,7 +89,21 @@ def main():
     subset = args.subset
     assert subset in ["small", "medium", "large", "dev", "test_clean", "test_other"], subset
 
-    prepare_phonemes(args.manifest_out_dir, subset)
+    manifest_dir = args.manifest_dir
+    prompt_duration = args.prompt_duration
+    suffix = ".jsonl.gz"
+    prefix = f"libriheavy_cuts_{args.subset}_prompt_{prompt_duration}s"
+
+    out_cuts_filename = manifest_dir / f"{prefix}_phone{suffix}"
+    if out_cuts_filename.is_file():
+        logging.info(f"{out_cuts_filename} already exists - skipping.")
+        return
+
+    in_cuts = load_manifest(manifest_dir / f"{prefix}{suffix}")
+    out_cuts = prepare_phonemes(in_cuts)
+
+    out_cuts.to_file(out_cuts_filename)
+    logging.info(f"Cuts saved to {out_cuts_filename}")
 
 
 if __name__ == "__main__":
