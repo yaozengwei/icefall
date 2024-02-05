@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 
 import torch
 from lhotse import CutSet, load_manifest_lazy
+from lhotse.cut import MonoCut
 from lhotse.dataset import DynamicBucketingSampler, SimpleCutSampler
 from lhotse.dataset.collation import collate_audio, collate_custom_field
 from lhotse.utils import fix_random_seed
@@ -42,12 +43,17 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
     .. code-block::
 
         {
-            'audio': (B x NumSamples) float tensor
-            'features': (B x NumFrames x NumFeatures) float tensor
-            'audio_lens': (B, ) int tensor
-            'features_lens': (B, ) int tensor
             'text': List[str] of len B  # when return_text=True
-            'tokens': List[List[str]]  # when return_tokens=True
+            'audio': (B x NumSamples) float tensor  # when return_audio=True
+            'audio_lens': (B, ) int tensor
+            'prompt_audio': (B x NumSamples) float tensor  # when return_prompt_audio=True
+            'prompt_audio_lens': (B, ) int tensor
+            'text_tokens': (B, NumTokens), int tensor  # when return_text_tokens=True
+            'text_tokens_lens': (B, ), int tensor
+            'audio_tokens': (B, NumTokens), int tensor  # when return_audio_tokens=True
+            'audio_tokens_lens': (B, ), int tensor
+            'prompt_audio_tokens': (B, NumTokens), int tensor  # when return_prompt_audio_tokens=True
+            'prompt_audio_tokens_lens': (B, ), int tensor
             'speakers': List[str] of len B  # when return_spk_ids=True
             'cut': List of Cuts  # when return_cuts=True
         }
@@ -55,15 +61,16 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        audio_blank_id: int,
-        text_blank_id: int,
         return_text: bool = True,
         return_audio: bool = True,
+        return_prompt_audio: bool = True,
         return_text_tokens: bool = False,
         return_audio_tokens: bool = False,
-        return_prompt_speaker_embedding: bool = False,
+        return_prompt_audio_tokens: bool = False,
         return_spk_ids: bool = False,
         return_cuts: bool = False,
+        text_blank_id: int = 0,
+        audio_blank_id: int = 0,
     ) -> None:
         super().__init__()
 
@@ -72,10 +79,11 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
 
         self.return_text = return_text
         self.return_audio = return_audio
+        self.return_prompt_audio = return_prompt_audio
 
         self.return_text_tokens = return_text_tokens
         self.return_audio_tokens = return_audio_tokens
-        self.return_prompt_speaker_embedding = return_prompt_speaker_embedding
+        self.return_prompt_audio_tokens = return_prompt_audio_tokens
 
         self.return_spk_ids = return_spk_ids
         self.return_cuts = return_cuts
@@ -92,6 +100,14 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
             batch["audio"] = audio
             batch["audio_lens"] = audio_lens
 
+        if self.return_prompt_audio:
+            prompt_cuts = CutSet.from_cuts(
+                [MonoCut.from_dict(cut.prompt_cut) for cut in cuts]
+            )
+            prompt_audio, prompt_audio_lens = collate_audio(prompt_cuts)
+            batch["prompt_audio"] = prompt_audio
+            batch["prompt_audio_lens"] = prompt_audio_lens
+
         if self.return_text_tokens:
             text_tokens = pad_sequence(
                 [torch.tensor(cut.text_tokens, dtype=torch.int32) for cut in cuts],
@@ -99,8 +115,7 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
                 padding_value=self.text_blank_id,
             )
             text_tokens_lens = torch.tensor(
-                [len(cut.text_tokens) for cut in cuts],
-                dtype=torch.int32,
+                [len(cut.text_tokens) for cut in cuts], dtype=torch.int32
             )
             batch["text_tokens"] = text_tokens
             batch["text_tokens_lens"] = text_tokens_lens
@@ -112,11 +127,15 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
             batch["audio_tokens"] = audio_tokens
             batch["audio_tokens_lens"] = audio_tokens_lens
 
-        if self.return_prompt_speaker_embedding:
-            prompt_speaker_embedding = collate_custom_field(
-                cuts, field="prompt_speaker_embedding"
+        if self.return_prompt_audio_tokens:
+            prompt_cuts = CutSet.from_cuts(
+                [MonoCut.from_dict(cut.prompt_cut) for cut in cuts]
             )
-            batch["prompt_speaker_embedding"] = prompt_speaker_embedding
+            prompt_audio_tokens, prompt_audio_tokens_lens = collate_custom_field(
+                prompt_cuts, field="codebooks", pad_value=self.audio_blank_id
+            )
+            batch["prompt_audio_tokens"] = prompt_audio_tokens
+            batch["prompt_audio_tokens_lens"] = prompt_audio_tokens_lens
 
         if self.return_spk_ids:
             batch["speakers"] = [cut.supervisions[0].speaker for cut in cuts]
@@ -164,7 +183,7 @@ class LibriHeavyTtsDataModule:
         group.add_argument(
             "--manifest-dir",
             type=Path,
-            default=Path("data/manifests"),
+            default=Path("data/manifests_codebooks"),
             help="Path to directory with train/valid/test cuts.",
         )
         group.add_argument(
@@ -224,6 +243,13 @@ class LibriHeavyTtsDataModule:
             "fields: batch['audio'] and batch['audio_lens'].",
         )
         group.add_argument(
+            "--return-prompt-audio",
+            type=str2bool,
+            default=False,
+            help="When enabled, each batch will have the "
+            "fields: batch['prompt_audio'] and batch['prompt_audio_lens'].",
+        )
+        group.add_argument(
             "--return-text-tokens",
             type=str2bool,
             default=True,
@@ -238,11 +264,11 @@ class LibriHeavyTtsDataModule:
             "fields: batch['audio_tokens'] and batch['audio_tokens_lens'].",
         )
         group.add_argument(
-            "--return-prompt-speaker-embedding",
+            "--return-prompt-audio-tokens",
             type=str2bool,
             default=True,
             help="When enabled, each batch will have the "
-            "field: batch['prompt_speaker_embedding'].",
+            "field: batch['prompt_audio_tokens'] and batch['prompt_audio_tokens_lens'].",
         )
         group.add_argument(
             "--num-workers",
@@ -252,16 +278,10 @@ class LibriHeavyTtsDataModule:
             "collect the batches.",
         )
         group.add_argument(
-            "--sampling-rate",
-            type=int,
-            default=24000,
-            help="Target sampling rate.",
-        )
-        group.add_argument(
-            "--prompt-sampling-rate",
-            type=int,
-            default=16000,
-            help="Sampling rate for prompt audio used to extract speaker embedding.",
+            "--prompt-duration",
+            type=float,
+            default=3.0,
+            help="Duration in seconds of acoustic prompt.",
         )
 
     def train_dataloaders(
@@ -278,14 +298,15 @@ class LibriHeavyTtsDataModule:
         """
         logging.info("About to create train dataset")
         dataset = SpeechSynthesisDataset(
-            audio_blank_id=self.args.audio_blank_id,
-            text_blank_id=self.args.text_blank_id,
             return_text=self.args.return_text,
             return_audio=self.args.return_audio,
+            return_prompt_audio=self.args.return_prompt_audio,
             return_text_tokens=self.args.return_text_tokens,
             return_audio_tokens=self.args.return_audio_tokens,
-            return_prompt_speaker_embedding=self.args.return_prompt_speaker_embedding,
+            return_prompt_audio_tokens=self.args.return_prompt_audio_tokens,
             return_cuts=self.args.return_cuts,
+            audio_blank_id=self.args.audio_blank_id,
+            text_blank_id=self.args.text_blank_id,
         )
 
         if self.args.bucketing_sampler:
@@ -329,14 +350,15 @@ class LibriHeavyTtsDataModule:
     def test_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
         logging.info("About to create test dataset")
         dataset = SpeechSynthesisDataset(
-            audio_blank_id=self.args.audio_blank_id,
-            text_blank_id=self.args.text_blank_id,
             return_text=self.args.return_text,
             return_audio=self.args.return_audio,
+            return_prompt_audio=self.args.return_prompt_audio,
             return_text_tokens=self.args.return_text_tokens,
             return_audio_tokens=self.args.return_audio_tokens,
-            return_prompt_speaker_embedding=self.args.return_prompt_speaker_embedding,
+            return_prompt_audio_tokens=self.args.return_prompt_audio_tokens,
             return_cuts=self.args.return_cuts,
+            audio_blank_id=self.args.audio_blank_id,
+            text_blank_id=self.args.text_blank_id,
         )
         sampler = DynamicBucketingSampler(
             cuts_valid,
@@ -357,41 +379,35 @@ class LibriHeavyTtsDataModule:
     @lru_cache()
     def train_small_cuts(self) -> CutSet:
         logging.info("About to get small subset cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_small_10.0s_prompt_spk_emb_phone.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_small_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)
 
     @lru_cache()
     def train_medium_cuts(self) -> CutSet:
         logging.info("About to get medium subset cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_medium.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_medium_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)
 
     @lru_cache()
     def train_large_cuts(self) -> CutSet:
         logging.info("About to get large subset cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_large.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_large_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)
 
     @lru_cache()
     def dev_cuts(self) -> CutSet:
         logging.info("About to get dev cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_dev_10.0s_prompt_spk_emb_phone.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_dev_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)
 
     @lru_cache()
     def test_clean_cuts(self) -> CutSet:
         logging.info("About to get the test-clean cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_test_clean.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_test_clean_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)
 
     @lru_cache()
     def test_other_cuts(self) -> CutSet:
         logging.info("About to get the test-other cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "libriheavy_cuts_test_other.jsonl.gz"
-        )
+        filename = f"libriheavy_cuts_test_other_prompt_{self.args.prompt_duration}s_phone.jsonl.gz"
+        return load_manifest_lazy(self.args.manifest_dir / filename)

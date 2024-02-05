@@ -54,7 +54,6 @@ It supports training with:
 import argparse
 import copy
 import logging
-import random
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -64,9 +63,9 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from tts_datamodule import LibriHeavyTtsDataModule
-from conformer import Conformer
-from decoder import Decoder
-from embedding import DecoderEmbedding, TextEmbedding
+from encoder import Conformer
+from funcodec.tasks.gan_speech_codec import GANSpeechCodecTask
+from decoder import Transformer
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
@@ -127,56 +126,77 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "--encoder-dim",
         type=int,
         default=512,
-        help="Embedding dimension in encoder."
+        help="Embedding dimension of encoder model."
     )
 
     parser.add_argument(
         "--encoder-num-layers",
         type=int,
-        default=12,
-        help="Number of conformer encoder layers.",
+        default=8,
+        help="Number of encoder layers.",
     )
 
     parser.add_argument(
-        "--encoder-feedforward-dim",
+        "--encoder-attention-dim",
         type=int,
-        default=2048,
-        help="Feedforward dimension of the subformer encoder layers, per stack, comma separated.",
+        default=512,
+        help="Attenion dimension in encoder layers.",
     )
 
     parser.add_argument(
         "--encoder-num-heads",
         type=int,
         default=8,
-        help="Number of attention heads in the conformer encoder layers",
+        help="Number of attention heads in encoder layers",
     )
 
     parser.add_argument(
-        "--encoder-cnn-kernel",
+        "--encoder-feedforward-dim",
+        type=int,
+        default=2048,
+        help="Feedforward dimension in encoder layers.",
+    )
+
+    parser.add_argument(
+        "--encoder-cnn-module-kernel",
         type=int,
         default=5,
-        help="Convolution kernel size of the conformer encoder layers.",
+        help="Convolution kernel size in encoder layers.",
     )
 
     parser.add_argument(
         "--decoder-dim",
         type=int,
         default=512,
-        help="Embedding dimension in the decoder model.",
+        help="Embedding dimension in decoder model.",
     )
 
     parser.add_argument(
         "--decoder-num-layers",
         type=int,
-        default=1,
-        help="Number of layers in the decoder model.",
+        default=4,
+        help="Number of decoder layers.",
     )
 
     parser.add_argument(
-        "--decoder-rnn-hidden-dim",
+        "--decoder-attention-dim",
         type=int,
-        default=1024,
-        help="Hidden dimension of LSTM layers in the decoder model.",
+        default=512,
+        help="Attenion dimension in decoder layers.",
+    )
+
+    parser.add_argument(
+        "--decoder-num-heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in decoder layers",
+    )
+
+    parser.add_argument(
+        "--decoder-feedforward-dim",
+        type=int,
+        default=2048,
+        help="Feedforward dimension in decoder layers.",
     )
 
     parser.add_argument(
@@ -190,10 +210,10 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--num-codebooks",
-        type=int,
-        default=4,
-        help="Number of codebooks used to encode audio.",
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate in training.",
     )
 
 
@@ -252,7 +272,7 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="zipformer/exp",
+        default="transducer_discrete/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -260,14 +280,14 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--bpe-model",
-        type=str,
-        default="data/lang_bpe_500/bpe.model",
-        help="Path to the BPE model",
+        "--encodec-model-dir",
+        type=Path,
+        default=Path("data/encodec_model/"),
+        help="Path to the encodec model directory that contains 'config.yaml' and 'model.pth'.",
     )
 
     parser.add_argument(
-        "--base-lr", type=float, default=0.045, help="The base learning rate."
+        "--base-lr", type=float, default=0.03, help="The base learning rate."
     )
 
     parser.add_argument(
@@ -325,13 +345,6 @@ def get_parser():
         "loss(joiner is just addition), this simple loss also uses for"
         "training (as a regularization item). We will scale the simple loss"
         "with this parameter before adding to the final loss.",
-    )
-
-    parser.add_argument(
-        "--ctc-loss-scale",
-        type=float,
-        default=0.2,
-        help="Scale for CTC loss.",
     )
 
     parser.add_argument(
@@ -459,11 +472,10 @@ def get_params() -> AttributeDict:
             "log_interval": 50,
             "reset_interval": 200,
             "valid_interval": 3000,  # For the 100h subset, use 800
-            "prompt_spk_emb_dim": 192,  # Dimension of prompt speaker embedding
             "text_vocab_size": get_max_phonemes(),  # including pad=0, bos=1, eos=2
             "text_blank_id": 0,  # blank_id for text tokens padding
-            "audio_blank_id": 1024,  # blank_id of predicted blank
-            "audio_vocab_size": 1025,  # including codebook_indexes in [0,1024) and blank_id 1024
+            "audio_blank_id": 0,  # blank_id for audio tokens padding
+            "sampling_rate": 16000,
             "warm_step": 2000,
             "env_info": get_env_info(),
         }
@@ -472,45 +484,32 @@ def get_params() -> AttributeDict:
     return params
 
 
-def _to_int_tuple(s: str):
-    return tuple(map(int, s.split(",")))
-
-
-def get_text_embed(params: AttributeDict) -> nn.Module:
-    text_embed = TextEmbedding(
+def get_encoder_model(params: AttributeDict) -> nn.Module:
+    encoder = Conformer(
         vocab_size=params.text_vocab_size,
+        blank_id=params.text_blank_id,
         embed_dim=params.encoder_dim,
-    )
-    return text_embed
-
-
-def get_decoder_embed(params: AttributeDict) -> nn.Module:
-    decoder_embed = DecoderEmbedding(
-        vocab_size=params.audio_vocab_size,
-        num_codebooks=params.num_codebooks,
-        embed_dim=params.decoder_dim,
-    )
-    return decoder_embed
-
-
-def get_text_encoder(params: AttributeDict) -> nn.Module:
-    text_encoder = Conformer(
-        d_model=params.encoder_dim,
+        attention_dim=params.encoder_attention_dim,
         num_heads=params.encoder_num_heads,
-        dim_feedforward=params.encoder_feedforward_dim,
-        cnn_module_kernel=params.encoder_cnn_kernel,
+        feedforward_dim=params.encoder_feedforward_dim,
+        cnn_module_kernel=params.encoder_cnn_module_kernel,
         num_layers=params.encoder_num_layers,
-        prompt_spk_emb_dim=params.prompt_spk_emb_dim,
+        memory_dim=params.prompt_dim,
+        dropout=params.dropout,
     )
-    return text_encoder
+    return encoder
 
 
-def get_decoder(params: AttributeDict) -> nn.Module:
-    decoder = Decoder(
-        decoder_dim=params.decoder_dim,
-        rnn_hidden_dim=params.decoder_rnn_hidden_dim,
+def get_decoder_model(params: AttributeDict) -> nn.Module:
+    decoder = Transformer(
+        vocab_size=params.audio_vocab_size + 1,  # extra one dim for sos_id
+        sos_id=params.audio_vocab_size,
+        embed_dim=params.decoder_dim,
+        attention_dim=params.decoder_attention_dim,
+        num_heads=params.decoder_num_heads,
+        feedforward_dim=params.decoder_feedforward_dim,
         num_layers=params.decoder_num_layers,
-        rnn_dropout=0.1,
+        dropout=params.dropout,
     )
     return decoder
 
@@ -520,31 +519,24 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
         encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
-        vocab_size=params.audio_vocab_size,
+        vocab_size=params.audio_vocab_size + 1,  # extra one dim for blank_id
     )
     return joiner
 
 
 def get_model(params: AttributeDict) -> nn.Module:
-    text_embed = get_text_embed(params)
-    text_encoder = get_text_encoder(params)
-
-    decoder_embed = get_decoder_embed(params)
-    decoder = get_decoder(params)
-
+    encoder = get_encoder_model(params)
+    decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
     model = TtsModel(
-        text_embed=text_embed,
-        text_encoder=text_encoder,
-        decoder_embed=decoder_embed,
+        encoder=encoder,
         decoder=decoder,
         joiner=joiner,
         encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
-        vocab_size=params.audio_vocab_size,
-        num_codebooks=params.num_codebooks,
-        audio_blank_id=params.audio_blank_id,
+        vocab_size=params.audio_vocab_size + 1,  # extra one dim for blank_id
+        blank_id=params.audio_vocab_size,
     )
     return model
 
@@ -665,27 +657,36 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def prepare_input(batch: dict, device: torch.device):
+def prepare_input(batch: dict, device: torch.device, first_codebook: bool = True):
     """Prepare batch data"""
 
     # for target audio tokens
-    # (B, T_audio, num_codebooks)
-    audio_tokens = batch["audio_tokens"].to(device)
+    if not first_codebook:
+        # (B, audio_len, num_codebooks)
+        audio_tokens = batch["audio_tokens"].to(device)
+    else:
+        # Only use first codebook
+        # (B, audio_len)
+        audio_tokens = batch["audio_tokens"][:, :, 0].to(device)
     # (B,)
     audio_tokens_lens = batch["audio_tokens_lens"].to(device)
 
-    # for prompt
-    # (B,  prompt_spk_emb_dim)
-    prompt_spk_emb = batch["prompt_speaker_embedding"].to(device)
+    # for prompt audio tokens
+    # (B, prompt_audio_len, num_codebooks)
+    prompt_audio_tokens = batch["prompt_audio_tokens"].to(device)
+    # (B,)
+    prompt_audio_tokens_lens = batch["prompt_audio_tokens_lens"].to(device)
 
     # for input text tokens
     text_tokens = batch["text_tokens"].to(device)
+    # (B,)
     text_tokens_lens = batch["text_tokens_lens"].to(device)
 
     return (
         audio_tokens,
         audio_tokens_lens,
-        prompt_spk_emb,
+        prompt_audio_tokens,
+        prompt_audio_tokens_lens,
         text_tokens,
         text_tokens_lens,
     )
@@ -694,6 +695,7 @@ def prepare_input(batch: dict, device: torch.device):
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    quantizer: nn.Module,
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker, int]:
@@ -704,10 +706,11 @@ def compute_loss(
       params:
         Parameters for training. See :func:`get_params`.
       model:
-        The model for training. It is an instance of Zipformer in our case.
+        The model for training.
+      quantizer:
+        The encodec quantizer model.
       batch:
-        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
-        for the content in it.
+        A batch of data. See `SpeechSynthesisDataset()` for the content in it.
       is_training:
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
@@ -718,7 +721,8 @@ def compute_loss(
     (
         audio_tokens,
         audio_tokens_lens,
-        prompt_spk_emb,
+        prompt_audio_tokens,
+        prompt_audio_tokens_lens,
         text_tokens,
         text_tokens_lens,
     ) = prepare_input(batch, device)
@@ -726,17 +730,22 @@ def compute_loss(
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    # codebook_index = random.randint(0, params.num_codebooks - 1)
-    codebook_index = 0
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=False):
+            # (batch, prompt_len, num_codebooks) -> (num_codebooks, batch, prompt_len)
+            prompt_audio_tokens = prompt_audio_tokens.permute(2, 0, 1)
+            prompt_codebook_emb = quantizer.decode(prompt_audio_tokens)
+            # (batch, embed_dim, prompt_len) -> (batch, prompt_len, embed_dim)
+            prompt_codebook_emb = prompt_codebook_emb.permute(0, 2, 1)
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = model(
             x=text_tokens,
             x_lens=text_tokens_lens,
-            ys=audio_tokens,
+            prompt=prompt_codebook_emb,
+            prompt_lens=prompt_audio_tokens_lens,
+            y=audio_tokens,
             y_lens=audio_tokens_lens,
-            prompt_spk_emb=prompt_spk_emb,
-            codebook_index=codebook_index,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
@@ -766,100 +775,47 @@ def compute_loss(
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
 
-    return loss, info, codebook_index
+    return loss, info
 
 
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    quantizer: nn.Module,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> List[MetricsTracker]:
     """Run the validation process."""
     model.eval()
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
-    tot_losses = [MetricsTracker() for _ in range(params.num_codebooks)]
+    tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        (
-            audio_tokens,
-            audio_tokens_lens,
-            prompt_spk_emb,
-            text_tokens,
-            text_tokens_lens,
-        ) = prepare_input(batch, device)
-
-        # Compute loss scales
-        batch_idx_train = params.batch_idx_train
-        warm_step = params.warm_step
-        s = params.simple_loss_scale
-        # take down the scale on the simple loss from 1.0 at the start
-        # to params.simple_loss scale by warm_step.
-        simple_loss_scale = (
-            s
-            if batch_idx_train >= warm_step
-            else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
+        loss, loss_info = compute_loss(
+            params=params,
+            model=model,
+            quantizer=quantizer,
+            batch=batch,
+            is_training=False,
         )
-        pruned_loss_scale = (
-            1.0
-            if batch_idx_train >= warm_step
-            else 0.1 + 0.9 * (batch_idx_train / warm_step)
-        )
-
-        # for codebook_index in range(params.num_codebooks):
-        for codebook_index in range(1):
-            with torch.set_grad_enabled(False):
-                simple_loss, pruned_loss = model(
-                    x=text_tokens,
-                    x_lens=text_tokens_lens,
-                    ys=audio_tokens,
-                    y_lens=audio_tokens_lens,
-                    prompt_spk_emb=prompt_spk_emb,
-                    codebook_index=codebook_index,
-                    prune_range=params.prune_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
-                    # cache_encoder_out=(codebook_index == 0),
-                )
-                if codebook_index == params.num_codebooks - 1:
-                    # Clear encoder output cache at last codebook
-                    model.cached = None
-
-                loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
-
-            assert loss.requires_grad is False
-
-            info = MetricsTracker()
-            info["frames"] = audio_tokens_lens.sum().item()
-            # Note: We use reduction=sum while computing the loss.
-            info["loss"] = loss.detach().cpu().item()
-            info["simple_loss"] = simple_loss.detach().cpu().item()
-            info["pruned_loss"] = pruned_loss.detach().cpu().item()
-
-            tot_losses[codebook_index] = tot_losses[codebook_index] + info
+        assert loss.requires_grad is False
+        tot_loss = tot_loss + loss_info
 
     if world_size > 1:
-        for i in range(params.num_codebooks):
-            tot_losses[i].reduce(loss.device)
+        tot_loss.reduce(loss.device)
 
-    loss_sum = 0.0
-    # for i in range(params.num_codebooks):
-    for i in range(1):
-        loss_value = tot_losses[i]["loss"] / tot_losses[i]["frames"]
-        loss_sum += loss_value
-
-    loss_value = loss_sum / params.num_codebooks
+    loss_value = tot_loss["loss"] / tot_loss["frames"]
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
-    return tot_losses
+    return tot_loss
 
 
 def train_one_epoch(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    quantizer: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
     train_dl: torch.utils.data.DataLoader,
@@ -881,6 +837,8 @@ def train_one_epoch(
         It is returned by :func:`get_params`.
       model:
         The model for training.
+      quantizer:
+        The encodec quantizer model.
       optimizer:
         The optimizer we are using.
       scheduler:
@@ -903,7 +861,7 @@ def train_one_epoch(
     """
     model.train()
 
-    tot_losses = [MetricsTracker() for _ in range(params.num_codebooks)]
+    tot_loss = MetricsTracker()
 
     saved_bad_model = False
 
@@ -929,16 +887,15 @@ def train_one_epoch(
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, loss_info, codebook_index = compute_loss(
+                loss, loss_info = compute_loss(
                     params=params,
                     model=model,
+                    quantizer=quantizer,
                     batch=batch,
                     is_training=True,
                 )
             # summary stats
-            tot_losses[codebook_index] = (
-                tot_losses[codebook_index] * (1 - 1 / params.reset_interval)
-            ) + loss_info
+            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
@@ -1014,9 +971,9 @@ def train_one_epoch(
 
             logging.info(
                 f"Epoch {params.cur_epoch}, "
-                f"batch {batch_idx}, codebook_index {codebook_index}, "
-                f"loss[{loss_info}], tot_loss[{tot_losses[codebook_index]}], "
-                f"batch size: {batch_size}, lr: {cur_lr:.2e}, "
+                f"batch {batch_idx}, loss[{loss_info}], "
+                f"tot_loss[{tot_loss}], batch size: {batch_size}, "
+                f"lr: {cur_lr:.2e}, "
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
 
@@ -1026,11 +983,9 @@ def train_one_epoch(
                 )
 
                 loss_info.write_summary(
-                    tb_writer, f"train/current_{codebook_index}_", params.batch_idx_train
+                    tb_writer, "train/current_", params.batch_idx_train
                 )
-                tot_losses[codebook_index].write_summary(
-                    tb_writer, f"train/tot_{codebook_index}_", params.batch_idx_train
-                )
+                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
                 if params.use_fp16:
                     tb_writer.add_scalar(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
@@ -1041,32 +996,22 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
+                quantizer=quantizer,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
             model.train()
-            s = ""
-            for i in range(params.num_codebooks):
-                s += f"codebook_index {i}, loss[{valid_info[i]}], "
-            logging.info(
-                f"Epoch {params.cur_epoch}, " + s
-                # f"validation: [{valid_info[i] for i in range(params.num_codebooks)}]"
-            )
+            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
             )
             if tb_writer is not None:
-                for i in range(params.num_codebooks):
-                    valid_info[i].write_summary(
-                        tb_writer, f"train/valid_{i}", params.batch_idx_train
-                    )
+                valid_info.write_summary(
+                    tb_writer, "train/valid_", params.batch_idx_train
+                )
 
-    loss_sum = 0.0
-    for i in range(params.num_codebooks):
-        loss_value = tot_losses[i]["loss"] / tot_losses[i]["frames"]
-        loss_sum += loss_value
-
-    params.train_loss = loss_sum / params.num_codebooks
+    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
@@ -1104,6 +1049,20 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
+    logging.info("About to load the pre-trained encodec model")
+    encodec_model, encodec_model_args = GANSpeechCodecTask.build_model_from_file(
+        config_file=params.encodec_model_dir / "config.yaml",
+        model_file=params.encodec_model_dir / "model.pth",
+        device="cpu",
+    )
+    assert encodec_model_args.sampling_rate == params.sampling_rate
+    quantizer = copy.deepcopy(encodec_model.quantizer)
+    quantizer.to(device)
+    quantizer.eval()
+
+    params.audio_vocab_size = encodec_model_args.quantizer_conf["codebook_size"]
+    params.prompt_dim = encodec_model_args.model_conf["odim"]
+
     logging.info(params)
 
     logging.info("About to create model")
@@ -1134,7 +1093,8 @@ def run(rank, world_size, args):
         clipping_scale=2.0,
     )
 
-    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs,
+                     warmup_batches=2000, warmup_start=0.0)
 
     if checkpoints and "optimizer" in checkpoints:
         logging.info("Loading optimizer state dict")
@@ -1171,7 +1131,6 @@ def run(rank, world_size, args):
             #     f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
             # )
             return False
-
         return True
 
     libriheavy = LibriHeavyTtsDataModule(params)
@@ -1201,6 +1160,7 @@ def run(rank, world_size, args):
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
+            quantizer=quantizer,
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
@@ -1224,6 +1184,7 @@ def run(rank, world_size, args):
         train_one_epoch(
             params=params,
             model=model,
+            quantizer=quantizer,
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -1284,6 +1245,7 @@ def display_and_save_batch(
 
 def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
+    quantizer: nn.Module,
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
@@ -1298,9 +1260,10 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, _, _ = compute_loss(
+                loss, _ = compute_loss(
                     params=params,
                     model=model,
+                    quantizer=quantizer,
                     batch=batch,
                     is_training=True,
                 )

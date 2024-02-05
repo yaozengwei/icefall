@@ -30,7 +30,7 @@ class Transformer(nn.Module):
     """
     Args:
         vocab_size: Number of tokens as modeling units including blank.
-        blank_id: ID of the blank symbol.
+        sos_id: ID of the SOS symbol.
         embed_dim: total dimension of the model.
         attention_dim: dimension in the attention module.
         num_heads: number of parallel attention heads.
@@ -42,7 +42,7 @@ class Transformer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        blank_id: int,
+        sos_id: int,
         embed_dim: int = 512,
         attention_dim: int = 512,
         num_heads: int = 8,
@@ -52,7 +52,7 @@ class Transformer(nn.Module):
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
-        self.blank_id = blank_id
+        self.sos_id = sos_id
 
         self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
 

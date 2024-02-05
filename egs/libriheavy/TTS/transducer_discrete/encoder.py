@@ -16,7 +16,9 @@
 # limitations under the License.
 
 import copy
+import logging
 import math
+import random
 from typing import Optional, Tuple
 
 import torch
@@ -32,13 +34,13 @@ class Conformer(nn.Module):
         vocab_size: Number of tokens as modeling units including blank token.
         blank_id: ID of the blank symbol.
         embed_dim: total dimension of the model.
-        attention_dim: dimension in the attention module.
+        attention_dim: dimension in the attention modules.
         num_heads: number of parallel attention heads.
-        feedforward_dim: hidden dimention in the feedforward module
-        cnn_module_kernel: convolution kernel size
-        num_layers: number of encoder layers
+        feedforward_dim: hidden dimention in the feedforward modules.
+        cnn_module_kernel: convolution kernel size.
+        num_layers: number of encoder layers.
         memory_dim: dimension of memory embedding, optional.
-        dropout: dropout rate
+        dropout: dropout rate.
     """
 
     def __init__(
@@ -103,11 +105,8 @@ class Conformer(nn.Module):
 
         padding_mask = make_pad_mask(x_lens)  # (batch, tgt_len)
         if memory is not None:
-            memory_padding_mask = make_pad_mask(memory_lens)
-            memory_attn_mask = torch.logical_or(
-                padding_mask.unsqueeze(2),  # (batch, tgt_len, 1)
-                memory_padding_mask.unsqueeze(1),  # (batch, 1, src_len)
-            )  # (batch, tgt_len, src_len)
+            memory_padding_mask = make_pad_mask(memory_lens)  # (batch, src_len)
+            memory_attn_mask = memory_padding_mask.unsqueeze(1)  # (batch, 1, src_len)
             memory = memory.permute(1, 0, 2)  # (src_len, batch, memory_dim)
         else:
             memory_attn_mask = None
@@ -372,6 +371,27 @@ class RelPositionalEncoding(torch.nn.Module):
         return self.dropout(pos_emb)
 
 
+def print_attn_entropy(module_name: str, attn_weights: Tensor, num_heads: int):
+    # attn_weights: (batch*num_heads, tgt_len, src_len)
+    batch = attn_weights.shape[0] // num_heads
+    _, tgt_len, src_len = attn_weights.shape
+    attn_weights = attn_weights.clone().detach()
+    attn_weights = attn_weights.view(batch, num_heads, tgt_len, src_len)
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=False):
+            attn_weights = attn_weights.to(torch.float32)
+            attn_weights_entropy = (
+                -((attn_weights + 1.0e-20).log() * attn_weights)
+                .sum(dim=-1)
+                .mean(dim=(0, 2))
+            )
+            logging.info(
+                f"name={module_name}, attn_weights_entropy = {attn_weights_entropy}, "
+                f"upper_entropy={math.log(src_len)}"
+            )
+
+
 class RelPositionMultiHeadAttention(nn.Module):
     """Multi-Head Attention layer with relative position encoding
 
@@ -397,6 +417,7 @@ class RelPositionMultiHeadAttention(nn.Module):
             self.head_dim, num_heads, attention_dim
         )
         self.dropout = dropout
+        self.name = None  # will be overwritten in training code; for diagnostics.
 
         self.in_proj = nn.Linear(embed_dim, 3 * attention_dim, bias=True)
         self.out_proj = nn.Linear(attention_dim, embed_dim, bias=True)
@@ -516,8 +537,11 @@ class RelPositionMultiHeadAttention(nn.Module):
             )
 
         attn_weights = attn_weights.view(batch * num_heads, seq_len, seq_len)
-
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if random.random() < 0.001 and not self.training:
+            print_attn_entropy(self.name, attn_weights, num_heads)
+
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )
@@ -563,6 +587,7 @@ class MultiHeadAttention(nn.Module):
             self.head_dim, num_heads, attention_dim
         )
         self.dropout = dropout
+        self.name = None  # will be overwritten in training code; for diagnostics.
 
         self.linear_q = nn.Linear(embed_dim, attention_dim, bias=True)
         self.linear_k = nn.Linear(
@@ -579,6 +604,7 @@ class MultiHeadAttention(nn.Module):
         query: Tensor,
         key: Tensor,
         value: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute dot product attention.
@@ -587,6 +613,8 @@ class MultiHeadAttention(nn.Module):
             query: Query tensor of shape (tgt_len, batch, embed_dim).
             key: Key tensor of shape (src_len, batch, embed_dim or memory_dim).
             value: Value tensor of shape (src_len, batch, embed_dim or memory_dim).
+            key_padding_mask: A binary mask indicating which elements are padding.
+                Its shape is (batch, src_len).
             attn_mask: A binary mask indicating which elements will be filled with -inf.
                 Its shape is (batch, 1, src_len) or (batch, tgt_len, src_len).
 
@@ -623,6 +651,12 @@ class MultiHeadAttention(nn.Module):
         # some mechanisms like that become ineffective.
         attn_weights = penalize_abs_values_gt(attn_weights, limit=50.0, penalty=1.0e-04)
 
+        if key_padding_mask is not None:
+            assert key_padding_mask.shape == (batch, src_len), key_padding_mask.shape
+            attn_weights = attn_weights.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"),
+            )
+
         if attn_mask is not None:
             assert (
                 attn_mask.shape == (batch, 1, src_len)
@@ -631,8 +665,11 @@ class MultiHeadAttention(nn.Module):
             attn_weights = attn_weights.masked_fill(attn_mask.unsqueeze(1), float("-inf"))
 
         attn_weights = attn_weights.view(batch * num_heads, tgt_len, src_len)
-
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if random.random() < 0.001 and not self.training:
+            print_attn_entropy(self.name, attn_weights, num_heads)
+
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )
