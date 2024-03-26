@@ -796,7 +796,7 @@ def compute_loss(
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
-    loss_lambda = params.loss_lambda
+    loss_lambda = params.loss_lambda if batch_idx_train >= warm_step else 1.0
 
     texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
@@ -808,7 +808,7 @@ def compute_loss(
         )
 
         # TODO: test warmup on loss_cosub
-        loss = loss_lambda * ctc_loss_label + (1 - loss_lambda) * ctc_loss_cosub
+        loss = loss_lambda * ctc_loss_label + (1.0 - loss_lambda) * ctc_loss_cosub
 
     assert loss.requires_grad == is_training
 
