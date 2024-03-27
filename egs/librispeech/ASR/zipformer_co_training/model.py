@@ -81,6 +81,7 @@ class AsrModel(nn.Module):
 
         self.encoder_embed = encoder_embed
         self.encoder = encoder
+        self.vocab_size = vocab_size
 
         self.use_transducer = use_transducer
         if use_transducer:
@@ -357,7 +358,7 @@ class AsrModel(nn.Module):
 
         return simple_loss, pruned_loss, ctc_loss
 
-    def forward(
+    def forward2(
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
@@ -429,6 +430,91 @@ class AsrModel(nn.Module):
         ctc_loss_cosub = ctc_loss[batch_size * 2:].sum() / 2.0
 
         return ctc_loss_label, ctc_loss_cosub
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: List[List[str]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          prune_range:
+            The prune range for rnnt loss, it means how many symbols(context)
+            we are considering for each frame to compute the loss.
+          am_scale:
+            The scale to smooth the loss with am (output of encoder network)
+            part
+          lm_scale:
+            The scale to smooth the loss with lm (output of predictor network)
+            part
+        Returns:
+          Return the transducer losses and CTC loss,
+          in form of (simple_loss, pruned_loss, ctc_loss)
+
+        Note:
+           Regarding am_scale & lm_scale, it will make the loss-function one of
+           the form:
+              lm_scale * lm_probs + am_scale * am_probs +
+              (1-lm_scale-am_scale) * combined_probs
+        """
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert x.size(0) == x_lens.size(0) == len(y), (x.shape, x_lens.shape, len(y))
+        batch_size = x.size(0)
+
+        # Compute encoder outputs on the duplicated batch
+        encoder_out, encoder_out_lens = self.forward_encoder(
+            x.repeat(2, 1, 1), x_lens.repeat(2)
+        )  # (N * 2, T, C), (N * 2)
+
+        # Compute CTC log-prob
+        ctc_output = self.ctc_output(encoder_out)  # (N * 2, T, C)
+
+        # Get frame-level labels
+        cosub_labels = ctc_output.argmax(dim=2)  # (N * 2, T)
+        # Exchange the labels
+        cosub_labels = torch.cat(
+            [cosub_labels[batch_size:], cosub_labels[:batch_size]], dim=0
+        )
+        # Compute cosub loss
+        ignore_id = -100
+        length_mask = make_pad_mask(encoder_out_lens)
+        cosub_labels.masked_fill_(length_mask, ignore_id)
+        cosub_ce_loss = nn.functional.nll_loss(
+            input=ctc_output.view(-1, self.vocab_size),
+            target=cosub_labels.view(-1),
+            ignore_index=ignore_id,
+            reduction="sum",
+        )
+
+        # Compute CTC loss
+        targets = []
+        target_lengths = []
+        for utt in (y + y):
+            targets += utt
+            target_lengths.append(len(utt))
+
+        ctc_loss = torch.nn.functional.ctc_loss(
+            log_probs=ctc_output.permute(1, 0, 2),  # (T, N * 2, C)
+            targets=torch.tensor(targets),
+            input_lengths=encoder_out_lens.cpu(),
+            target_lengths=torch.tensor(target_lengths),
+            reduction="sum",
+        )
+
+        return ctc_loss / 2.0, cosub_ce_loss / 2.0
+
+
+
 
 
 def ctc_greedy_search(

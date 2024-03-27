@@ -760,7 +760,7 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def compute_loss(
+def compute_loss2(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
@@ -821,6 +821,71 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["loss_label"] = ctc_loss_label.detach().cpu().item()
     info["loss_cosub"] = ctc_loss_cosub.detach().cpu().item()
+
+    return loss, info
+
+
+def compute_loss(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+    is_training: bool,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute loss given the model and its inputs.
+
+    Args:
+      params:
+        Parameters for training. See :func:`get_params`.
+      model:
+        The model for training. It is an instance of Zipformer in our case.
+      batch:
+        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
+        for the content in it.
+      is_training:
+        True for training. False for validation. When it is True, this
+        function enables autograd during computation; when it is False, it
+        disables autograd.
+     warmup: a floating point value which increases throughout training;
+        values >= 1.0 are fully warmed up and have all modules present.
+    """
+    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    feature = batch["inputs"]
+    # at entry, feature is (N, T, C)
+    assert feature.ndim == 3
+    feature = feature.to(device)
+
+    supervisions = batch["supervisions"]
+    feature_lens = supervisions["num_frames"].to(device)
+
+    batch_idx_train = params.batch_idx_train
+    warm_step = params.warm_step
+    loss_lambda = params.loss_lambda if batch_idx_train >= warm_step else 1.0
+
+    texts = batch["supervisions"]["text"]
+    y = sp.encode(texts, out_type=int)
+    # y = k2.RaggedTensor(y)
+
+    with torch.set_grad_enabled(is_training):
+        ctc_loss, cosub_ce_loss = model(
+            x=feature, x_lens=feature_lens, y=y
+        )
+
+        # TODO: test warmup on loss_cosub
+        loss = loss_lambda * ctc_loss + (1.0 - loss_lambda) * cosub_ce_loss
+
+    assert loss.requires_grad == is_training
+
+    info = MetricsTracker()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+
+    # Note: We use reduction=sum while computing the loss.
+    info["loss"] = loss.detach().cpu().item()
+    info["ctc_loss"] = ctc_loss.detach().cpu().item()
+    info["cosub_ce_loss"] = cosub_ce_loss.detach().cpu().item()
 
     return loss, info
 
