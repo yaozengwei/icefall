@@ -16,10 +16,11 @@
 # limitations under the License.
 
 # The model structure is modified from Daniel Povey's Zipformer
-# https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/pruned_transducer_stateless7/zipformer.py
+# https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/zipformer.py
 
+import copy
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import k2
 import torch
@@ -27,7 +28,7 @@ import torch.nn as nn
 
 from label_smoothing import LabelSmoothingLoss
 from icefall.utils import add_eos, add_sos, make_pad_mask
-from scaling import penalize_abs_values_gt
+from scaling import BiasNorm, FloatLike, ScheduledFloat, SwooshL, penalize_abs_values_gt
 
 
 class AttentionDecoderModel(nn.Module):
@@ -53,7 +54,7 @@ class AttentionDecoderModel(nn.Module):
         memory_dim: int = 512,
         sos_id: int = 1,
         eos_id: int = 1,
-        dropout: float = 0.1,
+        dropout: FloatLike = 0.1,
         ignore_id: int = -1,
         label_smoothing: float = 0.1,
     ):
@@ -182,7 +183,7 @@ class TransformerDecoder(nn.Module):
         num_heads: int = 8,
         feedforward_dim: int = 2048,
         memory_dim: int = 512,
-        dropout: float = 0.1,
+        dropout: FloatLike = 0.1,
     ):
         super().__init__()
         self.embed = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
@@ -281,30 +282,57 @@ class DecoderLayer(nn.Module):
         num_heads: int = 8,
         feedforward_dim: int = 2048,
         memory_dim: int = 512,
-        dropout: float = 0.1,
+        dropout: FloatLike = 0.1,
+        layer_dropout: FloatLike = ScheduledFloat(
+            (0.0, 0.1), (4000.0, 0.05), default=0
+        ),
     ):
         """Construct an DecoderLayer object."""
         super(DecoderLayer, self).__init__()
 
-        self.norm_self_attn = nn.LayerNorm(d_model)
         self.self_attn = MultiHeadAttention(
             d_model, attention_dim, num_heads, dropout=0.0
         )
 
-        self.norm_src_attn = nn.LayerNorm(d_model)
         self.src_attn = MultiHeadAttention(
             d_model, attention_dim, num_heads, memory_dim=memory_dim, dropout=0.0
         )
 
-        self.norm_ff = nn.LayerNorm(d_model)
         self.feed_forward = nn.Sequential(
             nn.Linear(d_model, feedforward_dim),
-            Swish(),
+            SwooshL(),
             nn.Dropout(dropout),
             nn.Linear(feedforward_dim, d_model),
         )
 
-        self.dropout = nn.Dropout(dropout)
+        self.norm = BiasNorm(d_model)
+
+        self.layer_dropout = copy.deepcopy(layer_dropout)
+
+    def get_sequence_dropout_mask(
+        self, x: torch.Tensor, dropout_rate: float
+    ) -> Optional[torch.Tensor]:
+        if (
+            dropout_rate == 0.0
+            or not self.training
+            or torch.jit.is_scripting()
+            or torch.jit.is_tracing()
+        ):
+            return None
+        batch_size = x.shape[1]
+        mask = (torch.rand(batch_size, 1, device=x.device) > dropout_rate).to(x.dtype)
+        return mask
+
+    def sequence_dropout(self, x: torch.Tensor, dropout_rate: float) -> torch.Tensor:
+        """
+        Apply sequence-level dropout to x.
+        x shape: (seq_len, batch_size, embed_dim)
+        """
+        dropout_mask = self.get_sequence_dropout_mask(x, dropout_rate)
+        if dropout_mask is None:
+            return x
+        else:
+            return x * dropout_mask
 
     def forward(
         self,
@@ -325,21 +353,22 @@ class DecoderLayer(nn.Module):
                 Its shape is (batch, 1, src_len) or (batch, tgt_len, src_len).
         """
         # self-attn module
-        qkv = self.norm_self_attn(x)
         self_attn_out = self.self_attn(
-            query=qkv, key=qkv, value=qkv, attn_mask=attn_mask
+            query=x, key=x, value=x, attn_mask=attn_mask
         )
-        x = x + self.dropout(self_attn_out)
+        x = x + self.sequence_dropout(self_attn_out, float(self.layer_dropout))
 
         # cross-attn module
-        q = self.norm_src_attn(x)
         src_attn_out = self.src_attn(
-            query=q, key=memory, value=memory, attn_mask=memory_attn_mask
+            query=x, key=memory, value=memory, attn_mask=memory_attn_mask
         )
-        x = x + self.dropout(src_attn_out)
+        x = x + self.sequence_dropout(src_attn_out, float(self.layer_dropout))
 
         # feed-forward module
-        x = x + self.dropout(self.feed_forward(self.norm_ff(x)))
+        ff_out = self.feed_forward(x)
+        x = x + self.sequence_dropout(ff_out, float(self.layer_dropout))
+
+        x = self.norm(x)
 
         return x
 
@@ -479,16 +508,15 @@ class PositionalEncoding(nn.Module):
         max_len (int): Maximum input length.
     """
 
-    def __init__(self, d_model, dropout_rate, max_len=5000):
+    def __init__(self, d_model: int, dropout_rate: float = 0.1, max_len: int = 5000):
         """Construct an PositionalEncoding object."""
         super(PositionalEncoding, self).__init__()
         self.d_model = d_model
-        self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.pe = None
         self.extend_pe(torch.tensor(0.0).expand(1, max_len))
 
-    def extend_pe(self, x):
+    def extend_pe(self, x: torch.Tensor):
         """Reset the positional encodings."""
         if self.pe is not None:
             if self.pe.size(1) >= x.size(1):
@@ -506,7 +534,7 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Add positional encoding.
 
         Args:
@@ -516,18 +544,11 @@ class PositionalEncoding(nn.Module):
             torch.Tensor: Encoded tensor (batch, time, `*`).
         """
         self.extend_pe(x)
-        x = x * self.xscale + self.pe[:, : x.size(1)]
+        x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
 
-class Swish(torch.nn.Module):
-    """Construct an Swish object."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return Swich activation function."""
-        return x * torch.sigmoid(x)
-
-
+# from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/mask.py#L9
 def subsequent_mask(size, device="cpu", dtype=torch.bool):
     """Create mask for subsequent steps (size, size).
 
