@@ -28,7 +28,7 @@ import torch.nn as nn
 
 from label_smoothing import LabelSmoothingLoss
 from icefall.utils import add_eos, add_sos, make_pad_mask
-from scaling import BiasNorm, FloatLike, ScheduledFloat, SwooshL, penalize_abs_values_gt
+from scaling import ActivationDropoutAndLinear, BiasNorm, FloatLike, ScheduledFloat, SwooshL, penalize_abs_values_gt
 
 
 class AttentionDecoderModel(nn.Module):
@@ -304,10 +304,29 @@ class DecoderLayer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(feedforward_dim, d_model),
         )
+        # self.feed_forward = nn.Sequential(
+        #     nn.Linear(d_model, feedforward_dim),
+        #     ActivationDropoutAndLinear(
+        #         feedforward_dim,
+        #         d_model,
+        #         activation="SwooshL",
+        #         dropout_p=dropout,
+        #         dropout_shared_dim=0,
+        #         bias=True,
+        #     )
+        # )
 
         self.norm = BiasNorm(d_model)
+        self.norm_self_attn = BiasNorm(d_model)
+        self.norm_src_attn = BiasNorm(d_model)
+        self.norm_ff = BiasNorm(d_model)
+        # self.norm = nn.LayerNorm(d_model)
+        # self.norm_self_attn = nn.LayerNorm(d_model)
+        # self.norm_src_attn = nn.LayerNorm(d_model)
+        # self.norm_ff = nn.LayerNorm(d_model)
 
         self.layer_dropout = copy.deepcopy(layer_dropout)
+        # self.dropout = nn.Dropout(dropout)
 
     def get_sequence_dropout_mask(
         self, x: torch.Tensor, dropout_rate: float
@@ -353,20 +372,29 @@ class DecoderLayer(nn.Module):
                 Its shape is (batch, 1, src_len) or (batch, tgt_len, src_len).
         """
         # self-attn module
+        x_norm = self.norm_self_attn(x)
+        # x_norm = x
         self_attn_out = self.self_attn(
-            query=x, key=x, value=x, attn_mask=attn_mask
+            query=x_norm, key=x_norm, value=x_norm, attn_mask=attn_mask
         )
         x = x + self.sequence_dropout(self_attn_out, float(self.layer_dropout))
+        # x = x + self.dropout(self_attn_out)
 
         # cross-attn module
+        x_norm = self.norm_src_attn(x)
+        # x_norm = x
         src_attn_out = self.src_attn(
-            query=x, key=memory, value=memory, attn_mask=memory_attn_mask
+            query=x_norm, key=memory, value=memory, attn_mask=memory_attn_mask
         )
         x = x + self.sequence_dropout(src_attn_out, float(self.layer_dropout))
+        # x = x + self.dropout(src_attn_out)
 
         # feed-forward module
-        ff_out = self.feed_forward(x)
+        x_norm = self.norm_ff(x)
+        # x_norm = x
+        ff_out = self.feed_forward(x_norm)
         x = x + self.sequence_dropout(ff_out, float(self.layer_dropout))
+        # x = x + self.dropout(ff_out)
 
         x = self.norm(x)
 

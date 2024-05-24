@@ -917,7 +917,7 @@ def compute_loss(
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.use_attention_decoder:
-        info["attn_deocder_loss"] = attention_decoder_loss.detach().cpu().item()
+        info["attn_decoder_loss"] = attention_decoder_loss.detach().cpu().item()
 
     return loss, info
 
