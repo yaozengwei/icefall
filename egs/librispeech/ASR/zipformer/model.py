@@ -230,10 +230,16 @@ class AsrModel(nn.Module):
             assert time_mask.shape[:-1] == ctc_output.shape[:-1], (
                 time_mask.shape, ctc_output.shape
             )
-            masked_scale = time_mask * (cr_loss_masked_scale - 1) + 1
-            # e.g., if cr_loss_masked_scale = 3, scales at masked positions are 3,
-            # scales at unmasked positions are 1
-            cr_loss = cr_loss * masked_scale  # scaling up masked positions
+            # Scale up self-masked positions
+            # masked_scale = time_mask * (cr_loss_masked_scale - 1) + 1
+            # # e.g., if cr_loss_masked_scale = 3, scales at masked positions are 3,
+            # # scales at unmasked positions are 1
+            # cr_loss = cr_loss * masked_scale  # scaling up masked positions
+
+            # Exclude target-masked positions
+            time_mask = time_mask.chunk(2, dim=0)
+            time_mask = torch.cat([time_mask[1], time_mask[0]], dim=0)
+            cr_loss = cr_loss.masked_fill(time_mask.bool(), 0.0)
         length_mask = make_pad_mask(encoder_out_lens).unsqueeze(-1)
         cr_loss = cr_loss.masked_fill(length_mask, 0.0).sum()
 
