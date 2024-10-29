@@ -90,6 +90,7 @@ from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.checkpoint import (
     save_checkpoint_with_global_batch_idx,
     update_averaged_model,
+    update_ema_model,
 )
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
@@ -549,6 +550,34 @@ def get_parser():
         help="Whether to use bf16 in AMP.",
     )
 
+    parser.add_argument(
+        "--use-ema",
+        type=str2bool,
+        default=False,
+        help="Whether to EMA model.",
+    )
+
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate.",
+    )
+
+    parser.add_argument(
+        "--ema-update-period",
+        type=int,
+        default=2,
+        help="Update EMA model at every this number of batches.",
+    )
+
+    parser.add_argument(
+        "--ema-loss-scale",
+        type=float,
+        default=0.5,
+        help="Scale for EMA loss.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -759,7 +788,8 @@ def get_spec_augment(params: AttributeDict) -> SpecAugment:
 def load_checkpoint_if_available(
     params: AttributeDict,
     model: nn.Module,
-    model_avg: nn.Module = None,
+    model_ema: Optional[nn.Module] = None,
+    model_avg: Optional[nn.Module] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -800,6 +830,7 @@ def load_checkpoint_if_available(
     saved_params = load_checkpoint(
         filename,
         model=model,
+        model_ema=model_ema,
         model_avg=model_avg,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -826,6 +857,7 @@ def save_checkpoint(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     model_avg: Optional[nn.Module] = None,
+    model_ema: Optional[nn.Module] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
     sampler: Optional[CutSampler] = None,
@@ -855,6 +887,7 @@ def save_checkpoint(
         filename=filename,
         model=model,
         model_avg=model_avg,
+        model_ema=model_ema,
         params=params,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -878,6 +911,7 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
+    model_ema: Optional[nn.Module] = None,
     spec_augment: Optional[SpecAugment] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
@@ -915,7 +949,8 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     use_cr_ctc = params.use_cr_ctc
-    use_spec_aug = use_cr_ctc and is_training
+    use_ema = params.use_ema
+    use_spec_aug = (use_cr_ctc or use_ema) and is_training
     if use_spec_aug:
         supervision_intervals = batch["supervisions"]
         supervision_segments = torch.stack(
@@ -930,7 +965,7 @@ def compute_loss(
         supervision_segments = None
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss = model(
+        simple_loss, pruned_loss, ctc_loss, attention_decoder_loss, cr_loss, ema_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -938,6 +973,8 @@ def compute_loss(
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             use_cr_ctc=use_cr_ctc,
+            use_ema=use_ema,
+            model_ema=model_ema,
             use_spec_aug=use_spec_aug,
             spec_augment=spec_augment,
             supervision_segments=supervision_segments,
@@ -966,6 +1003,8 @@ def compute_loss(
             loss += params.ctc_loss_scale * ctc_loss
             if use_cr_ctc:
                 loss += params.cr_loss_scale * cr_loss
+            elif use_ema:
+                loss += params.ema_loss_scale * ema_loss
 
         if params.use_attention_decoder:
             loss += params.attention_decoder_loss_scale * attention_decoder_loss
@@ -984,8 +1023,10 @@ def compute_loss(
         info["pruned_loss"] = pruned_loss.detach().cpu().item()
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
-        if params.use_cr_ctc:
+        if use_cr_ctc:
             info["cr_loss"] = cr_loss.detach().cpu().item()
+        elif use_ema:
+            info["ema_loss"] = ema_loss.detach().cpu().item()
     if params.use_attention_decoder:
         info["attn_decoder_loss"] = attention_decoder_loss.detach().cpu().item()
 
@@ -997,6 +1038,7 @@ def compute_validation_loss(
     model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
+    model_ema: Optional[nn.Module] = None,
     world_size: int = 1,
 ) -> MetricsTracker:
     """Run the validation process."""
@@ -1011,6 +1053,7 @@ def compute_validation_loss(
             sp=sp,
             batch=batch,
             is_training=False,
+            model_ema=model_ema,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -1037,6 +1080,7 @@ def train_one_epoch(
     scaler: GradScaler,
     spec_augment: Optional[SpecAugment] = None,
     model_avg: Optional[nn.Module] = None,
+    model_ema: Optional[nn.Module] = None,
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
@@ -1085,6 +1129,7 @@ def train_one_epoch(
             filename=params.exp_dir / f"bad-model{suffix}-{rank}.pt",
             model=model,
             model_avg=model_avg,
+            model_ema=model_ema,
             params=params,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -1107,6 +1152,7 @@ def train_one_epoch(
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
+                    model_ema=model_ema,
                     sp=sp,
                     batch=batch,
                     is_training=True,
@@ -1133,6 +1179,13 @@ def train_one_epoch(
             return
 
         if (
+            params.batch_idx_train > 0
+            and params.batch_idx_train % params.ema_update_period == 0
+        ):
+            ema_decay = min(params.ema_decay, 1 - 10 / max(20, params.batch_idx_train))
+            update_ema_model(ema_decay=ema_decay, model_cur=model, model_ema=model_ema)
+
+        if (
             rank == 0
             and params.batch_idx_train > 0
             and params.batch_idx_train % params.average_period == 0
@@ -1152,6 +1205,7 @@ def train_one_epoch(
                 global_batch_idx=params.batch_idx_train,
                 model=model,
                 model_avg=model_avg,
+                model_ema=model_ema,
                 params=params,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -1215,6 +1269,7 @@ def train_one_epoch(
                 model=model,
                 sp=sp,
                 valid_dl=valid_dl,
+                model_ema=model_ema,
                 world_size=world_size,
             )
             model.train()
@@ -1306,7 +1361,7 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    if params.use_cr_ctc:
+    if params.use_cr_ctc or params.use_ema:
         assert params.use_ctc
         assert not params.enable_spec_aug  # we will do spec_augment in model.py
         spec_augment = get_spec_augment(params)
@@ -1319,12 +1374,16 @@ def run(rank, world_size, args):
         # model_avg is only used with rank 0
         model_avg = copy.deepcopy(model).to(torch.float64)
 
+    model_ema = copy.deepcopy(model)
+    model_ema.eval()
+
     assert params.start_epoch > 0, params.start_epoch
     checkpoints = load_checkpoint_if_available(
-        params=params, model=model, model_avg=model_avg
+        params=params, model=model, model_avg=model_avg, model_ema=model_ema
     )
 
     model.to(device)
+    model_ema.to(device)
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
@@ -1431,6 +1490,7 @@ def run(rank, world_size, args):
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
+            model_ema=model_ema,
             train_dl=train_dl,
             optimizer=optimizer,
             sp=sp,
@@ -1457,6 +1517,7 @@ def run(rank, world_size, args):
             params=params,
             model=model,
             model_avg=model_avg,
+            model_ema=model_ema,
             optimizer=optimizer,
             scheduler=scheduler,
             sp=sp,
@@ -1477,6 +1538,7 @@ def run(rank, world_size, args):
             params=params,
             model=model,
             model_avg=model_avg,
+            model_ema=model_ema,
             optimizer=optimizer,
             scheduler=scheduler,
             sampler=train_dl.sampler,
@@ -1529,6 +1591,7 @@ def scan_pessimistic_batches_for_oom(
     optimizer: torch.optim.Optimizer,
     sp: spm.SentencePieceProcessor,
     params: AttributeDict,
+    model_ema: Optional[nn.Module] = None,
     spec_augment: Optional[SpecAugment] = None,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1549,6 +1612,7 @@ def scan_pessimistic_batches_for_oom(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    model_ema=model_ema,
                     spec_augment=spec_augment,
                 )
             loss.backward()

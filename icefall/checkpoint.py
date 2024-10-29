@@ -40,6 +40,7 @@ def save_checkpoint(
     filename: Path,
     model: Union[nn.Module, DDP],
     model_avg: Optional[nn.Module] = None,
+    model_ema: Optional[nn.Module] = None,
     params: Optional[Dict[str, Any]] = None,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
@@ -87,6 +88,8 @@ def save_checkpoint(
 
     if model_avg is not None:
         checkpoint["model_avg"] = model_avg.to(torch.float32).state_dict()
+    if model_ema is not None:
+        checkpoint["model_ema"] = model_ema.to(torch.float32).state_dict()
 
     if params:
         for k, v in params.items():
@@ -100,6 +103,7 @@ def load_checkpoint(
     filename: Path,
     model: nn.Module,
     model_avg: Optional[nn.Module] = None,
+    model_ema: Optional[nn.Module] = None,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
     scaler: Optional[GradScaler] = None,
@@ -131,6 +135,10 @@ def load_checkpoint(
         logging.info("Loading averaged model")
         model_avg.load_state_dict(checkpoint["model_avg"], strict=strict)
         checkpoint.pop("model_avg")
+    if model_ema is not None and "model_ema" in checkpoint:
+        logging.info("Loading EMA model")
+        model_ema.load_state_dict(checkpoint["model_ema"], strict=strict)
+        checkpoint.pop("model_ema")
 
     def load(name, obj):
         s = checkpoint.get(name, None)
@@ -196,6 +204,7 @@ def save_checkpoint_with_global_batch_idx(
     global_batch_idx: int,
     model: Union[nn.Module, DDP],
     model_avg: Optional[nn.Module] = None,
+    model_ema: Optional[nn.Module] = None,
     params: Optional[Dict[str, Any]] = None,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
@@ -241,6 +250,7 @@ def save_checkpoint_with_global_batch_idx(
         filename=filename,
         model=model,
         model_avg=model_avg,
+        model_ema=model_ema,
         params=params,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -449,6 +459,36 @@ def average_checkpoints_with_averaged_model(
     )
 
     return avg
+
+
+def update_ema_model(
+    ema_decay: float,
+    model_cur: Union[nn.Module, DDP],
+    model_ema: nn.Module,
+) -> None:
+    """Update the EMA model:
+    model_ema = model_ema * ema_decay + model_cur * (1 - ema_decay)
+
+    Args:
+      params:
+        User defined parameters, e.g., epoch, loss.
+      model_cur:
+        The current model.
+      model_avg:
+        The averaged model to be updated.
+    """
+    if isinstance(model_cur, DDP):
+        model_cur = model_cur.module
+
+    cur = model_cur.state_dict()
+    ema = model_ema.state_dict()
+
+    average_state_dict(
+        state_dict_1=ema,
+        state_dict_2=cur,
+        weight_1=ema_decay,
+        weight_2=1 - ema_decay,
+    )
 
 
 def average_state_dict(
