@@ -565,13 +565,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--ema-update-period",
-        type=int,
-        default=2,
-        help="Update EMA model at every this number of batches.",
-    )
-
-    parser.add_argument(
         "--ema-loss-scale",
         type=float,
         default=0.5,
@@ -1004,7 +997,10 @@ def compute_loss(
             if use_cr_ctc:
                 loss += params.cr_loss_scale * cr_loss
             elif use_ema:
-                loss += params.ema_loss_scale * ema_loss
+                ema_loss_scale = (
+                    params.ema_loss_scale if batch_idx_train >= warm_step else 0
+                )
+                loss += ema_loss_scale * ema_loss
 
         if params.use_attention_decoder:
             loss += params.attention_decoder_loss_scale * attention_decoder_loss
@@ -1178,10 +1174,7 @@ def train_one_epoch(
         if params.print_diagnostics and batch_idx == 5:
             return
 
-        if (
-            params.batch_idx_train > 0
-            and params.batch_idx_train % params.ema_update_period == 0
-        ):
+        if params.batch_idx_train > 0:
             ema_decay = min(params.ema_decay, 1 - 10 / max(20, params.batch_idx_train))
             update_ema_model(ema_decay=ema_decay, model_cur=model, model_ema=model_ema)
 
