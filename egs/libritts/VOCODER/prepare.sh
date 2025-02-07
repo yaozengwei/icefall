@@ -26,6 +26,9 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
   log "Stage 0: prepare wav list files"
   mkdir -p data/wav_list
   python3 ./local/prepare_wav_list.py --root-dir $root_dir --out-dir data/wav_list
+
+  cat data/wav_list/train-clean-100.txt data/wav_list/train-clean-360.txt \
+    data/wav_list/train-other-500.txt > data/wav_list/train-full-960.txt
 fi
 
 

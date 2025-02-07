@@ -64,7 +64,7 @@ def prepare_wav_list(root_dir: Path, out_dir: Path):
         out_file = out_dir / (part + ".txt")
         with open(out_file, "w") as f:
             for wav_file in part_dir.rglob("*.wav"):
-                f.write(str(wav_file.relative_to(part_dir)) + "\n")
+                f.write(str(wav_file.relative_to(root_dir)) + "\n")
                 cnt += 1
         logging.info(f"Saved {cnt} lines to {out_file}")
 
