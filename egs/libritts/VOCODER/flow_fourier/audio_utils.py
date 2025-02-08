@@ -124,3 +124,61 @@ class ISTFT(nn.Module):
             return_complex=self.return_complex,
         )
         return audio
+
+
+def analytic_transform(x: torch.Tensor) -> torch.Tensor:
+    """Create the analytic version of a given audio signal.
+    Args:
+        x: (batch, time), Real
+
+    Returns:
+        x_analytic: (batch, time), Complex
+    """
+    rfft = torch.fft.rfft(x, dim=-1)
+    rfft_rotated = -1j * rfft  # -90° phase shift
+    x_hilbert = torch.fft.irfft(rfft_rotated, n=x.shape[-1], dim=-1)
+    x_analytic = torch.complex(x, x_hilbert)
+    return x_analytic
+
+
+def remove_negative_frequency(x: torch.Tensor) -> torch.Tensor:
+    """Remove any negative-frequency components for a given complex input
+    Args:
+        x: (batch, time), Complex
+
+    Returns:
+        x_analytic: (batch, time), Complex
+    """
+    fft = torch.fft.fft(x, dim=-1)
+    mask = torch.full((1, x.shape[-1]), False, device=x.device)
+    mask[:, x.shape[-1] // 2 + 1:] = True
+    # logging.info(f"Mean-abs of negative-frequency components: {fft.masked_fill(~mask, 0).abs().mean(dim=-1)}")
+    fft = fft.masked_fill(mask, 0)  # set negative-frequency components to zero
+    x_no_neg = torch.fft.ifft(fft, n=x.shape[-1], dim=-1)
+    return x_no_neg
+
+
+def safe_log(x: torch.Tensor, clip_val: float = 1e-7) -> torch.Tensor:
+    """
+    Computes the element-wise logarithm of the input tensor with clipping to avoid near-zero values.
+
+    Args:
+        x (Tensor): Input tensor.
+        clip_val (float, optional): Minimum value to clip the input tensor. Defaults to 1e-7.
+
+    Returns:
+        Tensor: Element-wise logarithm of the input tensor with clipping applied.
+    """
+    return torch.log(torch.clip(x, min=clip_val))
+
+
+def convert_length(x: torch.Tensor, length: int) -> torch.Tensor:
+    # return x with the last dimension either truncated or extended with zeros,
+    # to 'length'.
+    if length <= x.shape[-1]:
+        return x[..., :length]
+    else:
+        shape = list(x.shape)
+        shape[-1] = length - shape[-1]
+        zeros = torch.zeros(shape, dtype=x.dtype, device=x.device)
+        return torch.cat((x, zeros), dim=-1)

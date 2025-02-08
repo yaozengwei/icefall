@@ -20,22 +20,10 @@ from typing import Optional
 
 import math
 import torch
-from audio_utils import STFT, ISTFT
+from audio_utils import STFT, ISTFT, convert_length
 from icefall.utils import make_pad_mask
 from torch import nn
 from torch import Tensor
-
-
-def convert_length(x: Tensor, length: int) -> Tensor:
-    # return x with the last dimension either truncated or extended with zeros,
-    # to 'length'.
-    if length <= x.shape[-1]:
-        return x[..., :length]
-    else:
-        shape = list(x.shape)
-        shape[-1] = length - shape[-1]
-        zeros = torch.zeros(shape, dtype=x.dtype, device=x.device)
-        return torch.cat((x, zeros), dim=-1)
 
 
 def fft_to_real(fft: Tensor):
