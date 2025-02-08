@@ -29,6 +29,9 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
 
   cat data/wav_list/train-clean-100.txt data/wav_list/train-clean-360.txt \
     data/wav_list/train-other-500.txt > data/wav_list/train-full-960.txt
+
+  cat data/wav_list/dev-clean.txt data/wav_list/dev-other.txt \
+    > data/wav_list/validation.txt
 fi
 
 
