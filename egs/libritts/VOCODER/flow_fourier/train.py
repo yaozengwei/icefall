@@ -43,7 +43,7 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, setup_logger, str2bool
-from checkpoint_ema import (
+from checkpoint import (
     load_checkpoint,
     save_checkpoint,
     update_averaged_model,
@@ -650,7 +650,7 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
-        use_aux_loss = (params.batch_idx_train % params.aux_loss_skip == 0)
+        use_aux_loss = (params.batch_idx_train % params.aux_loss_skip == 0) and params.higher_order
 
         audio = batch[0].to(device)
         audio_lens = torch.full((audio.shape[0],), audio.shape[1], dtype=torch.int32, device=device)
@@ -688,6 +688,7 @@ def train_one_epoch(
         if params.print_diagnostics and batch_idx == 5:
             return
 
+        # Update model_avg at every average_period steps
         if (
             rank == 0
             and params.batch_idx_train > 0
@@ -756,10 +757,7 @@ def train_one_epoch(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
                     )
 
-        if (
-            batch_idx % params.valid_interval == 0
-            and not params.print_diagnostics
-        ):
+        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
             valid_info, infer_samples = compute_validation_loss(
                 params=params,
@@ -810,7 +808,7 @@ def compute_validation_loss(
     """Run the validation process."""
     model.eval()
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-
+    use_aux_loss = params.higher_order
     # used to summary the stats over iterations
     tot_loss = MetricsTracker()
     returned_sample = None
@@ -829,7 +827,7 @@ def compute_validation_loss(
                 model=model,
                 model_ema=model_ema,
                 is_training=False,
-                use_aux_loss=True,
+                use_aux_loss=use_aux_loss,
             )
             assert loss.requires_grad is False
             # summary stats
@@ -923,12 +921,7 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    optimizer = ScaledAdam(
-        model.named_parameters(),
-        lr=params.base_lr,
-        clipping_scale=2.0,
-    )
-
+    optimizer = ScaledAdam(model.named_parameters(), lr=params.base_lr, clipping_scale=2.0)
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs, warmup_start=0.1)
 
     if checkpoints is not None:
