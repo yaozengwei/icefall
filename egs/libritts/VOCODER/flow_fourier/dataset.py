@@ -37,6 +37,7 @@ def build_data_loader(
     num_samples: Optional[int] = None,
     world_size: int = 1,
     pin_memory: bool = True,
+    persistent_workers: bool = True,
 ):
     dataset = LibriTTSDataset(
         wav_list_file=wav_list_file,
@@ -60,6 +61,7 @@ def build_data_loader(
         num_workers=num_workers,
         shuffle=shuffle if sampler is None else None,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
     return dataloader
