@@ -164,13 +164,13 @@ class Vocoder(nn.Module):
     def __init__(
         self,
         n_mels: int = 80,
-        sampling_rate: int = 22050,
+        sampling_rate: int = 24000,
         n_ffts: Tuple[int] = (512, 256, 128, 64),
-        hop_lengths: Tuple[int] = (128, 64, 32, 16),
-        mel_n_fft: int = 1024,
+        hop_lengths: Tuple[int] = (256, 128, 64, 32),
+        mel_n_fft: int = 512,
         mel_hop_length: int = 256,
         mel_enc_channels: int = 512,
-        mel_enc_num_layers: int = 512,
+        mel_enc_num_layers: int = 4,
         convnext_num_layers: int = (8, 8, 8, 8),
         convnext_channels: int = (768, 384, 192, 96),
         higher_order: bool = False,
@@ -274,6 +274,8 @@ class Vocoder(nn.Module):
         if not self.training or branch_drop_rate <= 0:
             output = branch_outputs.mean(dim=1)
         else:
+            if random.random() < 0.05:
+                logging.info(f"branch_drop_rate={branch_drop_rate}")
             # At the start of training, apply random branch masking
             mask = torch.rand(branch_outputs.shape[:2], device=x.device) > branch_drop_rate
             mask[mask.sum(dim=1) == 0] = True  # Unmask if all branches are dropped
@@ -437,7 +439,7 @@ class Vocoder(nn.Module):
             consistency_loss = self.compute_loss(
                 pred=x_mid_dup,
                 target=x_mid_dup_accurate,
-                audio_lens=audio_lens,
+                audio_lens=audio_lens[:num_dup],
                 loss_scale=consistency_loss_scale,
                 mel_scaling_loss=mel_scaling_loss,
                 mel_spec=mel_spec[:num_dup]
@@ -478,13 +480,13 @@ class Vocoder(nn.Module):
 
         if self.analytic:
             batch, time = pred.shape
-            pred = pred.view_as_real().permute(2, 0, 1).reshape(2 * batch, time)
-            target = target.view_as_real().permute(2, 0, 1).reshape(2 * batch, time)
+            pred = torch.view_as_real(pred).permute(2, 0, 1).reshape(2 * batch, time)
+            target = torch.view_as_real(target).permute(2, 0, 1).reshape(2 * batch, time)
             audio_lens = audio_lens.repeat(2)
             if isinstance(loss_scale, Tensor):
-                loss_scale = loss_scale.repeat(2)
+                loss_scale = loss_scale.repeat(2, 1)
             if mel_spec is not None:
-                mel_spec = mel_spec.repeat(2)
+                mel_spec = mel_spec.repeat(2, 1, 1)
 
         err = pred - target
 
@@ -504,9 +506,9 @@ class Vocoder(nn.Module):
             # local volume).
             mel_spec_lens = 1 + torch.div(audio_lens, self.mel.hop_length, rounding_mode="floor")
             assert err_mel_spec.shape[2] == mel_spec_lens.max().item()
-            pad_mask = make_pad_mask(mel_spec_lens).logical_not()  # (batch, time)
+            pad_mask = make_pad_mask(mel_spec_lens).logical_not().unsqueeze(1)  # (batch, 1, time)
             loss = err_mel_spec * ((mel_spec + eps) ** -loss_power)
-            loss = (loss * loss_scale * pad_mask).sum() / pad_mask.sum()
+            loss = (loss * loss_scale * pad_mask).sum() / (pad_mask.sum() * err_mel_spec.shape[1])
 
         return loss
 

@@ -160,6 +160,19 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--average-period",
+        type=int,
+        default=200,
+        help="""Update the averaged model, namely `model_avg`, after processing
+        this number of batches. `model_avg` is a separate version of model,
+        in which each floating-point parameter is the average of all the
+        parameters from the start of training. Each time we take the average,
+        we do: `model_avg = model * (average_period / batch_idx_train) +
+            model_avg * ((batch_idx_train - average_period) / batch_idx_train)`.
+        """,
+    )
+
+    parser.add_argument(
         "--use-fp16",
         type=str2bool,
         default=False,
@@ -190,21 +203,21 @@ def get_parser():
     parser.add_argument(
         "--train-num-samples",
         type=int,
-        default=16384,
+        default=32768,
         help="",
     )
 
     parser.add_argument(
         "--valid-num-samples",
         type=int,
-        default=48384,
+        default=32768,
         help="",
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
+        default=64,
         help="",
     )
 
@@ -239,7 +252,7 @@ def get_parser():
     parser.add_argument(
         "--aux-loss-skip",
         type=int,
-        default=2,
+        default=1,
         help="We compute auxiliary losses every [aux_loss_skip] batches.",
     )
 
@@ -447,7 +460,7 @@ def get_params() -> AttributeDict:
             "best_valid_epoch": -1,
             "batch_idx_train": -1,  # 0
             "log_interval": 50,
-            "valid_interval": 200,
+            "valid_interval": 300,
             "env_info": get_env_info(),
             "sampling_rate": 24000,
             "branch_drop_rate": 0.1,
@@ -942,8 +955,6 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    assert params.train_num_samples % params.hop_length == 0
-    assert params.valid_num_samples % params.hop_length == 0
     train_dl = build_data_loader(
         wav_list_file=params.train_wav_list,
         corpus_dir=params.corpus_dir,

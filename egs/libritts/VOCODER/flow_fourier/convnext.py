@@ -230,7 +230,7 @@ class ConvNeXt(nn.Module):
         x = self.in_proj(x)
 
         if dest_t is not None:
-            time_embed = torch.cat([self.time_embed(t), self.time_embed(dest_t)], dim=2)
+            time_embed = torch.cat([self.time_embed(t), self.time_embed(dest_t)], dim=1)
         else:
             time_embed = self.time_embed(t)
         time_embed = self.time_mlp(time_embed)  # (batch, channels)
@@ -290,7 +290,7 @@ class AudioConvNeXt(nn.Module):
 
     def forward(
         self,
-        audios: Tensor,
+        audio: Tensor,
         audio_lens: Tensor,
         t: Tensor,
         mel: Tensor,
@@ -298,7 +298,7 @@ class AudioConvNeXt(nn.Module):
     ) -> Tensor:
         """
         Args:
-            audios: (batch_size, audio_len)
+            audio: (batch_size, audio_len)
             audio_lens: (batch_size,)
             t: (batch_size,)
             mel: (batch, n_mels, mel_frames)
@@ -306,7 +306,7 @@ class AudioConvNeXt(nn.Module):
 
         Returns: (batch_size, audio_len)
         """
-        fft, fft_lens = self.fft(audios, audio_lens)
+        fft, fft_lens = self.fft(audio, audio_lens)
         # fft: (batch, fft_channels, fft_frames); complex.
         fft_real = fft_to_real(fft)
         # fft_real: (batch, 2 * fft_channels, fft_frames)
@@ -323,14 +323,14 @@ class AudioConvNeXt(nn.Module):
         fft_real = fft_real.reshape(batch_size * num_outputs, channels // num_outputs, fft_frames)
 
         fft = real_to_fft(fft_real)
-        audios = self.ifft(fft)
-        audios = audios.reshape(batch_size, num_outputs, audios.shape[-1])
-        audios = convert_length(audios, audio_lens.max())
+        audio = self.ifft(fft)
+        audio = audio.reshape(batch_size, num_outputs, audio.shape[-1])
+        audio = convert_length(audio, audio_lens.max())
 
-        audio_length_mask = make_pad_mask(audio_lens, max_len=audios.shape[-1]).logical_not()
-        audios = audios * audio_length_mask.unsqueeze(1)
+        audio_length_mask = make_pad_mask(audio_lens, max_len=audio.shape[-1]).logical_not()
+        audio = audio * audio_length_mask.unsqueeze(1)
 
-        return audios
+        return audio
 
     def upsample_mel(self, mel: Tensor, fft_frames: int) -> Tensor:
         """Upsample mel coefficients, if necessary, to match the FFT coefficients.
