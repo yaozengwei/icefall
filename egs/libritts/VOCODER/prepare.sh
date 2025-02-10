@@ -32,6 +32,9 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
 
   cat data/wav_list/dev-clean.txt data/wav_list/dev-other.txt \
     > data/wav_list/validation.txt
+
+  cat data/wav_list/test-clean.txt data/wav_list/test-other.txt \
+    > data/wav_list/test.txt
 fi
 
 
