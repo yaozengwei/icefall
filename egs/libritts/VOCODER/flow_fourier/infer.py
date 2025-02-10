@@ -26,7 +26,7 @@ from checkpoint import (
     average_checkpoints_with_averaged_model,
     load_checkpoint,
 )
-from dataset import LibriTTSDataset
+from dataset import build_data_loader
 from icefall.utils import AttributeDict, setup_logger, str2bool
 from scipy.io.wavfile import write
 from train import add_model_arguments, get_model
@@ -100,6 +100,13 @@ def get_parser():
         help="",
     )
 
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="How many subprocesses to use for data loading.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -120,7 +127,7 @@ def get_params() -> AttributeDict:
 def infer_audio(
     params: AttributeDict,
     model: nn.Module,
-    dataset: torch.utils.data.Dataset,
+    dataloader: torch.utils.data.DataLoader,
 ) -> None:
     """Run the inference process."""
     def makedir_if_necessary(filename: str):
@@ -129,26 +136,25 @@ def infer_audio(
             os.makedirs(dirname)
 
     device = next(model.parameters()).device
+    total_samples = len(dataloader.dataset)
     cnt = 0
-    log_interval = 100
-    total_samples = len(dataset)
+    log_interval = 10
     with torch.inference_mode():
-        for audio, filename in dataset:
-            audio = audio.to(device)
-            audio_lens = torch.full((1,), audio.shape[0], dtype=torch.int32, device=device)
-            pred_audio = model.infer(
-                audio=audio.unsqueeze(0),
-                audio_lens=audio_lens,
-                n_timesteps=params.n_timesteps,
+        for batch_idx, (audios, audio_lens, file_names) in enumerate(dataloader):
+            batch_size = audios.shape[0]
+            audios = audios.to(device)  # (batch, time)
+            audio_lens = audio_lens.to(device)  # (batch,)
+            pred_audios = model.infer(
+                audio=audios, audio_lens=audio_lens, n_timesteps=params.n_timesteps
             )
-            pred_audio = pred_audio[0].data.cpu().numpy()
+            for i in range(batch_size):
+                pred = pred_audios[i, :audio_lens[i].item()].data.cpu().numpy()
+                pred_out_file = f"{params.wav_dir_pred}/{file_names[i]}"
+                makedir_if_necessary(pred_out_file)
+                write(pred_out_file, params.sampling_rate, pred)
 
-            pred_out_file = f"{params.wav_dir_pred}/{filename}"
-            makedir_if_necessary(pred_out_file)
-            write(pred_out_file, params.sampling_rate, pred_audio)
-
-            cnt += 1
-            if cnt % log_interval == 0:
+            cnt += batch_size
+            if batch_idx % log_interval == 0:
                 logging.info(f"Processed {cnt} / {total_samples} samples")
 
         logging.info(f"Processed {cnt} samples in total.")
@@ -217,15 +223,18 @@ def main():
     model.to(device)
     model.eval()
 
-    assert params.batch_size == 1, "Currently only support inference with batch_size=1"
-    test_dataset = LibriTTSDataset(
+    # assert params.batch_size == 1, "Currently only support inference with batch_size=1"
+    dataloader = build_data_loader(
         wav_list_file=params.test_wav_list,
         corpus_dir=params.corpus_dir,
         sampling_rate=params.sampling_rate,
+        batch_size=params.batch_size,
+        num_workers=params.num_workers,
         train=False,
+        drop_last=False,
     )
 
-    infer_audio(params=params, model=model, dataset=test_dataset)
+    infer_audio(params=params, model=model, dataloader=dataloader)
 
     logging.info("Done!")
 

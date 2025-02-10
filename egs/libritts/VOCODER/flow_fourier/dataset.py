@@ -22,9 +22,18 @@ import numpy as np
 import os
 import torch
 import torchaudio
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 torch.set_num_threads(1)
+
+
+def pad_seq_collate_fn(data):
+    # each item in data: (audio: Tensor, file_name: str)
+    audios = pad_sequence([torch.Tensor(x[0]) for x in data], batch_first=True)
+    audio_lens = torch.tensor([len(x[0]) for x in data], dtype=torch.int32)
+    file_names = [x[1] for x in data]
+    return audios, audio_lens, file_names
 
 
 def build_data_loader(
@@ -38,6 +47,7 @@ def build_data_loader(
     world_size: int = 1,
     pin_memory: bool = True,
     persistent_workers: bool = True,
+    drop_last: bool = False,
 ):
     dataset = LibriTTSDataset(
         wav_list_file=wav_list_file,
@@ -62,6 +72,8 @@ def build_data_loader(
         shuffle=shuffle if sampler is None else None,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        collate_fn=None if num_samples is not None else pad_seq_collate_fn,
+        drop_last=drop_last,
     )
 
     return dataloader
