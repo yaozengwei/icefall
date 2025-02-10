@@ -16,6 +16,7 @@
 # limitations under the License.
 
 
+import random
 from typing import Optional
 
 import math
@@ -45,6 +46,44 @@ def real_to_fft(real_fft: Tensor):
     real_fft = real_fft.reshape(batch_size, 2, -1, fft_frames).permute(0, 2, 3, 1)
     fft = torch.view_as_complex(real_fft.contiguous())
     return fft
+
+
+# From https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/scaling.py
+class LimitParamValue(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, min: float, max: float):
+        ctx.save_for_backward(x)
+        assert max >= min
+        ctx.min = min
+        ctx.max = max
+        return x
+
+    @staticmethod
+    def backward(ctx, x_grad: Tensor):
+        (x,) = ctx.saved_tensors
+        # where x < ctx.min, ensure all grads are negative (this will tend to make
+        # x more positive).
+        x_grad = x_grad * torch.where(
+            torch.logical_and(x_grad > 0, x < ctx.min), -1.0, 1.0
+        )
+        # where x > ctx.max, ensure all grads are positive (this will tend to make
+        # x more negative).
+        x_grad *= torch.where(torch.logical_and(x_grad < 0, x > ctx.max), -1.0, 1.0)
+        return x_grad, None, None
+
+
+def limit_param_value(
+    x: Tensor, min: float, max: float, prob: float = 0.6, training: bool = True
+):
+    # You apply this to (typically) an nn.Parameter during training to ensure that its
+    # (elements mostly) stays within a supplied range.  This is done by modifying the
+    # gradients in backprop.
+    # It's not necessary to do this on every batch: do it only some of the time,
+    # to save a little time.
+    if training and random.random() < prob:
+        return LimitParamValue.apply(x, min, max)
+    else:
+        return x
 
 
 class SinusoidalPosEmb(torch.nn.Module):
@@ -126,7 +165,10 @@ class ConvNeXtBlock(nn.Module):
         x = self.pwconv2(x)
         x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
 
-        x = x + residual * self.residual_scale
+        residual_scale = limit_param_value(
+            self.residual_scale, min=0.5, max=1.0, training=self.training
+        )
+        x = x + residual * residual_scale
 
         return x
 
