@@ -547,7 +547,7 @@ class Vocoder(nn.Module):
                     x=x,
                     audio_lens=audio_lens,
                     cond=cond,
-                    t=t[None].expand(batch_size),
+                    t=t[None, None].expand(batch_size, 1),
                 )
                 x = x + vt * dt
             else:
@@ -556,8 +556,8 @@ class Vocoder(nn.Module):
                     x=x,
                     audio_lens=audio_lens,
                     cond=cond,
-                    t=t[None].expand(batch_size),
-                    dest_t=dest_t[None].expand(batch_size),
+                    t=t[None, None].expand(batch_size, 1),
+                    dest_t=dest_t[None, None].expand(batch_size, 1),
                 )
                 x = x_dest
 
