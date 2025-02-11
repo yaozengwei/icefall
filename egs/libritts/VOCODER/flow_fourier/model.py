@@ -594,3 +594,45 @@ class Vocoder(nn.Module):
             )
 
         return pred_audio
+
+    def inverse_infer(
+        self,
+        audio: torch.Tensor,
+        audio_lens: torch.Tensor,
+        n_timesteps: int = 8,
+        start_t: float = 0.999,
+    ) -> Tensor:
+        assert not self.analytic and not self.higher_order
+
+        mel_spec = self.mel(audio)  # (batch, n_mels, time)
+
+        # sample noise p(x_0)
+        if self.from_inv_mel:
+            noise = self.reconstuct_audio_with_random_phase(mel_spec)
+            noise = convert_length(noise, audio.shape[-1])
+        else:
+            # scale x0 by x1's std in training
+            noise = torch.randn_like(audio) * self.init_noise_scale
+
+        # start point
+        x = audio * start_t + noise * (1.0 - start_t)
+
+        cond = self.mel_encoder(mel_spec.sqrt())
+
+        # use fixed euler solver for ODEs.
+        t_span = torch.linspace(start_t, 0, n_timesteps + 1, device=noise.device)
+        t, dt = t_span[0], t_span[1] - t_span[0]
+        batch_size = x.shape[0]
+        for step in range(1, len(t_span)):
+            vt, _, _ = self.process_model(
+                x=x,
+                audio_lens=audio_lens,
+                cond=cond,
+                t=t[None, None].expand(batch_size, 1),
+            )
+            x = x + vt * dt
+            t = t_span[step]
+
+        inv_noise = x
+
+        return inv_noise, noise
