@@ -246,6 +246,7 @@ class Vocoder(nn.Module):
         est_fft = est_mag * torch.exp(random_phase * 1j)
         est_audio = self.ifft(est_fft)
         return est_audio * 2.0
+        # return est_audio
 
     def process_model(
         self,

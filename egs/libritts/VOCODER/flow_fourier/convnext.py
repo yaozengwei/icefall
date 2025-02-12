@@ -212,6 +212,7 @@ class ConvNeXt(nn.Module):
         cond_channels: int,
         channels: int,
         num_layers: int,
+        use_t: bool = True,
         use_dest_t: bool = False,
     ):
         super().__init__()
@@ -220,13 +221,14 @@ class ConvNeXt(nn.Module):
 
         self.in_proj = nn.Conv1d(in_channels, channels, 1, bias=False)
 
-        self.time_embed = SinusoidalPosEmb(channels)
-        time_embed_hidden = channels * 3
-        self.time_mlp = nn.Sequential(
-            nn.Linear(channels if not use_dest_t else channels * 2, time_embed_hidden),
-            nn.SiLU(),
-            nn.Linear(time_embed_hidden, channels),
-        )
+        if use_t:
+            self.time_embed = SinusoidalPosEmb(channels)
+            time_embed_hidden = channels * 3
+            self.time_mlp = nn.Sequential(
+                nn.Linear(channels if not use_dest_t else channels * 2, time_embed_hidden),
+                nn.SiLU(),
+                nn.Linear(time_embed_hidden, channels),
+            )
 
         cond_embed_hidden = channels * 3
         self.cond_mlp = nn.Sequential(
@@ -241,7 +243,7 @@ class ConvNeXt(nn.Module):
                     channels=channels,
                     hidden_channels=channels * 3,
                     cond_channels=channels,
-                    time_embed_channels=channels,
+                    time_embed_channels=channels if use_t else None,
                     residual_scale=0.9,
                 )
                 for _ in range(num_layers)
@@ -254,7 +256,7 @@ class ConvNeXt(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor,
-        t: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
         dest_t: Optional[torch.Tensor] = None,
         length_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -271,11 +273,14 @@ class ConvNeXt(nn.Module):
         """
         x = self.in_proj(x)
 
-        if dest_t is not None:
-            time_embed = torch.cat([self.time_embed(t), self.time_embed(dest_t)], dim=1)
+        if t is not None:
+            if dest_t is not None:
+                time_embed = torch.cat([self.time_embed(t), self.time_embed(dest_t)], dim=1)
+            else:
+                time_embed = self.time_embed(t)
+            time_embed = self.time_mlp(time_embed)  # (batch, channels)
         else:
-            time_embed = self.time_embed(t)
-        time_embed = self.time_mlp(time_embed)  # (batch, channels)
+            time_embed = None
 
         cond = self.cond_mlp(cond)
 
@@ -298,6 +303,7 @@ class AudioConvNeXt(nn.Module):
         convnext_channels: int,
         convnext_num_layers: int,
         num_outputs: int = 1,
+        use_t: bool = True,
         use_dest_t: bool = False,
         analytic: bool = False,
     ):
@@ -320,6 +326,7 @@ class AudioConvNeXt(nn.Module):
             cond_channels=cond_channels,
             channels=convnext_channels,
             num_layers=convnext_num_layers,
+            use_t=use_t,
             use_dest_t=use_dest_t,
         )
 
@@ -334,8 +341,8 @@ class AudioConvNeXt(nn.Module):
         self,
         audio: Tensor,
         audio_lens: Tensor,
-        t: Tensor,
         mel: Tensor,
+        t: Optional[torch.Tensor] = None,
         dest_t: Optional[torch.Tensor] = None,
     ) -> Tensor:
         """
