@@ -29,7 +29,7 @@ from checkpoint import (
 )
 from dataset import build_data_loader
 from icefall.utils import AttributeDict, setup_logger, str2bool
-from train import add_model_arguments, get_model
+from train_one_step import add_model_arguments, get_model
 
 
 def get_parser():
@@ -70,13 +70,6 @@ def get_parser():
         type=str,
         default="flow_fourier/exp",
         help="The experiment dir.",
-    )
-
-    parser.add_argument(
-        "--n-timesteps",
-        type=int,
-        default=8,
-        help="The number of steps to generate.",
     )
 
     parser.add_argument(
@@ -144,9 +137,7 @@ def infer_audio(
             batch_size = audios.shape[0]
             audios = audios.to(device)  # (batch, time)
             audio_lens = audio_lens.to(device)  # (batch,)
-            pred_audios = model.infer(
-                audio=audios, audio_lens=audio_lens, n_timesteps=params.n_timesteps
-            )
+            pred_audios = model.infer(audio=audios, audio_lens=audio_lens)
             for i in range(batch_size):
                 pred = pred_audios[i, :audio_lens[i].item()].data.cpu().numpy()
                 pred_out_file = f"{params.wav_dir_pred}/{file_names[i]}"
@@ -173,7 +164,7 @@ def main():
     if params.use_averaged_model:
         params.suffix += "-use-avg-model"
 
-    params.wav_dir_pred = f"{params.exp_dir}/{params.suffix}-pred-step-{params.n_timesteps}"
+    params.wav_dir_pred = f"{params.exp_dir}/{params.suffix}-pred"
     os.makedirs(params.wav_dir_pred, exist_ok=True)
 
     device = torch.device("cpu")

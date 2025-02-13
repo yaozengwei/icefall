@@ -19,6 +19,7 @@ import argparse
 import logging
 import os
 
+import soundfile as sf
 import torch
 import torch.nn as nn
 from checkpoint import (
@@ -28,7 +29,6 @@ from checkpoint import (
 )
 from dataset import build_data_loader
 from icefall.utils import AttributeDict, setup_logger, str2bool
-from scipy.io.wavfile import write
 from train import add_model_arguments, get_model
 
 
@@ -161,7 +161,7 @@ def infer_audio(
                 pred = inv_noises[i, :audio_lens[i].item()].data.cpu().numpy()
                 pred_out_file = f"{params.wav_dir_pred}/{file_names[i]}"
                 makedir_if_necessary(pred_out_file)
-                write(pred_out_file, params.sampling_rate, pred)
+                sf.write(pred_out_file, pred, params.sampling_rate)
 
             cnt += batch_size
             if batch_idx % log_interval == 0:
