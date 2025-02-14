@@ -235,6 +235,41 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--kaldi-io",
+        type=str2bool,
+        default=False,
+        help="Whether to use kaldi_native_io style dataset",
+    )
+
+    parser.add_argument(
+        "--train-scp-ark-dir",
+        type=str,
+        default="./data/scp_ark/train-full-960",
+        help="Dir to the scp/ark files of the training set.",
+    )
+
+    parser.add_argument(
+        "--valid-scp-ark-dir",
+        type=str,
+        default="./data/scp_ark/validation",
+        help="Dir to the scp/ark files of the validation set.",
+    )
+
+    parser.add_argument(
+        "--train-inv-noise-scp-ark-dir",
+        type=str,
+        default="",
+        help="Dir to the scp/ark files of the inv-noise training set.",
+    )
+
+    parser.add_argument(
+        "--valid-inv-noise-scp-ark-dir",
+        type=str,
+        default="",
+        help="Dir to the scp/ark files of the inv-noise validation set.",
+    )
+
+    parser.add_argument(
         "--mel-scaling-loss",
         type=str2bool,
         default=True,
@@ -844,6 +879,9 @@ def run(rank, world_size, args):
         world_size=world_size,
         inv_noise_pair=True,
         inv_noise_dir=params.inv_noise_dir,
+        kaldi_io=params.kaldi_io,
+        scp_ark_dir=params.train_scp_ark_dir,
+        inv_noise_scp_ark_dir=params.train_inv_noise_scp_ark_dir,
     )
     valid_dl = build_data_loader(
         wav_list_file=params.valid_wav_list,
@@ -856,6 +894,9 @@ def run(rank, world_size, args):
         world_size=world_size,
         inv_noise_pair=True,
         inv_noise_dir=params.inv_noise_dir,
+        kaldi_io=params.kaldi_io,
+        scp_ark_dir=params.valid_scp_ark_dir,
+        inv_noise_scp_ark_dir=params.valid_inv_noise_scp_ark_dir,
     )
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)

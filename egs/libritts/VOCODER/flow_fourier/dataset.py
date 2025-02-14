@@ -16,12 +16,15 @@
 # limitations under the License.
 
 
-from pathlib import Path
-from typing import Optional
+import glob
 import numpy as np
 import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 import torch
 import torchaudio
+from kaldi_native_io import read_wave
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
@@ -37,11 +40,11 @@ def pad_seq_collate_fn(data):
 
 
 def build_data_loader(
-    wav_list_file: Path,
-    corpus_dir: Path,
-    sampling_rate: int,
-    batch_size: int,
-    num_workers: int,
+    wav_list_file: Optional[Path] = None,
+    corpus_dir: Optional[Path] = None,
+    sampling_rate: int = 24000,
+    batch_size: int = 64,
+    num_workers: int = 8,
     train: bool = False,
     num_samples: Optional[int] = None,
     world_size: int = 1,
@@ -49,27 +52,54 @@ def build_data_loader(
     persistent_workers: bool = True,
     drop_last: bool = False,
     inv_noise_pair: bool = False,
-    inv_noise_dir: Optional[Path] = None
+    inv_noise_dir: Optional[Path] = None,
+    kaldi_io: bool = False,
+    scp_ark_dir: Optional[Path] = None,
+    inv_noise_scp_ark_dir: Optional[Path] = None,
 ):
     if not inv_noise_pair:
-        dataset = LibriTTSDataset(
-            wav_list_file=wav_list_file,
-            corpus_dir=corpus_dir,
-            sampling_rate=sampling_rate,
-            train=train,
-            num_samples=num_samples,
-        )
+        if not kaldi_io:
+            assert wav_list_file is not None
+            assert corpus_dir is not None
+            dataset = LibriTTSDataset(
+                wav_list_file=wav_list_file,
+                corpus_dir=corpus_dir,
+                sampling_rate=sampling_rate,
+                train=train,
+                num_samples=num_samples,
+            )
+        else:
+            assert scp_ark_dir is not None
+            dataset = KaldiIOLibriTTSDataset(
+                scp_ark_dir=scp_ark_dir,
+                sampling_rate=sampling_rate,
+                train=train,
+                num_samples=num_samples,
+            )
     else:
-        assert num_samples is not None
-        assert inv_noise_dir is not None
-        dataset = InvNoisePairLibriTTSDataset(
-            wav_list_file=wav_list_file,
-            corpus_dir=corpus_dir,
-            inv_noise_dir=inv_noise_dir,
-            sampling_rate=sampling_rate,
-            train=train,
-            num_samples=num_samples,
-        )
+        assert num_samples is not None  # since we use inv-noise only in training
+        if not kaldi_io:
+            assert wav_list_file is not None
+            assert corpus_dir is not None
+            assert inv_noise_dir is not None
+            dataset = InvNoisePairLibriTTSDataset(
+                wav_list_file=wav_list_file,
+                corpus_dir=corpus_dir,
+                inv_noise_dir=inv_noise_dir,
+                sampling_rate=sampling_rate,
+                train=train,
+                num_samples=num_samples,
+            )
+        else:
+            assert scp_ark_dir is not None
+            assert inv_noise_scp_ark_dir is not None
+            dataset = KaldiIOInvNoisePairLibriTTSDataset(
+                scp_ark_dir=scp_ark_dir,
+                inv_noise_scp_ark_dir=inv_noise_scp_ark_dir,
+                sampling_rate=sampling_rate,
+                train=train,
+                num_samples=num_samples,
+            )
 
     shuffle = train
 
@@ -117,7 +147,7 @@ class LibriTTSDataset(Dataset):
     def __len__(self) -> int:
         return len(self.wav_list)
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         file_name = self.wav_list[index]
 
         y, sr = torchaudio.load(os.path.join(self.corpus_dir, file_name))
@@ -211,3 +241,153 @@ class InvNoisePairLibriTTSDataset(Dataset):
                 y2 = y2[:, : self.num_samples]
 
         return y1[0], y2[0], file_name
+
+
+class KaldiIOLibriTTSDataset(Dataset):
+    def __init__(
+        self,
+        scp_ark_dir: str,
+        sampling_rate: int,
+        train: bool = False,
+        num_samples: Optional[int] = None,
+        apply_effects: bool = True,
+    ):
+        self.samples = self.parse_samples(scp_ark_dir)  # list of ark files
+        self.sampling_rate = sampling_rate
+        if train:
+            assert num_samples is not None
+        self.train = train
+        self.num_samples = num_samples
+        self.apply_effects = apply_effects
+
+    def parse_samples(self, scp_ark_dir: str) -> List[Tuple[str, str]]:
+        samples = []
+        scp_files = glob.glob(scp_ark_dir + "/*.scp")
+        for scp in scp_files:
+            with open(scp, "r") as f:
+                for line in f.readlines():
+                    key, ark = line.strip().split()
+                    samples.append((key, ark))
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        file_name, ark = self.samples[index]
+        wav = read_wave(ark)
+        # since wav.data is in range of [-32768, 32767], we convert it into range of [-1, 1]
+        y = torch.from_numpy(wav.data.numpy() / 32768.0)
+        sr = int(wav.sample_freq)
+
+        if y.size(0) > 1:
+            # mix to mono
+            y = y.mean(dim=0, keepdim=True)
+
+        if self.apply_effects:
+            gain = np.random.uniform(-1, -6) if self.train else -3
+            y, _ = torchaudio.sox_effects.apply_effects_tensor(
+                y, sr, [["norm", f"{gain:.2f}"]]
+            )
+
+        if sr != self.sampling_rate:
+            y = torchaudio.functional.resample(
+                y, orig_freq=sr, new_freq=self.sampling_rate
+            )
+
+        if self.num_samples is not None:
+            if y.size(-1) < self.num_samples:
+                pad_length = self.num_samples - y.size(-1)
+                padding_tensor = y.repeat(1, 1 + pad_length // y.size(-1))
+                y = torch.cat((y, padding_tensor[:, :pad_length]), dim=1)
+            elif self.train:
+                start = np.random.randint(low=0, high=y.size(-1) - self.num_samples + 1)
+                y = y[:, start : start + self.num_samples]
+            else:
+                # During validation, take always the first segment for determinism
+                y = y[:, : self.num_samples]
+
+        return y[0], file_name
+
+
+class KaldiIOInvNoisePairLibriTTSDataset(Dataset):
+    def __init__(
+        self,
+        scp_ark_dir: str,
+        inv_noise_scp_ark_dir: str,
+        sampling_rate: int,
+        train: bool = False,
+        num_samples: Optional[int] = None,
+        apply_effects: bool = True,
+    ):
+        self.samples = self.parse_samples(scp_ark_dir)  # list of ark files
+        self.inv_noise_samples = self.parse_samples(inv_noise_scp_ark_dir)  # list of ark files
+        assert all(a[0] == b[0] for a, b in zip(self.samples, self.inv_noise_samples))
+        self.sampling_rate = sampling_rate
+        if train:
+            assert num_samples is not None
+        self.train = train
+        self.num_samples = num_samples
+        self.apply_effects = apply_effects
+
+    def parse_samples(self, scp_ark_dir: str) -> List[Tuple[str, str]]:
+        samples = []
+        scp_files = glob.glob(scp_ark_dir + "/*.scp")
+        for scp in scp_files:
+            with open(scp, "r") as f:
+                for line in f.readlines():
+                    key, ark = line.strip().split()
+                    samples.append((key, ark))
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # y1: ground-truth; y2: inverted noise
+
+        file_name1, ark1 = self.samples[index]
+        wav1 = read_wave(ark1)
+        # since wav.data is in range of [-32768, 32767], we convert it into range of [-1, 1]
+        y1 = torch.from_numpy(wav1.data.numpy() / 32768.0)
+        sr1 = int(wav1.sample_freq)
+
+        file_name2, ark2 = self.inv_noise_samples[index]
+        wav2 = read_wave(ark2)
+        # since wav.data is in range of [-32768, 32767], we convert it into range of [-1, 1]
+        y2 = torch.from_numpy(wav2.data.numpy() / 32768.0)
+        sr2 = int(wav2.sample_freq)
+
+        assert y1.shape == y2.shape and sr1 == sr2 and file_name1 == file_name2
+
+        if y1.size(0) > 1:
+            # mix to mono
+            y1 = y1.mean(dim=0, keepdim=True)
+            y2 = y2.mean(dim=0, keepdim=True)
+
+        if self.apply_effects:
+            gain = np.random.uniform(-1, -6) if self.train else -3
+            y1, _ = torchaudio.sox_effects.apply_effects_tensor(y1, sr1, [["norm", f"{gain:.2f}"]])
+            y2, _ = torchaudio.sox_effects.apply_effects_tensor(y2, sr2, [["norm", f"{gain:.2f}"]])
+
+        if sr1 != self.sampling_rate:
+            y1 = torchaudio.functional.resample(y1, orig_freq=sr1, new_freq=self.sampling_rate)
+            y2 = torchaudio.functional.resample(y2, orig_freq=sr2, new_freq=self.sampling_rate)
+
+        if self.num_samples is not None:
+            if y1.size(-1) < self.num_samples:
+                pad_length = self.num_samples - y1.size(-1)
+                padding_tensor1 = y1.repeat(1, 1 + pad_length // y1.size(-1))
+                y1 = torch.cat((y1, padding_tensor1[:, :pad_length]), dim=1)
+                padding_tensor2 = y2.repeat(1, 1 + pad_length // y2.size(-1))
+                y2 = torch.cat((y2, padding_tensor2[:, :pad_length]), dim=1)
+            elif self.train:
+                start = np.random.randint(low=0, high=y1.size(-1) - self.num_samples + 1)
+                y1 = y1[:, start : start + self.num_samples]
+                y2 = y2[:, start : start + self.num_samples]
+            else:
+                # During validation, take always the first segment for determinism
+                y1 = y1[:, : self.num_samples]
+                y2 = y2[:, : self.num_samples]
+
+        return y1[0], y2[0], file_name1
