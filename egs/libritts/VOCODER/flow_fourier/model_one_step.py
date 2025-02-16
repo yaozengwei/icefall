@@ -34,6 +34,16 @@ from audio_utils import (
 from convnext import AudioConvNeXt, MelEncoder
 
 
+class ScaleGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    def backward(ctx, x_grad):
+        return x_grad * ctx.scale, None
+
+
 class OneStepVocoder(nn.Module):
     def __init__(
         self,
@@ -49,6 +59,8 @@ class OneStepVocoder(nn.Module):
         convnext_channels: int = (768, 384, 192, 96),
         from_inv_mel: bool = True,
         init_noise_scale: float = 0.1,
+        use_disc: bool = False,
+        disc_mask_order: int = 3,
     ):
         super().__init__()
         self.num_branches = len(n_ffts)
@@ -58,6 +70,9 @@ class OneStepVocoder(nn.Module):
         # These two arguments should be consistent with the model used to get the inverted noise
         self.from_inv_mel = from_inv_mel
         self.init_noise_scale = init_noise_scale  # emprical, need to tune
+
+        self.use_disc = use_disc
+        self.disc_mask_order = disc_mask_order
 
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
@@ -100,6 +115,24 @@ class OneStepVocoder(nn.Module):
 
         self.ifft = ISTFT(n_fft=mel_n_fft, hop_length=mel_hop_length)
 
+        if use_disc:
+            # Use a smaller model as discriminator
+            self.disc_estimators = nn.ModuleList([
+                AudioConvNeXt(
+                    n_fft=n_ffts[i],
+                    hop_length=hop_lengths[i],
+                    cond_channels=mel_enc_channels,
+                    mel_hop_length=mel_hop_length,
+                    convnext_channels=convnext_channels[i],
+                    convnext_num_layers=convnext_num_layers[i] // 2,
+                    num_outputs=1,
+                    use_t=False,
+                    use_dest_t=False,
+                    analytic=False,
+                )
+                for i in range(self.num_branches)
+            ])
+
         self.apply(self._init_weights)
 
     @torch.no_grad()
@@ -125,10 +158,13 @@ class OneStepVocoder(nn.Module):
         audio_lens: Tensor,
         cond: Tensor,
         branch_drop_rate: float = 0.0,
+        forward_disc: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
+        if forward_disc:
+            assert self.use_disc
+        estimators = self.estimators if not forward_disc else self.disc_estimators
         branch_outputs = torch.stack([
-            estimator(audio=x, audio_lens=audio_lens, mel=cond)
-            for estimator in self.estimators
+            est(audio=x, audio_lens=audio_lens, mel=cond) for est in estimators
         ], dim=1)  # (batch, num_branches, 1, time)
 
         # fuse all branches
@@ -146,6 +182,54 @@ class OneStepVocoder(nn.Module):
 
         return output[:, 0]
 
+    def get_disc_loss(
+        self,
+        x1: torch.Tensor,
+        x1_pred: torch.Tensor,
+        audio_lens: torch.Tensor,
+        cond: torch.Tensor,
+        branch_drop_rate: float = 0.0,
+    ) -> torch.Tensor:
+        """Get discriminator-related loss, i.e. mask-prediction loss."""
+
+        # generate mask used to combine x1 and x1_pred
+        batch_size, time = x1.shape
+        kwargs = {'device': x1.device}
+        # batch_size, (sin vs. cos)
+        r = torch.randn(2, batch_size, self.disc_mask_order, 1, **kwargs)
+        time_range = torch.arange(time, **kwargs) * (math.pi / time)
+        order_range = torch.arange(1, self.disc_mask_order + 1, **kwargs).unsqueeze(-1)
+
+        mask = (r[0] * (time_range * order_range).sin()
+                + r[1] * (time_range * order_range).cos())  # (batch_size, order, time)
+        mask = mask.sum(dim=1)  # (batch_size, time)
+        # get a lava-lamp-like mask that's quite balanced between zeros and ones
+        # mask = (mask > 0).to(torch.float)
+        mask = (mask * 5.0).sigmoid()  # a soft mask in range [0, 1]
+
+        # combined_x1 is a combined audio where some parts come from real x1
+        # and some come from x1_pred which is the model output
+        combined_x1 = (mask * x1) + (1.0 - mask) * x1_pred
+        # reverse grad before giving it to the discriminator, as we want the
+        # model to "beat" the discriminator.
+        combined_x1 = ScaleGrad.apply(combined_x1, -1)
+
+        disc_output = self.process_model(
+            x=combined_x1,
+            audio_lens=audio_lens,
+            cond=cond,
+            branch_drop_rate=branch_drop_rate,
+            forward_disc=True,
+        )  # (batch_size, time)
+        # disc_loss is also a MSE loss
+        disc_loss = self.compute_loss(
+            pred=disc_output,
+            target=mask,
+            audio_lens=audio_lens,
+            mel_scaling_loss=False,
+        )
+        return disc_loss
+
     def forward(
         self,
         audio: torch.Tensor,
@@ -153,6 +237,7 @@ class OneStepVocoder(nn.Module):
         inv_noise: torch.Tensor,
         mel_scaling_loss: bool = True,
         branch_drop_rate: float = 0.0,
+        mix_noise_scale: float = 0.2,
         eps: float = 1e-8,
     ) -> Tuple[Tensor]:
         x1 = audio
@@ -162,24 +247,57 @@ class OneStepVocoder(nn.Module):
         mel_spec = self.mel(audio)  # (batch, n_mels, time)
         cond = self.mel_encoder(mel_spec.sqrt())
 
-        x1_pred = self.process_model(
-            x=x0,
-            audio_lens=audio_lens,
-            cond=cond,
-            branch_drop_rate=branch_drop_rate,
-        )
-        # shape of vt, x_mid, x_dest should be: (batch_size, time)
+        if not self.use_disc:
+            x1_pred = self.process_model(
+                x=x0,
+                audio_lens=audio_lens,
+                cond=cond,
+                branch_drop_rate=branch_drop_rate,
+            )
+            # compute losses
+            main_loss = self.compute_loss(
+                pred=x1_pred,
+                target=x1,
+                audio_lens=audio_lens,
+                mel_scaling_loss=mel_scaling_loss,
+                mel_spec=mel_spec,
+            )
+            loss = (main_loss,)
+        else:
+            batch_size = audio.shape[0]
+            # add real random noise to inv_noise
+            if self.from_inv_mel:
+                random_noise = self.reconstuct_audio_with_random_phase(mel_spec)
+                random_noise = convert_length(random_noise, audio.shape[-1])
+            else:
+                # scale x0 by x1's std in training
+                random_noise = torch.randn_like(audio) * self.init_noise_scale
+            # use sqrt to keep the noise-energy correct
+            x0_mixed = random_noise * math.sqrt(mix_noise_scale) + x0 * math.sqrt(1.0 - mix_noise_scale)
 
-        # compute losses
-        main_loss = self.compute_loss(
-            pred=x1_pred,
-            target=x1,
-            audio_lens=audio_lens,
-            mel_scaling_loss=mel_scaling_loss,
-            mel_spec=mel_spec,
-        )
+            x1_pred = self.process_model(
+                x=torch.cat([x0, x0_mixed], dim=0),
+                audio_lens=audio_lens.repeat(2),
+                cond=cond.repeat(2, 1, 1),
+                branch_drop_rate=branch_drop_rate,
+            )  # (batch_size * 2, time)
+            # compute losses
+            main_loss = self.compute_loss(
+                pred=x1_pred[:batch_size],  # first half
+                target=x1,
+                audio_lens=audio_lens,
+                mel_scaling_loss=mel_scaling_loss,
+                mel_spec=mel_spec,
+            )
+            disc_loss = self.get_disc_loss(
+                x1=x1,
+                x1_pred=x1_pred[batch_size:],  # second half
+                audio_lens=audio_lens,
+                cond=cond.detach(),  # TODO: not sure whether we need detach here
+                branch_drop_rate=branch_drop_rate,
+            )
+            loss = (main_loss, disc_loss)
 
-        loss = (main_loss,)
         return loss
 
     def compute_loss(

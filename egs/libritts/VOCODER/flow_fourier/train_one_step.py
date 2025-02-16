@@ -276,6 +276,20 @@ def get_parser():
         help="",
     )
 
+    parser.add_argument(
+        "--mix-noise-scale",
+        type=float,
+        default=0.2,
+        help="",
+    )
+
+    parser.add_argument(
+        "--disc-loss-scale",
+        type=float,
+        default=1.0,
+        help="",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -357,6 +371,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=0.1,
         help="Noise scale used when constructing x0 from standard distribution.",
+    )
+
+    parser.add_argument(
+        "--use-disc",
+        type=str2bool,
+        default=False,
+        help="Whether to discriminator",
     )
 
 
@@ -480,6 +501,7 @@ def get_model(params: AttributeDict) -> nn.Module:
         convnext_channels=_to_int_tuple(params.convnext_channels),
         from_inv_mel=params.from_inv_mel,
         init_noise_scale=params.init_noise_scale,
+        use_disc=params.use_disc,
     )
     return model
 
@@ -497,6 +519,8 @@ def compute_loss(
     branch_drop_rate = params.branch_drop_rate * (1.0 - params.batch_idx_train / params.warm_step)
     branch_drop_rate = max(branch_drop_rate, 0.0)
 
+    use_disc = params.use_disc
+
     with torch.set_grad_enabled(is_training):
         losses = model(
             audio=audio,
@@ -504,9 +528,13 @@ def compute_loss(
             inv_noise=inv_noise,
             mel_scaling_loss=params.mel_scaling_loss,
             branch_drop_rate=branch_drop_rate,
+            mix_noise_scale=params.mix_noise_scale,
         )
         main_loss = losses[0]
         loss = main_loss
+        if use_disc:
+            disc_loss = losses[1]
+            loss = loss + params.disc_loss_scale * disc_loss
 
     assert loss.requires_grad == is_training
 
@@ -515,6 +543,8 @@ def compute_loss(
     loss_info["samples"] = batch_size
     loss_info["loss"] = loss.detach().item() * batch_size
     loss_info["main_loss"] = main_loss.detach().item() * batch_size
+    if use_disc:
+        loss_info["disc_loss"] = disc_loss.detach().item() * batch_size
 
     return loss, loss_info
 
