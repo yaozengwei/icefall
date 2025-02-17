@@ -291,6 +291,20 @@ def get_parser():
         help="",
     )
 
+    parser.add_argument(
+        "--log-mel-loss-scale",
+        type=float,
+        default=1.0,
+        help="",
+    )
+
+    parser.add_argument(
+        "--fft-mag-loss-scale",
+        type=float,
+        default=1.0,
+        help="",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -375,10 +389,24 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--use-disc",
+        "--use-disc-loss",
         type=str2bool,
         default=False,
-        help="Whether to discriminator",
+        help="Whether to discriminator loss",
+    )
+
+    parser.add_argument(
+        "--use-fft-mag-loss",
+        type=str2bool,
+        default=False,
+        help="Whether to fft magnitude l1-loss",
+    )
+
+    parser.add_argument(
+        "--use-log-mel-loss",
+        type=str2bool,
+        default=False,
+        help="Whether to log-mel l1-loss",
     )
 
 
@@ -502,7 +530,9 @@ def get_model(params: AttributeDict) -> nn.Module:
         convnext_channels=_to_int_tuple(params.convnext_channels),
         from_inv_mel=params.from_inv_mel,
         init_noise_scale=params.init_noise_scale,
-        use_disc=params.use_disc,
+        use_disc_loss=params.use_disc_loss,
+        use_fft_mag_loss=params.use_fft_mag_loss,
+        use_log_mel_loss=params.use_log_mel_loss,
     )
     return model
 
@@ -520,7 +550,9 @@ def compute_loss(
     branch_drop_rate = params.branch_drop_rate * (1.0 - params.batch_idx_train / params.warm_step)
     branch_drop_rate = max(branch_drop_rate, 0.0)
 
-    use_disc = params.use_disc
+    use_disc_loss = params.use_disc_loss
+    use_log_mel_loss = params.use_log_mel_loss
+    use_fft_mag_loss = params.use_fft_mag_loss
 
     with torch.set_grad_enabled(is_training):
         losses = model(
@@ -531,11 +563,14 @@ def compute_loss(
             branch_drop_rate=branch_drop_rate,
             mix_noise_scale=params.mix_noise_scale,
         )
-        main_loss = losses[0]
+        main_loss, log_mel_loss, fft_mag_loss, disc_loss = losses
         loss = main_loss
-        if use_disc:
-            disc_loss = losses[1]
-            loss = loss + params.disc_loss_scale * disc_loss
+        if use_log_mel_loss:
+            loss += params.log_mel_loss_scale * log_mel_loss
+        if use_fft_mag_loss:
+            loss += params.fft_mag_loss_scale * fft_mag_loss
+        if use_disc_loss:
+            loss += params.disc_loss_scale * disc_loss
 
     assert loss.requires_grad == is_training
 
@@ -544,7 +579,11 @@ def compute_loss(
     loss_info["samples"] = batch_size
     loss_info["loss"] = loss.detach().item() * batch_size
     loss_info["main_loss"] = main_loss.detach().item() * batch_size
-    if use_disc:
+    if use_log_mel_loss:
+        loss_info["log_mel_loss"] = log_mel_loss.detach().item() * batch_size
+    if use_fft_mag_loss:
+        loss_info["fft_mag_loss"] = fft_mag_loss.detach().item() * batch_size
+    if use_disc_loss:
         loss_info["disc_loss"] = disc_loss.detach().item() * batch_size
 
     return loss, loss_info

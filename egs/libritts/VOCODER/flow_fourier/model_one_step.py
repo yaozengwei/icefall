@@ -24,10 +24,12 @@ from typing import Optional, Tuple
 import torch
 from torchaudio.transforms import MelSpectrogram
 from torch import Tensor, nn
+from torch.nn import functional as F
 from icefall.utils import make_pad_mask
 from audio_utils import (
     ISTFT,
     InverseMelScale,
+    STFT,
     convert_length,
     safe_log,
 )
@@ -59,8 +61,10 @@ class OneStepVocoder(nn.Module):
         convnext_channels: int = (768, 384, 192, 96),
         from_inv_mel: bool = True,
         init_noise_scale: float = 0.1,
-        use_disc: bool = False,
+        use_disc_loss: bool = False,
         disc_mask_order: int = 3,
+        use_fft_mag_loss: bool = False,
+        use_log_mel_loss: bool = False,
     ):
         super().__init__()
         self.num_branches = len(n_ffts)
@@ -71,8 +75,11 @@ class OneStepVocoder(nn.Module):
         self.from_inv_mel = from_inv_mel
         self.init_noise_scale = init_noise_scale  # emprical, need to tune
 
-        self.use_disc = use_disc
+        self.use_disc_loss = use_disc_loss
         self.disc_mask_order = disc_mask_order
+
+        self.use_fft_mag_loss = use_fft_mag_loss
+        self.use_log_mel_loss = use_log_mel_loss
 
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
@@ -107,15 +114,13 @@ class OneStepVocoder(nn.Module):
             power=2,
         )
 
-        self.inv_mel = InverseMelScale(
-            n_mels=n_mels,
-            sample_rate=sampling_rate,
-            n_fft=mel_n_fft,
-        )
+        if from_inv_mel:
+            self.inv_mel = InverseMelScale(
+                n_mels=n_mels, sample_rate=sampling_rate, n_fft=mel_n_fft
+            )
+            self.ifft = ISTFT(n_fft=mel_n_fft, hop_length=mel_hop_length)
 
-        self.ifft = ISTFT(n_fft=mel_n_fft, hop_length=mel_hop_length)
-
-        if use_disc:
+        if use_disc_loss:
             # Use a smaller model as discriminator
             self.disc_estimators = nn.ModuleList([
                 AudioConvNeXt(
@@ -132,6 +137,9 @@ class OneStepVocoder(nn.Module):
                 )
                 for i in range(self.num_branches)
             ])
+
+        if use_fft_mag_loss:
+            self.fft = STFT(n_fft=mel_n_fft, hop_length=mel_hop_length)
 
         self.apply(self._init_weights)
 
@@ -161,7 +169,7 @@ class OneStepVocoder(nn.Module):
         forward_disc: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         if forward_disc:
-            assert self.use_disc
+            assert self.use_disc_loss
         estimators = self.estimators if not forward_disc else self.disc_estimators
         branch_outputs = torch.stack([
             est(audio=x, audio_lens=audio_lens, mel=cond) for est in estimators
@@ -247,7 +255,7 @@ class OneStepVocoder(nn.Module):
         mel_spec = self.mel(audio)  # (batch, n_mels, time)
         cond = self.mel_encoder(mel_spec.sqrt())
 
-        if not self.use_disc:
+        if not self.use_disc_loss:
             x1_pred = self.process_model(
                 x=x0,
                 audio_lens=audio_lens,
@@ -262,7 +270,22 @@ class OneStepVocoder(nn.Module):
                 mel_scaling_loss=mel_scaling_loss,
                 mel_spec=mel_spec,
             )
-            loss = (main_loss,)
+
+            if self.use_log_mel_loss:
+                log_mel_loss = self.compute_log_mel_loss(
+                    pred=x1_pred, target=x1, audio_lens=audio_lens
+                )
+            else:
+                log_mel_loss = 0.0
+
+            if self.use_fft_mag_loss:
+                fft_mag_loss = self.compute_fft_mag_loss(
+                    pred=x1_pred, target=x1, audio_lens=audio_lens
+                )
+            else:
+                fft_mag_loss = 0.0
+
+            disc_loss = 0.0
         else:
             batch_size = audio.shape[0]
             # add real random noise to inv_noise
@@ -296,8 +319,10 @@ class OneStepVocoder(nn.Module):
                 cond=cond.detach(),  # TODO: not sure whether we need detach here
                 branch_drop_rate=branch_drop_rate,
             )
-            loss = (main_loss, disc_loss)
+            # TODO:
+            log_mel_loss, fft_mag_loss = 0.0, 0.0
 
+        loss = (main_loss, log_mel_loss, fft_mag_loss, disc_loss)
         return loss
 
     def compute_loss(
@@ -330,6 +355,30 @@ class OneStepVocoder(nn.Module):
             loss = err_mel_spec * ((mel_spec + eps) ** -loss_power)
             loss = (loss * pad_mask).sum() / (pad_mask.sum() * err_mel_spec.shape[1])
 
+        return loss
+
+    def compute_log_mel_loss(
+        self, pred: Tensor, target: Tensor, audio_lens: Tensor
+    ) -> Tensor:
+        """Compute l1-loss on log-mel"""
+        pred = safe_log(self.mel(pred))  # (batch, n_mels, time)
+        target = safe_log(self.mel(target))  # (batch, n_mels, time)
+        mel_spec_lens = 1 + torch.div(audio_lens, self.mel.hop_length, rounding_mode="floor")
+        assert pred.shape[2] == mel_spec_lens.max().item()
+        pad_mask = make_pad_mask(mel_spec_lens).logical_not().unsqueeze(1)  # (batch, 1, time)
+        loss = F.smooth_l1_loss(pred, target, reduction='none')
+        loss = (loss * pad_mask).sum() / (pad_mask.sum() * pred.shape[1])
+        return loss
+
+    def compute_fft_mag_loss(
+        self, pred: Tensor, target: Tensor, audio_lens: Tensor
+    ) -> Tensor:
+        """Compute l1-loss on fft magnitude"""
+        pred, fft_lens = self.fft(pred, audio_lens)  # (batch, n_fft // 2 + 1, time)
+        target, _ = self.fft(target, audio_lens)  # (batch, n_fft // 2 + 1, time)
+        pad_mask = make_pad_mask(fft_lens).logical_not().unsqueeze(1)  # (batch, 1, time)
+        loss = F.smooth_l1_loss(pred.abs(), target.abs(), reduction='none')
+        loss = (loss * pad_mask).sum() / (pad_mask.sum() * pred.shape[1])
         return loss
 
     def infer(
