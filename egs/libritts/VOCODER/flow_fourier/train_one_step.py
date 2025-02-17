@@ -23,6 +23,7 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
 
+import librosa
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -33,7 +34,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from optim import ScaledAdam, Eden
 from torch.utils.tensorboard import SummaryWriter
-from utils import MetricsTracker
+from utils import MetricsTracker, plot_feature
 from model_one_step import OneStepVocoder
 from dataset import build_data_loader
 
@@ -728,6 +729,7 @@ def train_one_epoch(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
                 pred_from_rand, pred_from_inv, gt_audio = infer_sample
+
                 tb_writer.add_audio(
                     "train/valid_pred_audio_from_random_noise",
                     pred_from_rand,
@@ -745,6 +747,28 @@ def train_one_epoch(
                     gt_audio,
                     params.batch_idx_train,
                     params.sampling_rate,
+                )
+
+                def compute_spec(y):
+                    stft = librosa.stft(y, n_fft=1024)
+                    return librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+                tb_writer.add_image(
+                    "train/valid_pred_audio_from_random_noise_spec",
+                    plot_feature(compute_spec(pred_from_rand)),
+                    params.batch_idx_train,
+                    dataformats="HWC",
+                )
+                tb_writer.add_image(
+                    "train/valid_pred_audio_from_inv_noise_spec",
+                    plot_feature(compute_spec(pred_from_inv)),
+                    params.batch_idx_train,
+                    dataformats="HWC",
+                )
+                tb_writer.add_image(
+                    "train/valid_gt_audio_spec",
+                    plot_feature(compute_spec(gt_audio)),
+                    params.batch_idx_train,
+                    dataformats="HWC",
                 )
 
     loss_value = tot_loss["loss"] / tot_loss["samples"]
