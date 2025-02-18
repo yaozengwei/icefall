@@ -59,6 +59,7 @@ class OneStepVocoder(nn.Module):
         mel_enc_num_layers: int = 4,
         convnext_num_layers: int = (8, 8, 8, 8),
         convnext_channels: int = (768, 384, 192, 96),
+        convnext_conv_kernel_sizes: int = (7, 7, 7, 7),
         from_inv_mel: bool = True,
         init_noise_scale: float = 0.1,
         use_disc_loss: bool = False,
@@ -71,6 +72,7 @@ class OneStepVocoder(nn.Module):
         assert len(hop_lengths) == self.num_branches
         assert len(convnext_num_layers) == self.num_branches
         assert len(convnext_channels) == self.num_branches
+        assert len(convnext_conv_kernel_sizes) == self.num_branches
         # These two arguments should be consistent with the model used to get the inverted noise
         self.from_inv_mel = from_inv_mel
         self.init_noise_scale = init_noise_scale  # emprical, need to tune
@@ -95,6 +97,7 @@ class OneStepVocoder(nn.Module):
                 mel_hop_length=mel_hop_length,
                 convnext_channels=convnext_channels[i],
                 convnext_num_layers=convnext_num_layers[i],
+                convnext_conv_kernel_size=convnext_conv_kernel_sizes[i],
                 num_outputs=1,
                 use_t=False,
                 use_dest_t=False,

@@ -361,6 +361,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--convnext-conv-kernel-sizes",
+        type=str,
+        default="7,7,7",
+        help="",
+    )
+
+    parser.add_argument(
         "--mel-enc-channels",
         type=int,
         default=512,
@@ -528,6 +535,7 @@ def get_model(params: AttributeDict) -> nn.Module:
         mel_enc_num_layers=params.mel_enc_num_layers,
         convnext_num_layers=_to_int_tuple(params.convnext_num_layers),
         convnext_channels=_to_int_tuple(params.convnext_channels),
+        convnext_conv_kernel_sizes=_to_int_tuple(params.convnext_conv_kernel_sizes),
         from_inv_mel=params.from_inv_mel,
         init_noise_scale=params.init_noise_scale,
         use_disc_loss=params.use_disc_loss,

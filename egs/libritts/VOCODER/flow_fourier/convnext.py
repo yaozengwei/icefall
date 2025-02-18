@@ -112,12 +112,21 @@ class ConvNeXtBlock(nn.Module):
         self,
         channels: int,
         hidden_channels: int,
+        conv_kernel_size: int = 7,
         cond_channels: Optional[int] = None,
         time_embed_channels: Optional[int] = None,
         residual_scale: float = 1.0,
     ):
         super().__init__()
-        self.dwconv = nn.Conv1d(channels, channels, kernel_size=7, padding=3, groups=channels, bias=False)
+        assert conv_kernel_size % 2 == 1, conv_kernel_size
+        self.dwconv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=channels,
+            bias=False,
+        )
         self.pwconv1 = nn.Linear(channels, hidden_channels, bias=False)
         self.act = nn.LeakyReLU()
         self.pwconv2 = nn.Linear(hidden_channels, channels, bias=False)
@@ -212,6 +221,7 @@ class ConvNeXt(nn.Module):
         cond_channels: int,
         channels: int,
         num_layers: int,
+        conv_kernel_size: int = 7,
         use_t: bool = True,
         use_dest_t: bool = False,
     ):
@@ -242,6 +252,7 @@ class ConvNeXt(nn.Module):
                 ConvNeXtBlock(
                     channels=channels,
                     hidden_channels=channels * 3,
+                    conv_kernel_size=conv_kernel_size,
                     cond_channels=channels,
                     time_embed_channels=channels if use_t else None,
                     residual_scale=0.9,
@@ -302,6 +313,7 @@ class AudioConvNeXt(nn.Module):
         mel_hop_length: int,
         convnext_channels: int,
         convnext_num_layers: int,
+        convnext_conv_kernel_size: int = 7,
         num_outputs: int = 1,
         use_t: bool = True,
         use_dest_t: bool = False,
@@ -326,6 +338,7 @@ class AudioConvNeXt(nn.Module):
             cond_channels=cond_channels,
             channels=convnext_channels,
             num_layers=convnext_num_layers,
+            conv_kernel_size=convnext_conv_kernel_size,
             use_t=use_t,
             use_dest_t=use_dest_t,
         )

@@ -173,6 +173,7 @@ class Vocoder(nn.Module):
         mel_enc_num_layers: int = 4,
         convnext_num_layers: int = (8, 8, 8, 8),
         convnext_channels: int = (768, 384, 192, 96),
+        convnext_conv_kernel_sizes: int = (7, 7, 7, 7),
         higher_order: bool = False,
         analytic: bool = False,
         from_inv_mel: bool = True,
@@ -183,6 +184,7 @@ class Vocoder(nn.Module):
         assert len(hop_lengths) == self.num_branches
         assert len(convnext_num_layers) == self.num_branches
         assert len(convnext_channels) == self.num_branches
+        assert len(convnext_conv_kernel_sizes) == self.num_branches
         self.higher_order = higher_order
         self.num_outputs = 1 if not higher_order else 3
         self.analytic = analytic
@@ -203,6 +205,7 @@ class Vocoder(nn.Module):
                 mel_hop_length=mel_hop_length,
                 convnext_channels=convnext_channels[i],
                 convnext_num_layers=convnext_num_layers[i],
+                convnext_conv_kernel_size=convnext_conv_kernel_sizes[i],
                 num_outputs=self.num_outputs,
                 use_dest_t=higher_order,
                 analytic=analytic,
