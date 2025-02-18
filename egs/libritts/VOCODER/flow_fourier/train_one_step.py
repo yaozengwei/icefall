@@ -564,7 +564,7 @@ def compute_loss(
             mix_noise_scale=params.mix_noise_scale,
         )
         main_loss, log_mel_loss, fft_mag_loss, disc_loss = losses
-        loss = main_loss
+        loss = main_loss * 1.0
         if use_log_mel_loss:
             loss += params.log_mel_loss_scale * log_mel_loss
         if use_fft_mag_loss:
