@@ -445,6 +445,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Noise scale used when constructing x0 from standard distribution.",
     )
 
+    parser.add_argument(
+        "--mag-power",
+        type=int,
+        default=1,
+        help="",
+    )
+
 
 def get_params() -> AttributeDict:
     """Return a dict containing training parameters.
@@ -571,6 +578,7 @@ def get_model(params: AttributeDict) -> nn.Module:
         analytic=params.analytic,
         from_inv_mel=params.from_inv_mel,
         init_noise_scale=params.init_noise_scale,
+        mag_power=params.mag_power,
     )
     return model
 
