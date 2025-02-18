@@ -845,13 +845,13 @@ def train_one_epoch(
                         stft = librosa.stft(y, n_fft=1024)
                         return librosa.amplitude_to_db(np.abs(stft), ref=np.max)
                     tb_writer.add_image(
-                        "train/valid_pred_audio_step_{step}_spec",
+                        f"train/valid_pred_audio_step_{step}_spec",
                         plot_feature(compute_spec(pred_audio)),
                         params.batch_idx_train,
                         dataformats="HWC",
                     )
                     tb_writer.add_image(
-                        "train/valid_gt_audio_step_{step}_spec",
+                        f"train/valid_gt_audio_step_{step}_spec",
                         plot_feature(compute_spec(gt_audio)),
                         params.batch_idx_train,
                         dataformats="HWC",
