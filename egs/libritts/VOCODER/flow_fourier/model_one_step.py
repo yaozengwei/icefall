@@ -84,6 +84,8 @@ class OneStepVocoder(nn.Module):
         self.use_fft_mag_loss = use_fft_mag_loss
         self.use_log_mel_loss = use_log_mel_loss
 
+        self.mag_power = mag_power
+
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
             channels=mel_enc_channels,
@@ -103,7 +105,6 @@ class OneStepVocoder(nn.Module):
                 use_t=False,
                 use_dest_t=False,
                 analytic=False,
-                mag_power=mag_power,
             )
             for i in range(self.num_branches)
         ])
@@ -145,6 +146,10 @@ class OneStepVocoder(nn.Module):
 
         if use_fft_mag_loss:
             self.fft = STFT(n_fft=mel_n_fft, hop_length=mel_hop_length)
+
+        if mag_power > 1:
+            self.post_fft = STFT(n_fft=512, hop_length=256)
+            self.post_ifft = ISTFT(n_fft=512, hop_length=256)
 
         self.apply(self._init_weights)
 
@@ -193,7 +198,16 @@ class OneStepVocoder(nn.Module):
             weight = (mask / mask.sum(dim=1, keepdim=True))[:, :, None, None]  # (batch, num_branches, 1, 1)
             output = (branch_outputs * weight).sum(dim=1)  # (batch, 1, time)
 
-        return output[:, 0]
+        output = output[:, 0]
+
+        if self.mag_power > 1:
+            eps = 1e-6
+            fft, _ = self.post_fft(output, audio_lens)
+            mag = (fft.real ** 2 + fft.imag ** 2 + eps).sqrt()
+            fft = fft * (1.0 - (-mag).exp())
+            output = self.post_ifft(fft)
+
+        return output
 
     def get_disc_loss(
         self,
