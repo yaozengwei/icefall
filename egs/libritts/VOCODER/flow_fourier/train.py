@@ -202,6 +202,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--inv-noise-dir",
+        type=str,
+        default="",
+        help="Dir to the saved inverted noise.",
+    )
+
+    parser.add_argument(
         "--train-num-samples",
         type=int,
         default=32768,
@@ -248,6 +255,27 @@ def get_parser():
         type=str,
         default="./data/scp_ark/validation",
         help="Dir to the scp/ark files of the validation set.",
+    )
+
+    parser.add_argument(
+        "--use-inv-noise",
+        type=str2bool,
+        default=False,
+        help="Whether to use inv-noise.",
+    )
+
+    parser.add_argument(
+        "--train-inv-noise-scp-ark-dir",
+        type=str,
+        default="",
+        help="Dir to the scp/ark files of the inv-noise training set.",
+    )
+
+    parser.add_argument(
+        "--valid-inv-noise-scp-ark-dir",
+        type=str,
+        default="",
+        help="Dir to the scp/ark files of the inv-noise validation set.",
     )
 
     parser.add_argument(
@@ -591,6 +619,7 @@ def compute_loss(
     model_ema: nn.Module,
     is_training: bool = True,
     use_aux_loss: bool = True,
+    inv_noise: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
     """Compute loss given the model and its inputs."""
     # linearly decrease from branch_drop_rate to 0 in first warm_step batches
@@ -602,6 +631,7 @@ def compute_loss(
             ema_model=model_ema,
             audio=audio,
             audio_lens=audio_lens,
+            inv_noise=inv_noise,
             mel_scaling_loss=params.mel_scaling_loss,
             branch_drop_rate=branch_drop_rate,
             use_aux_loss=use_aux_loss,
@@ -707,6 +737,7 @@ def train_one_epoch(
         audio_lens = torch.full((audio.shape[0],), audio.shape[1], dtype=torch.int32, device=device)
         # audio: (N, T), float32
         # audio_lens, (N,), int32
+        inv_noise = batch[1].to(device) if params.use_inv_noise else None
         batch_size = audio.shape[0]
 
         try:
@@ -715,6 +746,7 @@ def train_one_epoch(
                 loss, loss_info = compute_loss(
                     audio=audio,
                     audio_lens=audio_lens,
+                    inv_noise=inv_noise,
                     params=params,
                     model=model,
                     model_ema=model_ema,
@@ -886,10 +918,12 @@ def compute_validation_loss(
             audio_lens = torch.full((audio.shape[0],), audio.shape[1], dtype=torch.int32, device=device)
             # audio: (N, T), float32
             # audio_lens, (N,), int32
+            inv_noise = batch[1].to(device) if params.use_inv_noise else None
 
             loss, loss_info = compute_loss(
                 audio=audio,
                 audio_lens=audio_lens,
+                inv_noise=inv_noise,
                 params=params,
                 model=model,
                 model_ema=model_ema,
@@ -1020,6 +1054,9 @@ def run(rank, world_size, args):
         world_size=world_size,
         kaldi_io=params.kaldi_io,
         scp_ark_dir=params.train_scp_ark_dir,
+        inv_noise_pair=params.use_inv_noise,
+        inv_noise_dir=params.inv_noise_dir,
+        inv_noise_scp_ark_dir=params.train_inv_noise_scp_ark_dir,
     )
     valid_dl = build_data_loader(
         wav_list_file=params.valid_wav_list,
@@ -1032,6 +1069,9 @@ def run(rank, world_size, args):
         world_size=world_size,
         kaldi_io=params.kaldi_io,
         scp_ark_dir=params.valid_scp_ark_dir,
+        inv_noise_pair=params.use_inv_noise,
+        inv_noise_dir=params.inv_noise_dir,
+        inv_noise_scp_ark_dir=params.valid_inv_noise_scp_ark_dir,
     )
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)

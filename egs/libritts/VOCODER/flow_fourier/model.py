@@ -305,6 +305,7 @@ class Vocoder(nn.Module):
         ema_model: nn.Module,
         audio: torch.Tensor,
         audio_lens: torch.Tensor,
+        inv_noise: Optional[torch.Tensor] = None,
         mel_scaling_loss: bool = True,
         branch_drop_rate: float = 0.0,
         use_aux_loss: bool = True,
@@ -326,6 +327,11 @@ class Vocoder(nn.Module):
         else:
             # scale x0 by x1's std in training
             x0 = torch.randn_like(x1) * self.init_noise_scale
+
+        if inv_noise is not None:
+            assert inv_noise.shape == x0.shape
+            batch_size = x0.shape[0]
+            x0 = torch.cat((inv_noise[:batch_size // 2], x0[batch_size // 2:]), dim=0)
 
         if self.analytic:
             x1 = analytic_transform(x1)
