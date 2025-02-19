@@ -66,6 +66,7 @@ class OneStepVocoder(nn.Module):
         disc_mask_order: int = 3,
         use_fft_mag_loss: bool = False,
         use_log_mel_loss: bool = False,
+        mag_power: int = 1,
     ):
         super().__init__()
         self.num_branches = len(n_ffts)
@@ -102,6 +103,7 @@ class OneStepVocoder(nn.Module):
                 use_t=False,
                 use_dest_t=False,
                 analytic=False,
+                mag_power=mag_power,
             )
             for i in range(self.num_branches)
         ])

@@ -416,6 +416,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Whether to log-mel l1-loss",
     )
 
+    parser.add_argument(
+        "--mag-power",
+        type=int,
+        default=1,
+        help="",
+    )
+
 
 def get_params() -> AttributeDict:
     """Return a dict containing training parameters.
@@ -541,6 +548,7 @@ def get_model(params: AttributeDict) -> nn.Module:
         use_disc_loss=params.use_disc_loss,
         use_fft_mag_loss=params.use_fft_mag_loss,
         use_log_mel_loss=params.use_log_mel_loss,
+        mag_power=params.mag_power,
     )
     return model
 

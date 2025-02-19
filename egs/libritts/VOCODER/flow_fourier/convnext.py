@@ -390,8 +390,8 @@ class AudioConvNeXt(nn.Module):
         fft = real_to_fft(fft_real)
 
         if self.mag_power > 1:
-            mag, phase = fft.abs(), fft.angle()
-            fft = torch.polar(abs=mag ** self.mag_power, angle=phase)
+            # fft = fft * (fft.abs() ** (self.mag_power - 1)).clamp(max=1.0)
+            fft = fft * (1 - (-fft.abs()).exp())
 
         audio = self.ifft(fft)
         audio = audio.reshape(batch_size, num_outputs, audio.shape[-1])
