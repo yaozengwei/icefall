@@ -171,9 +171,11 @@ class Vocoder(nn.Module):
         mel_hop_length: int = 256,
         mel_enc_channels: int = 512,
         mel_enc_num_layers: int = 4,
+        mel_enc_hidden_factor: int = 3,
         convnext_num_layers: int = (8, 8, 8, 8),
         convnext_channels: int = (768, 384, 192, 96),
         convnext_conv_kernel_sizes: int = (7, 7, 7, 7),
+        convnext_hidden_factor: int = 3,
         higher_order: bool = False,
         analytic: bool = False,
         from_inv_mel: bool = True,
@@ -196,6 +198,7 @@ class Vocoder(nn.Module):
             n_mels=n_mels,
             channels=mel_enc_channels,
             num_layers=mel_enc_num_layers,
+            hidden_factor=mel_enc_hidden_factor,
         )
 
         self.estimators = nn.ModuleList([
@@ -207,6 +210,7 @@ class Vocoder(nn.Module):
                 convnext_channels=convnext_channels[i],
                 convnext_num_layers=convnext_num_layers[i],
                 convnext_conv_kernel_size=convnext_conv_kernel_sizes[i],
+                hidden_factor=convnext_hidden_factor,
                 num_outputs=self.num_outputs,
                 use_dest_t=higher_order,
                 analytic=analytic,

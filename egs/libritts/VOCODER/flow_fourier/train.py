@@ -432,6 +432,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--convnext-hidden-factor",
+        type=int,
+        default=3,
+        help="",
+    )
+
+    parser.add_argument(
         "--mel-enc-channels",
         type=int,
         default=512,
@@ -442,6 +449,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "--mel-enc-num-layers",
         type=int,
         default=4,
+        help="",
+    )
+
+    parser.add_argument(
+        "--mel-enc-hidden-factor",
+        type=int,
+        default=3,
         help="",
     )
 
@@ -599,9 +613,11 @@ def get_model(params: AttributeDict) -> nn.Module:
         mel_hop_length=params.mel_hop_length,
         mel_enc_channels=params.mel_enc_channels,
         mel_enc_num_layers=params.mel_enc_num_layers,
+        mel_enc_hidden_factor=params.mel_enc_hidden_factor,
         convnext_num_layers=_to_int_tuple(params.convnext_num_layers),
         convnext_channels=_to_int_tuple(params.convnext_channels),
         convnext_conv_kernel_sizes=_to_int_tuple(params.convnext_conv_kernel_sizes),
+        convnext_hidden_factor=params.convnext_hidden_factor,
         higher_order=params.higher_order,
         analytic=params.analytic,
         from_inv_mel=params.from_inv_mel,

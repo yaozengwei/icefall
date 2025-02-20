@@ -184,12 +184,18 @@ class ConvNeXtBlock(nn.Module):
 
 class MelEncoder(nn.Module):
     """ConvNeXt-based mel-spectrogram encoder."""
-    def __init__(self, n_mels: int = 80, channels: int = 512, num_layers: int = 4):
+    def __init__(
+        self,
+        n_mels: int = 80,
+        channels: int = 512,
+        num_layers: int = 4,
+        hidden_factor: int = 3,
+    ):
         super().__init__()
         self.in_proj = nn.Conv1d(n_mels, channels, 1, bias=False)
         self.convnext_blocks = nn.ModuleList(
             [
-                ConvNeXtBlock(channels=channels, hidden_channels=channels * 3)
+                ConvNeXtBlock(channels=channels, hidden_channels=channels * hidden_factor)
                 for _ in range(num_layers)
             ]
         )
@@ -222,6 +228,7 @@ class ConvNeXt(nn.Module):
         channels: int,
         num_layers: int,
         conv_kernel_size: int = 7,
+        hidden_factor: int = 3,
         use_t: bool = True,
         use_dest_t: bool = False,
     ):
@@ -251,7 +258,7 @@ class ConvNeXt(nn.Module):
             [
                 ConvNeXtBlock(
                     channels=channels,
-                    hidden_channels=channels * 3,
+                    hidden_channels=channels * hidden_factor,
                     conv_kernel_size=conv_kernel_size,
                     cond_channels=channels,
                     time_embed_channels=channels if use_t else None,
@@ -314,6 +321,7 @@ class AudioConvNeXt(nn.Module):
         convnext_channels: int,
         convnext_num_layers: int,
         convnext_conv_kernel_size: int = 7,
+        hidden_factor: int = 3,
         num_outputs: int = 1,
         use_t: bool = True,
         use_dest_t: bool = False,
@@ -342,6 +350,7 @@ class AudioConvNeXt(nn.Module):
             channels=convnext_channels,
             num_layers=convnext_num_layers,
             conv_kernel_size=convnext_conv_kernel_size,
+            hidden_factor=hidden_factor,
             use_t=use_t,
             use_dest_t=use_dest_t,
         )
