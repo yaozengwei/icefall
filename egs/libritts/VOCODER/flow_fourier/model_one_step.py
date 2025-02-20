@@ -33,7 +33,7 @@ from audio_utils import (
     convert_length,
     safe_log,
 )
-from convnext import AudioConvNeXt, MelEncoder
+from convnext import AudioConvNeXt, MelEncoder, WavEncoder
 
 
 class ScaleGrad(torch.autograd.Function):
@@ -67,6 +67,7 @@ class OneStepVocoder(nn.Module):
         use_fft_mag_loss: bool = False,
         use_log_mel_loss: bool = False,
         mag_power: int = 1,
+        use_post_wav_encoder: bool = False,
     ):
         super().__init__()
         self.num_branches = len(n_ffts)
@@ -85,6 +86,7 @@ class OneStepVocoder(nn.Module):
         self.use_log_mel_loss = use_log_mel_loss
 
         self.mag_power = mag_power
+        self.use_post_wav_encoder = use_post_wav_encoder
 
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
@@ -151,6 +153,11 @@ class OneStepVocoder(nn.Module):
             self.post_fft = STFT(n_fft=512, hop_length=256)
             self.post_ifft = ISTFT(n_fft=512, hop_length=256)
 
+            if use_post_wav_encoder:
+                self.post_wav_encoder = WavEncoder(
+                    win_length=64, channels=256, num_layers=2
+                )
+
         self.apply(self._init_weights)
 
     @torch.no_grad()
@@ -206,6 +213,9 @@ class OneStepVocoder(nn.Module):
             mag = (fft.real ** 2 + fft.imag ** 2 + eps).sqrt()
             fft = fft * (1.0 - (-mag).exp())
             output = self.post_ifft(fft)
+
+            if self.use_post_wav_encoder:
+                output = self.post_wav_encoder(output, audio_lens)
 
         return output
 

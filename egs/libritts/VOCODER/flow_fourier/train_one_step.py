@@ -423,6 +423,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="",
     )
 
+    parser.add_argument(
+        "--use-post-wav-encoder",
+        type=str2bool,
+        default=False,
+        help="",
+    )
+
 
 def get_params() -> AttributeDict:
     """Return a dict containing training parameters.
@@ -549,6 +556,7 @@ def get_model(params: AttributeDict) -> nn.Module:
         use_fft_mag_loss=params.use_fft_mag_loss,
         use_log_mel_loss=params.use_log_mel_loss,
         mag_power=params.mag_power,
+        use_post_wav_encoder=params.use_post_wav_encoder,
     )
     return model
 
