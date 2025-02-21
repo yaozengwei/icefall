@@ -369,6 +369,13 @@ def get_parser():
         help="scale on loss for small t differences",
     )
 
+    parser.add_argument(
+        "--branch-loss-scale",
+        type=float,
+        default=1.0,
+        help="scale on branch_losses",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -668,7 +675,7 @@ def compute_loss(
             )
         else:
             main_loss, branch_losses = losses
-            loss = main_loss + sum(branch_losses)
+            loss = main_loss + params.branch_loss_scale * sum(branch_losses)
 
     assert loss.requires_grad == is_training
 
