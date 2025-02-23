@@ -136,7 +136,7 @@ class ConvNeXtBlock(nn.Module):
         if time_embed_channels is not None:
             self.time_embed_proj = nn.Linear(time_embed_channels, channels)
 
-        self.residual_scale = nn.Parameter(torch.full((1,), residual_scale))
+        self.residual_scale = nn.Parameter(torch.full((channels, 1), residual_scale))
 
     def forward(
         self,
