@@ -166,17 +166,25 @@ class TransformerEncoderLayer(nn.Module):
 
         # TODO: test removing nonlin activations here
         self.cond_proj = nn.Sequential(
-            nn.LeakyReLU(),
+            # nn.LeakyReLU(),
             nn.Linear(embed_dim, 2 * embed_dim, bias=False)
         )
         self.time_embed_proj = nn.Sequential(
-            nn.SiLU(),
+            # nn.SiLU(),
             nn.Linear(embed_dim, 2 * embed_dim)
         )
 
         if use_res_scale:
             self.res_scale1 = nn.Parameter(torch.full((embed_dim,), 0.9))
             self.res_scale2 = nn.Parameter(torch.full((embed_dim,), 0.9))
+
+        # self._init_weights()
+
+    # @torch.no_grad()
+    # def _init_weights(self):
+    #     nn.init.constant_(self.cond_proj[1].weight, 0)
+    #     nn.init.constant_(self.time_embed_proj[1].weight, 0)
+    #     nn.init.constant_(self.time_embed_proj[1].bias, 0)
 
     def forward(
         self,
@@ -203,6 +211,7 @@ class TransformerEncoderLayer(nn.Module):
         scale_attn, scale_ff = self.time_embed_proj(time_embed).chunk(2, dim=-1)
 
         attn_in = self.norm1(x) * (1.0 + scale_attn.unsqueeze(0)) + shift_attn
+        # attn_in = self.norm1(x) + shift_attn
         attn_out = self.attn(
             query=attn_in,
             key=attn_in,
@@ -220,6 +229,7 @@ class TransformerEncoderLayer(nn.Module):
             x = attn_out + x
 
         ff_in = self.norm2(x) * (1.0 + scale_ff.unsqueeze(0)) + shift_ff
+        # ff_in = self.norm2(x) + shift_ff
         ff_out = self.ff(ff_in)
         if self.use_res_scale:
             res_scale2 = limit_param_value(
@@ -431,17 +441,17 @@ class LocalGlogalTransformer(nn.Module):
                 time_embed=local_time_embed,
                 key_padding_mask=local_pad_mask,
             )  # (chunk_size, batch_size * num_chunks, embed_dim)
-            if i < self.num_encoders - 1:
-                mem = x.mean(dim=0).reshape(batch_size, num_chunks, embed_dim)
-                mem = mem.permute(1, 0, 2)  # (num_chunks, batch_size, embed_dim)
-                mem = self.global_encoders[i](
-                    x=mem,
-                    cond=global_cond,
-                    time_embed=time_embed,
-                    key_padding_mask=global_pad_mask,
-                )
-                mem = mem.permute(1, 0, 2).reshape(batch_size * num_chunks, embed_dim)
-                x = x + mem.unsqueeze(0)
+            # if i < self.num_encoders - 1:
+            #     mem = x.mean(dim=0).reshape(batch_size, num_chunks, embed_dim)
+            #     mem = mem.permute(1, 0, 2)  # (num_chunks, batch_size, embed_dim)
+            #     mem = self.global_encoders[i](
+            #         x=mem,
+            #         cond=global_cond,
+            #         time_embed=time_embed,
+            #         key_padding_mask=global_pad_mask,
+            #     )
+            #     mem = mem.permute(1, 0, 2).reshape(batch_size * num_chunks, embed_dim)
+            #     x = x + mem.unsqueeze(0)
 
         x = x.view(chunk_size, batch_size, num_chunks, embed_dim).permute(1, 3, 2, 0)
         x = x.reshape(batch_size, embed_dim, num_chunks * chunk_size)
@@ -573,6 +583,113 @@ class AudioLocalGlogalTransformer(nn.Module):
 
         x = self.decoder(x).squeeze(1)
         x = convert_length(x, time)  # (batch_size, time)
+
+        return x
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Block adapted from https://github.com/facebookresearch/ConvNeXt to 1D audio signal.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        conv_kernel_size: int = 7,
+        use_res_scale: bool = True,
+    ):
+        super().__init__()
+        self.use_res_scale = use_res_scale
+
+        assert conv_kernel_size % 2 == 1, conv_kernel_size
+        self.dwconv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=channels,
+            bias=False,
+        )
+        self.pwconv1 = nn.Linear(channels, hidden_channels, bias=False)
+        self.act = nn.LeakyReLU()
+        self.pwconv2 = nn.Linear(hidden_channels, channels, bias=False)
+
+        if self.use_res_scale:
+            self.res_scale = nn.Parameter(torch.full((channels, 1), 0.9))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        length_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, in_channels, time)
+            length_mask: (batch_size, 1, time)
+        """
+        residual = x
+
+        if length_mask is not None:
+            x = x * length_mask
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
+
+        if self.use_res_scale:
+            res_scale = limit_param_value(
+                self.res_scale, min=0.5, max=1.0, training=self.training
+            )
+            x = x + residual * res_scale
+        else:
+            x = x + residual
+
+        return x
+
+
+class MelEncoder(nn.Module):
+    """ConvNeXt-based mel-spectrogram encoder."""
+    def __init__(
+        self,
+        n_mels: int = 80,
+        channels: int = 512,
+        num_layers: int = 4,
+        hidden_factor: int = 4,
+        use_res_scale: bool = True,
+    ):
+        super().__init__()
+        self.in_proj = nn.Conv1d(n_mels, channels, 1, bias=False)
+        self.convnext_blocks = nn.ModuleList(
+            [
+                ConvNeXtBlock(
+                    channels=channels,
+                    hidden_channels=channels * hidden_factor,
+                    use_res_scale=use_res_scale,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.act = nn.LeakyReLU()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        length_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, n_mels, time)
+            length_mask: (batch, 1, time)
+        """
+        x = self.in_proj(x)
+
+        for block in self.convnext_blocks:
+            x = block(x, length_mask=length_mask)
+
+        x = self.act(x)
 
         return x
 

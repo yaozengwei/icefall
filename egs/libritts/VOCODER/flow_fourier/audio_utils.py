@@ -100,6 +100,7 @@ class ISTFT(nn.Module):
         n_fft: int,
         hop_length: int,
         window: str = "hann_window",
+        center: bool = True,
         onesided: bool = True,
         return_complex: bool = False,
     ):
@@ -107,6 +108,7 @@ class ISTFT(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = n_fft
+        self.center = center
         self.onesided = onesided
         self.return_complex = return_complex
         window = torch.hann_window(self.win_length)
@@ -119,7 +121,7 @@ class ISTFT(nn.Module):
             hop_length=self.hop_length,
             win_length=self.win_length,
             window=self.window,
-            center=True,
+            center=self.center,
             onesided=self.onesided,
             return_complex=self.return_complex,
         )
