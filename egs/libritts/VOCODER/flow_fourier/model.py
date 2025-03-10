@@ -279,7 +279,7 @@ class Vocoder(nn.Module):
         ], dim=1)  # (batch, num_branches, num_output, time)
 
         # fuse all branches
-        if not self.training or branch_drop_rate <= 0:
+        if not self.training or branch_drop_rate <= 0 or self.num_branches == 1:
             output = branch_outputs.mean(dim=1)
         else:
             if random.random() < 0.05:
