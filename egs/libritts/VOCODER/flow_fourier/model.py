@@ -180,7 +180,6 @@ class Vocoder(nn.Module):
         analytic: bool = False,
         from_inv_mel: bool = True,
         init_noise_scale: float = 0.1,
-        mag_power: int = 1,
     ):
         super().__init__()
         self.num_branches = len(n_ffts)
@@ -214,7 +213,6 @@ class Vocoder(nn.Module):
                 num_outputs=self.num_outputs,
                 use_dest_t=higher_order,
                 analytic=analytic,
-                mag_power=mag_power,
             )
             for i in range(self.num_branches)
         ])

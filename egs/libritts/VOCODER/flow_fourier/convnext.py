@@ -326,11 +326,9 @@ class AudioConvNeXt(nn.Module):
         use_t: bool = True,
         use_dest_t: bool = False,
         analytic: bool = False,
-        mag_power: int = 1,
     ):
         super().__init__()
         self.num_outputs = num_outputs
-        self.mag_power = mag_power
 
         self.fft = STFT(
             n_fft=n_fft,
@@ -397,10 +395,6 @@ class AudioConvNeXt(nn.Module):
         fft_real = fft_real.reshape(batch_size * num_outputs, channels // num_outputs, fft_frames)
 
         fft = real_to_fft(fft_real)
-
-        if self.mag_power > 1:
-            # fft = fft * (fft.abs() ** (self.mag_power - 1)).clamp(max=1.0)
-            fft = fft * (1 - (-fft.abs()).exp())
 
         audio = self.ifft(fft)
         audio = audio.reshape(batch_size, num_outputs, audio.shape[-1])
