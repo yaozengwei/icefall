@@ -384,6 +384,7 @@ class Vocoder(nn.Module):
         )
         # shape of vt, x_mid, x_dest should be: (batch_size, time)
 
+        power_spec = self.power_spec(audio)
         # compute losses
         main_loss = self.compute_loss(
             pred=vt,
@@ -391,7 +392,7 @@ class Vocoder(nn.Module):
             audio_lens=audio_lens,
             loss_scale=main_loss_scale if self.higher_order else 1.0,
             mel_scaling_loss=mel_scaling_loss,
-            mel_spec=mel_spec,
+            mel_spec=power_spec,
         )
 
         if use_aux_loss and self.higher_order:
