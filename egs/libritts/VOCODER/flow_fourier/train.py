@@ -439,13 +439,6 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--analytic",
-        type=str2bool,
-        default=False,
-        help="Whether to use analytic signals",
-    )
-
-    parser.add_argument(
         "--from-inv-mel",
         type=str2bool,
         default=True,
@@ -584,7 +577,6 @@ def get_model(params: AttributeDict) -> nn.Module:
         convnext_conv_kernel_sizes=_to_int_tuple(params.convnext_conv_kernel_sizes),
         convnext_hidden_factor=params.convnext_hidden_factor,
         higher_order=params.higher_order,
-        analytic=params.analytic,
         from_inv_mel=params.from_inv_mel,
         init_noise_scale=params.init_noise_scale,
     )
