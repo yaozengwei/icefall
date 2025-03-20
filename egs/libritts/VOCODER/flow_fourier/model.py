@@ -28,9 +28,7 @@ from icefall.utils import make_pad_mask
 from audio_utils import (
     ISTFT,
     InverseMelScale,
-    analytic_transform,
     convert_length,
-    remove_negative_frequency,
     safe_log,
 )
 from convnext import AudioConvNeXt, MelEncoder
@@ -177,7 +175,6 @@ class Vocoder(nn.Module):
         convnext_conv_kernel_sizes: int = (7, 7, 7, 7),
         convnext_hidden_factor: int = 3,
         higher_order: bool = False,
-        analytic: bool = False,
         from_inv_mel: bool = True,
         init_noise_scale: float = 0.1,
     ):
@@ -189,7 +186,6 @@ class Vocoder(nn.Module):
         assert len(convnext_conv_kernel_sizes) == self.num_branches
         self.higher_order = higher_order
         self.num_outputs = 1 if not higher_order else 3
-        self.analytic = analytic
         self.from_inv_mel = from_inv_mel
         self.init_noise_scale = init_noise_scale  # emprical, need to tune
 
@@ -212,7 +208,6 @@ class Vocoder(nn.Module):
                 hidden_factor=convnext_hidden_factor,
                 num_outputs=self.num_outputs,
                 use_dest_t=higher_order,
-                analytic=analytic,
             )
             for i in range(self.num_branches)
         ])
@@ -252,7 +247,7 @@ class Vocoder(nn.Module):
         random_phase = torch.rand_like(est_mag) * (2 * pi) - pi
         est_fft = est_mag * torch.exp(random_phase * 1j)
         est_audio = self.ifft(est_fft)
-        return est_audio * 2.0
+        return est_audio * 2.0  # TODO: test this
         # return est_audio
 
     def process_model(
@@ -304,10 +299,9 @@ class Vocoder(nn.Module):
 
     def forward(
         self,
-        ema_model: nn.Module,
         audio: torch.Tensor,
         audio_lens: torch.Tensor,
-        inv_noise: Optional[torch.Tensor] = None,
+        ema_model: Optional[nn.Module] = None,
         mel_scaling_loss: bool = True,
         branch_drop_rate: float = 0.0,
         use_aux_loss: bool = True,
@@ -329,16 +323,6 @@ class Vocoder(nn.Module):
         else:
             # scale x0 by x1's std in training
             x0 = torch.randn_like(x1) * self.init_noise_scale
-
-        if inv_noise is not None:
-            assert inv_noise.shape == x0.shape
-            batch_size = x0.shape[0]
-            x0 = torch.cat((inv_noise[:batch_size // 2], x0[batch_size // 2:]), dim=0)
-
-        if self.analytic:
-            x1 = analytic_transform(x1)
-            x0 = analytic_transform(x0)
-            # Now x1 and x0 are both complex tensors
 
         if self.higher_order:
             (
@@ -492,16 +476,6 @@ class Vocoder(nn.Module):
         if mel_scaling_loss:
             assert mel_spec is not None
 
-        if self.analytic:
-            batch, time = pred.shape
-            pred = torch.view_as_real(pred).permute(2, 0, 1).reshape(2 * batch, time)
-            target = torch.view_as_real(target).permute(2, 0, 1).reshape(2 * batch, time)
-            audio_lens = audio_lens.repeat(2)
-            if isinstance(loss_scale, Tensor):
-                loss_scale = loss_scale.repeat(2, 1)
-            if mel_spec is not None:
-                mel_spec = mel_spec.repeat(2, 1, 1)
-
         err = pred - target
 
         if not mel_scaling_loss:
@@ -544,10 +518,6 @@ class Vocoder(nn.Module):
             # scale x0 by x1's std in training
             noise = torch.randn_like(audio) * self.init_noise_scale
 
-        if self.analytic:
-            noise = analytic_transform(noise)
-            # Now noise is complex
-
         cond = self.mel_encoder(mel_spec.sqrt())
 
         # use fixed euler solver for ODEs.
@@ -575,18 +545,14 @@ class Vocoder(nn.Module):
                 )
                 x = x_dest
 
-            if self.analytic:
-                # remove negative frequency at each step
-                x = remove_negative_frequency(x)
-
             t = t_span[step]
 
-        pred_audio = x if not self.analytic else x.real
+        pred_audio = x
         if clamp_pred:
             pred_audio = pred_audio.clamp(min=-1.0, max=1.0)
 
         if log_mel_diff:
-            mel_spec_noise = self.mel(noise if not self.analytic else noise.real)  # (batch, n_mels, time)
+            mel_spec_noise = self.mel(noise)  # (batch, n_mels, time)
             mel_spec_infer = self.mel(pred_audio)  # (batch, n_mels, time)
 
             def mel_diff(x, y):
@@ -608,45 +574,3 @@ class Vocoder(nn.Module):
             )
 
         return pred_audio
-
-    def inverse_infer(
-        self,
-        audio: torch.Tensor,
-        audio_lens: torch.Tensor,
-        n_timesteps: int = 8,
-        start_t: float = 0.999,
-    ) -> Tensor:
-        assert not self.analytic and not self.higher_order
-
-        mel_spec = self.mel(audio)  # (batch, n_mels, time)
-
-        # sample noise p(x_0)
-        if self.from_inv_mel:
-            noise = self.reconstuct_audio_with_random_phase(mel_spec)
-            noise = convert_length(noise, audio.shape[-1])
-        else:
-            # scale x0 by x1's std in training
-            noise = torch.randn_like(audio) * self.init_noise_scale
-
-        # start point
-        x = audio * start_t + noise * (1.0 - start_t)
-
-        cond = self.mel_encoder(mel_spec.sqrt())
-
-        # use fixed euler solver for ODEs.
-        t_span = torch.linspace(start_t, 0, n_timesteps + 1, device=noise.device)
-        t, dt = t_span[0], t_span[1] - t_span[0]
-        batch_size = x.shape[0]
-        for step in range(1, len(t_span)):
-            vt, _, _ = self.process_model(
-                x=x,
-                audio_lens=audio_lens,
-                cond=cond,
-                t=t[None, None].expand(batch_size, 1),
-            )
-            x = x + vt * dt
-            t = t_span[step]
-
-        inv_noise = x
-
-        return inv_noise, noise
