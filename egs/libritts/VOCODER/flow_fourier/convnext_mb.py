@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+# Copyright    2025  Xiaomi Corp.             (authors: Daniel Povey, Zengwei Yao)
+#
+# See ../../../../LICENSE for clarification regarding multiple authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import random
+from typing import Optional
+
+import math
+import torch
+from audio_utils import STFT, ISTFT, convert_length
+from icefall.utils import make_pad_mask
+from torch import nn
+from torch import Tensor
+
+
+def fft_to_real(fft: Tensor):
+    """
+    fft: (batch_size, fft_channels, fft_frames), complex.
+    Returns: real_fft: (batch_size, fft_channels * 2, fft_frames), real
+    """
+    (batch_size, _, fft_frames) = fft.shape
+    real_fft = torch.view_as_real(fft).permute(0, 1, 3, 2).reshape(batch_size, -1, fft_frames)
+    return real_fft
+
+
+def real_to_fft(real_fft: Tensor):
+    """
+    real_fft: (batch_size, fft_channels * 2, fft_frames), real
+    Returns: fft: (batch_size, fft_channels, fft_frames), complex.
+    """
+    (batch_size, _, fft_frames) = real_fft.shape
+    real_fft = real_fft.reshape(batch_size, -1, 2, fft_frames).permute(0, 1, 3, 2)
+    fft = torch.view_as_complex(real_fft.contiguous())
+    return fft
+
+
+# From https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/scaling.py
+class LimitParamValue(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, min: float, max: float):
+        ctx.save_for_backward(x)
+        assert max >= min
+        ctx.min = min
+        ctx.max = max
+        return x
+
+    @staticmethod
+    def backward(ctx, x_grad: Tensor):
+        (x,) = ctx.saved_tensors
+        # where x < ctx.min, ensure all grads are negative (this will tend to make
+        # x more positive).
+        x_grad = x_grad * torch.where(
+            torch.logical_and(x_grad > 0, x < ctx.min), -1.0, 1.0
+        )
+        # where x > ctx.max, ensure all grads are positive (this will tend to make
+        # x more negative).
+        x_grad *= torch.where(torch.logical_and(x_grad < 0, x > ctx.max), -1.0, 1.0)
+        return x_grad, None, None
+
+
+def limit_param_value(
+    x: Tensor, min: float, max: float, prob: float = 0.6, training: bool = True
+):
+    # You apply this to (typically) an nn.Parameter during training to ensure that its
+    # (elements mostly) stays within a supplied range.  This is done by modifying the
+    # gradients in backprop.
+    # It's not necessary to do this on every batch: do it only some of the time,
+    # to save a little time.
+    if training and random.random() < prob:
+        return LimitParamValue.apply(x, min, max)
+    else:
+        return x
+
+
+class SinusoidalPosEmb(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        assert self.dim % 2 == 0, "SinusoidalPosEmb requires dim to be even"
+
+    def forward(self, x, scale=1000):
+        if x.ndim < 1:
+            x = x.unsqueeze(0)
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
+        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Block adapted from https://github.com/facebookresearch/ConvNeXt to 1D audio signal.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        conv_kernel_size: int = 7,
+        cond_channels: Optional[int] = None,
+        time_embed_channels: Optional[int] = None,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        assert conv_kernel_size % 2 == 1, conv_kernel_size
+        self.dwconv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=channels,
+            bias=False,
+        )
+        self.pwconv1 = nn.Linear(channels, hidden_channels, bias=False)
+        self.act = nn.LeakyReLU()
+        self.pwconv2 = nn.Linear(hidden_channels, channels, bias=False)
+
+        if cond_channels is not None:
+            self.cond_proj = nn.Linear(cond_channels, channels, bias=False)
+        if time_embed_channels is not None:
+            self.time_embed_proj = nn.Linear(time_embed_channels, channels)
+
+        self.residual_scale = nn.Parameter(torch.full((channels, 1), residual_scale))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        time_embed: Optional[torch.Tensor] = None,
+        length_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, in_channels, time)
+            cond: (batch_size, cond_channels, time)
+            time_embed: (batch, channels)
+            length_mask: (batch_size, 1, time)
+        """
+        residual = x
+
+        if length_mask is not None:
+            x = x * length_mask
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+
+        # Add condition and time embeddings
+        if cond is not None:
+            assert hasattr(self, "cond_proj")
+            cond = self.cond_proj(cond.transpose(1, 2))
+            x = x + cond
+        if time_embed is not None:
+            assert hasattr(self, "time_embed_proj")
+            time_embed = self.time_embed_proj(time_embed).unsqueeze(1)
+            x = x * (1. + time_embed)
+
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
+
+        residual_scale = limit_param_value(
+            self.residual_scale, min=0.5, max=1.0, training=self.training
+        )
+        x = x + residual * residual_scale
+
+        return x
+
+
+class MelEncoder(nn.Module):
+    """ConvNeXt-based mel-spectrogram encoder."""
+    def __init__(
+        self,
+        n_mels: int = 80,
+        channels: int = 512,
+        num_layers: int = 4,
+        hidden_factor: int = 3,
+    ):
+        super().__init__()
+        self.in_proj = nn.Conv1d(n_mels, channels, 1, bias=False)
+        self.convnext_blocks = nn.ModuleList(
+            [
+                ConvNeXtBlock(channels=channels, hidden_channels=channels * hidden_factor)
+                for _ in range(num_layers)
+            ]
+        )
+        self.act = nn.LeakyReLU()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        length_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, n_mels, time)
+            length_mask: (batch, 1, time)
+        """
+        x = self.in_proj(x)
+        for block in self.convnext_blocks:
+            x = block(x, length_mask=length_mask)
+        x = self.act(x)
+        return x
+
+
+class ConvNeXt(nn.Module):
+    """ConvNeXt model that processes the Fourier spectral coefficients."""
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_channels: int,
+        channels: int,
+        num_layers: int,
+        conv_kernel_size: int = 7,
+        hidden_factor: int = 3,
+        num_bands: int = 4,
+        use_t: bool = True,
+        use_dest_t: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_bands = num_bands
+
+        self.in_proj = nn.Conv1d(in_channels, channels, 1, bias=False)
+
+        self.band_embed = nn.Embedding(num_bands, channels)
+
+        if use_t:
+            self.time_embed = SinusoidalPosEmb(channels)
+            time_embed_hidden = channels * 3
+            self.time_mlp = nn.Sequential(
+                nn.Linear(channels if not use_dest_t else channels * 2, time_embed_hidden),
+                nn.SiLU(),
+                nn.Linear(time_embed_hidden, channels),
+            )
+
+        cond_embed_hidden = channels * 3
+        self.cond_mlp = nn.Sequential(
+            nn.Conv1d(cond_channels, cond_embed_hidden, kernel_size=1, bias=False),
+            nn.LeakyReLU(),
+            nn.Conv1d(cond_embed_hidden, channels, kernel_size=1, bias=False),
+        )
+
+        self.convnext_blocks = nn.ModuleList(
+            [
+                ConvNeXtBlock(
+                    channels=channels,
+                    hidden_channels=channels * hidden_factor,
+                    conv_kernel_size=conv_kernel_size,
+                    cond_channels=channels,
+                    time_embed_channels=channels if use_t else None,
+                    residual_scale=0.9,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.out_proj = nn.Conv1d(channels, out_channels, 1, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        band_idx: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        dest_t: Optional[torch.Tensor] = None,
+        length_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, in_channels, time)
+            cond: (batch, cond_channels, time)
+            t: (batch,)
+            dest_t: (batch,)
+            length_mask: (batch, 1, time)
+
+        Returns:
+            x: (batch, out_channels, time)
+        """
+        x = self.in_proj(x)
+
+        if t is not None:
+            if dest_t is not None:
+                time_embed = torch.cat([self.time_embed(t), self.time_embed(dest_t)], dim=1)
+            else:
+                time_embed = self.time_embed(t)
+            time_embed = self.time_mlp(time_embed)  # (batch, channels)
+        else:
+            time_embed = None
+
+        band_embed = self.band_embed(band_idx)
+
+        cond = self.cond_mlp(cond)
+
+        for block in self.convnext_blocks:
+            x = block(x, cond=cond, time_embed=time_embed + band_embed, length_mask=length_mask)
+
+        x = self.out_proj(x)
+
+        return x
+
+
+class AudioConvNeXt(nn.Module):
+    """ConvNeXt-based model that processes audio wavforms"""
+    def __init__(
+        self,
+        n_fft: int,
+        hop_length: int,
+        cond_channels: int,
+        mel_hop_length: int,
+        convnext_channels: int,
+        convnext_num_layers: int,
+        convnext_conv_kernel_size: int = 7,
+        hidden_factor: int = 3,
+        num_outputs: int = 1,
+        use_t: bool = True,
+        use_dest_t: bool = False,
+        num_bands: int = 4,
+    ):
+        super().__init__()
+        assert num_outputs == 1
+        self.num_outputs = num_outputs
+        self.num_bands = num_bands
+
+        self.fft = STFT(
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
+
+        # mel_hop_length should be integer multiple of hop_length.
+        assert mel_hop_length % hop_length == 0, (mel_hop_length, hop_length)
+        self.mel_upsample_factor = mel_hop_length // hop_length
+
+        real_fft_channels = n_fft + 2
+        self.channels_per_band = (real_fft_channels + num_bands - 1) // num_bands
+        self.pad_channels = self.channels_per_band * num_bands - real_fft_channels
+
+        self.convnext = ConvNeXt(
+            in_channels=self.channels_per_band,
+            out_channels=self.channels_per_band,
+            cond_channels=cond_channels,
+            channels=convnext_channels,
+            num_layers=convnext_num_layers,
+            conv_kernel_size=convnext_conv_kernel_size,
+            hidden_factor=hidden_factor,
+            use_t=use_t,
+            use_dest_t=use_dest_t,
+        )
+
+        self.ifft = ISTFT(
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
+
+    def forward(
+        self,
+        audio: Tensor,
+        audio_lens: Tensor,
+        mel: Tensor,
+        t: Optional[torch.Tensor] = None,
+        dest_t: Optional[torch.Tensor] = None,
+    ) -> Tensor:
+        """
+        Args:
+            audio: (batch_size, audio_len)
+            audio_lens: (batch_size,)
+            t: (batch_size,)
+            mel: (batch, n_mels, mel_frames)
+            dest_t: (batch_size,)
+
+        Returns: (batch_size, audio_len)
+        """
+        fft, fft_lens = self.fft(audio, audio_lens)
+        # fft: (batch, fft_channels, fft_frames); complex.
+        fft_real = fft_to_real(fft)
+        # fft_real: (batch, fft_channels * 2, fft_frames)
+
+        # divide into sub-bands
+        batch, orig_channels, num_frames = fft_real.shape
+        num_bands = self.num_bands
+        channels_per_band = self.channels_per_band
+        pad_channels = self.pad_channels
+        fft_real = nn.functional.pad(fft_real, (0, 0, 0, pad_channels))
+        fft_real = fft_real.reshape(batch, num_bands, channels_per_band, num_frames).flatten(0, 1)
+
+        mel = self.upsample_mel(mel, fft.shape[2])
+        # now mel: (batch, n_mel, fft_frames)
+        mel = mel.unsqueeze(1).expand(-1, num_bands, -1, -1).contiguous().flatten(0, 1)
+
+        if t is not None:
+            t = t.unsqueeze(1).expand(-1, num_bands).contiguous().flatten(0, 1)
+        if dest_t is not None:
+            dest_t = dest_t.unsqueeze(1).expand(-1, num_bands).contiguous().flatten(0, 1)
+
+        band_idx = torch.arange(num_bands).to(device=fft_real.device).repeat(batch)
+
+        fft_length_mask = make_pad_mask(fft_lens, max_len=fft.shape[2]).logical_not().unsqueeze(1)
+        fft_length_mask = fft_length_mask.unsqueeze(1).expand(-1, num_bands, -1, -1).contiguous().flatten(0, 1)
+        fft_real = self.convnext(
+            fft_real, cond=mel, band_idx=band_idx, t=t, dest_t=dest_t, length_mask=fft_length_mask
+        )
+
+        fft_real = fft_real.reshape(batch, num_bands * channels_per_band, num_frames)
+        fft_real = fft_real[:, :orig_channels]
+
+        fft = real_to_fft(fft_real)
+
+        audio = self.ifft(fft)
+        audio = audio.reshape(batch, 1, audio.shape[-1])
+        audio = convert_length(audio, audio_lens.max())
+
+        audio_length_mask = make_pad_mask(audio_lens, max_len=audio.shape[-1]).logical_not()
+        audio = audio * audio_length_mask.unsqueeze(1)
+
+        return audio
+
+    def upsample_mel(self, mel: Tensor, fft_frames: int) -> Tensor:
+        """Upsample mel coefficients, if necessary, to match the FFT coefficients.
+        Args:
+            Mel: (batch_size, n_mels, mel_frames)
+        """
+        f = self.mel_upsample_factor
+        if f != 1:
+            (batch_size, n_mels, mel_frames) = mel.shape
+            mel = mel.unsqueeze(-1).expand(batch_size, n_mels, mel_frames, f)
+            mel = mel.reshape(batch_size, n_mels, -1)
+        mel = convert_length(mel, fft_frames)
+        return mel
